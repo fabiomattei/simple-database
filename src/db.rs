@@ -52,10 +52,18 @@ pub fn redact(target: &str) -> String {
 }
 
 impl Database {
-    /// Open a SQLite file (created if missing) or connect to a
-    /// `postgres://` / `mysql://` URL.
+    /// Open a SQLite file (created if missing), connect to a
+    /// `postgres://` / `mysql://` URL, or to the saved connection `@name`.
     pub fn open(target: &str) -> Result<Database> {
-        let label = redact(target);
+        match crate::connections::resolve(target)? {
+            Some((resolved, name)) => Database::open_labeled(&resolved, format!("@{name}")),
+            None => Database::open_labeled(target, redact(target)),
+        }
+    }
+
+    /// Like [`Database::open`] without `@name` lookup; `label` is what
+    /// [`Database::label`] reports (it must not contain a password).
+    pub fn open_labeled(target: &str, label: String) -> Result<Database> {
         let conn = match url_dialect(target) {
             Some(Dialect::Postgres) => Conn::Postgres(Box::new(pg::connect(target)?)),
             Some(_) => Conn::Mysql(Box::new(mysqldb::connect(target)?)),
@@ -68,7 +76,7 @@ impl Database {
         Database { conn: Conn::Sqlite(conn), label: label.into(), check_cache: HashMap::new() }
     }
 
-    /// A file path, or the URL without its password.
+    /// A file path, the URL without its password, or `@name` for a saved connection.
     pub fn label(&self) -> &str {
         &self.label
     }

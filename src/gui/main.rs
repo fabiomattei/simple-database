@@ -1,8 +1,9 @@
 //! sdb-gui: desktop app for designing schemas and working with databases.
 //!
-//! Usage: `sdb-gui [schema.dbs] [database.db | postgres://… | mysql://…] [--tab schema|diagram|sql|migrate|query|data|seed]`
+//! Usage: `sdb-gui [schema.dbs] [database.db | postgres://… | mysql://… | @saved] [--tab schema|diagram|sql|migrate|query|data|seed]`
 //! Arguments may come in either order; SQLite files are recognised by their header.
 
+mod conns;
 mod editor;
 mod er;
 mod grid;
@@ -15,6 +16,7 @@ use simple_database::ddl::{self, Dialect};
 use simple_database::diagram::{self, DiagramFormat};
 use simple_database::parser::{self, ParseError};
 use simple_database::schema::Schema;
+use simple_database::connections::Store;
 use simple_database::db::{self, Database, QueryResult};
 use simple_database::seed::{self, SeedOptions, TableReport};
 use simple_database::sqlite;
@@ -96,7 +98,7 @@ enum Dialog {
     Unsaved(Pending),
     ConfirmPush,
     Syntax,
-    Connect { url: String, error: Option<String> },
+    Connections(Box<conns::Manager>),
 }
 
 struct Analysis {
@@ -147,6 +149,8 @@ struct App {
     status: Option<(String, bool, Instant)>,
     dialog: Option<Dialog>,
     allow_close: bool,
+    /// Saved connections (re-read from disk before every change).
+    conns: Store,
 }
 
 impl App {
@@ -184,7 +188,12 @@ impl App {
             status: None,
             dialog: None,
             allow_close: false,
+            conns: Store::default(),
         };
+        match Store::load() {
+            Ok(store) => app.conns = store,
+            Err(e) => app.set_status(format!("Cannot read saved connections: {e:#}"), true),
+        }
 
         // Arguments on the command line win over the last session.
         let mut args: Vec<String> = Vec::new();
@@ -207,6 +216,7 @@ impl App {
             for a in args {
                 let path = Path::new(&a);
                 let is_db = db::is_url(&a)
+                    || a.starts_with('@')
                     || sqlite::is_sqlite_file(path)
                     || matches!(path.extension().and_then(|e| e.to_str()), Some("db" | "sqlite" | "sqlite3"));
                 if is_db {
@@ -324,34 +334,58 @@ impl App {
         }
     }
 
-    /// Open a SQLite file or connect to a server URL. A failed connection
-    /// to a server reopens the connect dialog, e.g. to type a password.
+    /// Open a SQLite file, or connect to a server URL or saved `@name`. A
+    /// failed connection to a server opens the Connections dialog, e.g. to
+    /// type a password.
     fn open_db(&mut self, target: &str) {
-        let opened = Database::open(target).and_then(|mut conn| {
+        let label = db::redact(target);
+        if let Err(e) = self.attach_db(Database::open(target)) {
+            if let Some(name) = target.strip_prefix('@') {
+                let mut m = conns::Manager::new(&self.conns, Some(name));
+                m.message = Some((e, true));
+                self.dialog = Some(Dialog::Connections(Box::new(m)));
+            } else if db::is_url(target) {
+                self.dialog = Some(Dialog::Connections(Box::new(conns::Manager::for_target(target, e))));
+            } else {
+                self.set_status(format!("Cannot open {label}: {e}"), true);
+            }
+        }
+    }
+
+    /// Read a newly opened database and make it the current one.
+    fn attach_db(&mut self, opened: anyhow::Result<Database>) -> Result<(), String> {
+        let opened = opened.and_then(|mut conn| {
             let schema = conn.introspect()?;
             let counts = conn.row_counts(&schema)?;
             Ok(Db { conn, schema, counts })
         });
-        match opened {
-            Ok(db) => {
-                self.set_status(format!("Connected to {}", db.conn.label()), false);
-                let dialect = db.conn.dialect();
-                if [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql].iter().any(|d| self.query == default_query(*d)) {
-                    self.query = default_query(dialect).into();
-                }
-                self.data_table = db.schema.tables.first().map(|t| t.name.clone());
-                self.db = Some(db);
-                self.data_page = 0;
-                self.data_out = None;
-                self.query_out = None;
-                self.seed.tables.clear();
-                self.seed.report = None;
+        let db = opened.map_err(|e| format!("{e:#}"))?;
+        self.set_status(format!("Connected to {}", db.conn.label()), false);
+        if let Some(name) = db.conn.label().strip_prefix('@') {
+            // `Database::open` already recorded `@name` as used; others (typed passwords) are recorded here.
+            if let Ok(mut fresh) = Store::load() {
+                fresh.touch(name);
+                let _ = fresh.save();
+                self.conns = fresh;
             }
-            Err(e) if db::is_url(target) => {
-                self.dialog = Some(Dialog::Connect { url: target.to_string(), error: Some(format!("{e:#}")) });
-            }
-            Err(e) => self.set_status(format!("Cannot open {target}: {e:#}"), true),
         }
+        let dialect = db.conn.dialect();
+        if [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql].iter().any(|d| self.query == default_query(*d)) {
+            self.query = default_query(dialect).into();
+        }
+        self.data_table = db.schema.tables.first().map(|t| t.name.clone());
+        self.db = Some(db);
+        self.data_page = 0;
+        self.data_out = None;
+        self.query_out = None;
+        self.seed.tables.clear();
+        self.seed.report = None;
+        Ok(())
+    }
+
+    fn open_connections(&mut self) {
+        let current = self.db.as_ref().and_then(|d| d.conn.label().strip_prefix('@'));
+        self.dialog = Some(Dialog::Connections(Box::new(conns::Manager::new(&self.conns, current))));
     }
 
     /// Reload schema and row counts after the database changed.
@@ -386,6 +420,9 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_shortcut(&cmd(Key::N))) {
             self.request(Pending::NewSchema, ctx);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&cmd(Key::K))) {
+            self.open_connections();
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -427,8 +464,8 @@ impl App {
                     self.open_db(&p.to_string_lossy());
                     self.tab = Tab::Migrate;
                 }
-                if ui.button("Connect to server…").clicked() {
-                    self.dialog = Some(Dialog::Connect { url: String::new(), error: None });
+                if ui.add(egui::Button::new("Connections…").shortcut_text(ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::K)))).clicked() {
+                    self.open_connections();
                 }
                 if ui.add_enabled(self.db.is_some(), egui::Button::new("Close database")).clicked() {
                     self.db = None;
@@ -503,10 +540,30 @@ impl App {
                         self.open_db(&p.to_string_lossy());
                         self.tab = Tab::Migrate;
                     }
-                    if ui.button("Connect…").on_hover_text("PostgreSQL or MySQL server").clicked() {
-                        self.dialog = Some(Dialog::Connect { url: String::new(), error: None });
+                    if ui.button("Connections…").on_hover_text("Saved connections, PostgreSQL and MySQL servers").clicked() {
+                        self.open_connections();
                     }
                 });
+                // Quick access: favorites, then recently used.
+                let mut quick: Vec<_> = self.conns.connections.iter().filter(|c| c.favorite).collect();
+                quick.sort_by_key(|c| c.name.to_lowercase());
+                quick.extend(self.conns.recent(5).into_iter().filter(|c| !c.favorite));
+                let mut connect = None;
+                if !quick.is_empty() {
+                    ui.add_space(4.0);
+                    for c in quick {
+                        ui.horizontal(|ui| {
+                            conns::color_dot(ui, c.color);
+                            let star = if c.favorite { "★ " } else { "" };
+                            if ui.selectable_label(false, format!("{star}{}", c.name)).on_hover_text(c.summary()).clicked() {
+                                connect = Some(format!("@{}", c.name));
+                            }
+                        });
+                    }
+                }
+                if let Some(target) = connect {
+                    self.open_db(&target);
+                }
             }
             Some(db) => {
                 let label = db.conn.label();
@@ -520,8 +577,12 @@ impl App {
                     Dialect::Postgres => "PostgreSQL",
                     Dialect::Mysql => "MySQL",
                 };
+                let saved = label.strip_prefix('@').and_then(|n| self.conns.get(n));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(name).strong()).on_hover_text(label);
+                    if let Some(c) = saved {
+                        conns::color_dot(ui, c.color);
+                    }
+                    ui.label(RichText::new(name).strong()).on_hover_text(saved.map_or_else(|| label.to_string(), |c| c.summary()));
                     ui.label(RichText::new(kind).small().weak());
                 });
                 egui::ScrollArea::vertical().id_salt("db_tables").show(ui, |ui| {
@@ -1188,56 +1249,25 @@ impl App {
                 });
                 resp.should_close()
             }
-            Dialog::Connect { url, error } => {
-                let (mut url, error) = (url.clone(), error.clone());
-                let (mut connect, mut cancel) = (false, false);
-                let resp = egui::Modal::new(egui::Id::new("connect")).show(ctx, |ui| {
-                    ui.set_width(480.0);
-                    ui.heading("Connect to a server");
-                    ui.label("PostgreSQL or MySQL connection URL:");
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut url)
-                            .hint_text("postgres://user:password@localhost:5432/app")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if url.is_empty() {
-                        edit.request_focus();
-                    }
-                    if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        connect = true;
-                    }
-                    ui.label(
-                        RichText::new(
-                            "MySQL: mysql://user:password@localhost:3306/app. Without a password in the URL, \
-                             PGPASSWORD or MYSQL_PWD is used. Passwords are not saved. TLS: add \
-                             ?sslmode=verify-full&sslrootcert=ca.pem&sslcert=client.pem&sslkey=client.key",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    if let Some(e) = &error {
-                        ui.colored_label(error_color(ui), format!("✖ {e}"));
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(db::is_url(url.trim()), egui::Button::new(RichText::new("Connect").strong())).clicked() {
-                            connect = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
+            Dialog::Connections(_) => {
+                let Some(Dialog::Connections(mut m)) = self.dialog.take() else { unreachable!() };
+                let mut action = None;
+                let resp = egui::Modal::new(egui::Id::new("connections")).show(ctx, |ui| {
+                    action = m.show(ui, &mut self.conns);
                 });
-                self.dialog = Some(Dialog::Connect { url: url.clone(), error });
-                if connect && db::is_url(url.trim()) {
-                    // On failure this reopens the dialog with the error.
-                    self.dialog = None;
-                    self.open_db(url.trim());
-                    if self.dialog.is_none() {
-                        self.tab = Tab::Migrate;
-                    }
+                match action {
+                    Some(conns::Action::Connect { target, label }) => match self.attach_db(Database::open_labeled(&target, label)) {
+                        Ok(()) => {
+                            self.tab = Tab::Migrate;
+                            return;
+                        }
+                        Err(e) => m.message = Some((e, true)),
+                    },
+                    Some(conns::Action::Close) => return,
+                    None => {}
                 }
-                resp.should_close() || cancel
+                self.dialog = Some(Dialog::Connections(m));
+                resp.should_close()
             }
             Dialog::Syntax => {
                 let resp = egui::Modal::new(egui::Id::new("syntax")).show(ctx, |ui| {

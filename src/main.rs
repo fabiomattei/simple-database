@@ -14,9 +14,9 @@ use simple_database::validate::{Issue, Severity, print_issues};
 /// Wherever a SCHEMA argument is expected you can pass a `.dbs` schema file, an
 /// existing SQLite database file or a database URL; databases are introspected.
 ///
-/// `--db` takes a SQLite file or a URL: `postgres://user:pass@host/db` or
-/// `mysql://user:pass@host/db`. Without a password in the URL, PGPASSWORD or
-/// MYSQL_PWD is used.
+/// `--db` takes a SQLite file, a URL (`postgres://user:pass@host/db` or
+/// `mysql://user:pass@host/db`) or `@name`, a connection saved with `sdb conn
+/// add`. Without a password, PGPASSWORD or MYSQL_PWD is used.
 #[derive(Parser)]
 #[command(name = "sdb", version, about, long_about)]
 struct Cli {
@@ -121,6 +121,34 @@ enum Command {
         #[arg(long)]
         db: Option<String>,
     },
+    /// Manage saved connections, used as `--db @name`
+    #[command(subcommand)]
+    Conn(ConnCommand),
+}
+
+#[derive(Subcommand)]
+enum ConnCommand {
+    /// List saved connections
+    List,
+    /// Save a connection (a password in the URL is saved too, unless --no-password)
+    Add {
+        name: String,
+        /// SQLite file or postgres:// / mysql:// URL
+        target: String,
+        #[arg(short, long, default_value = "")]
+        group: String,
+        /// Don't save the URL's password; it is asked for (GUI) or read from
+        /// PGPASSWORD / MYSQL_PWD (CLI) when connecting
+        #[arg(long)]
+        no_password: bool,
+        /// Replace an existing connection with the same name
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Delete a saved connection
+    Remove { name: String },
+    /// Connect to a saved connection and report the result
+    Test { name: String },
 }
 
 use simple_database::STARTER_SCHEMA as STARTER;
@@ -238,6 +266,61 @@ fn run(cli: Cli) -> Result<()> {
             };
             shell::run(db)?;
         }
+        Command::Conn(cmd) => conn_command(cmd)?,
+    }
+    Ok(())
+}
+
+fn conn_command(cmd: ConnCommand) -> Result<()> {
+    let mut store = connections::Store::load()?;
+    match cmd {
+        ConnCommand::List => {
+            if store.connections.is_empty() {
+                eprintln!("No saved connections. Add one with `sdb conn add NAME URL`.");
+            }
+            for (group, conns) in store.grouped("") {
+                if !group.is_empty() {
+                    println!("{group}/");
+                }
+                for c in conns {
+                    let indent = if group.is_empty() { "" } else { "  " };
+                    let star = if c.favorite { " ★" } else { "" };
+                    let key = if store.password(&c.name).is_some() { " (password saved)" } else { "" };
+                    println!("{indent}@{:<20} {:<10} {}{key}{star}", c.name, c.kind.label(), c.summary());
+                }
+            }
+        }
+        ConnCommand::Add { name, target, group, no_password, force } => {
+            let (mut conn, password) = connections::Connection::from_target(&name, &target)?;
+            if conn.kind == connections::Kind::Sqlite {
+                // Saved connections are used from any directory.
+                conn.database = std::path::absolute(&conn.database)?.to_string_lossy().into_owned();
+            }
+            conn.group = group;
+            conn.save_password = password.is_some() && !no_password;
+            let old = store.get(&conn.name).map(|c| c.name.clone());
+            if old.is_some() && !force {
+                bail!("a connection named '{}' already exists (use --force to replace it)", conn.name);
+            }
+            store.upsert(old.as_deref(), conn, password)?;
+            store.save()?;
+            println!("Saved @{name} in {}", store.dir().join("connections.json").display());
+        }
+        ConnCommand::Remove { name } => {
+            let name = name.trim_start_matches('@');
+            if !store.remove(name) {
+                bail!("no saved connection named '{name}'");
+            }
+            store.save()?;
+            println!("Removed @{name}");
+        }
+        ConnCommand::Test { name } => {
+            let name = name.trim_start_matches('@');
+            let started = std::time::Instant::now();
+            let mut db = db::Database::open(&format!("@{name}"))?;
+            let tables = db.introspect()?.tables.len();
+            println!("Connected to @{name} in {:.0?}: {tables} table(s)", started.elapsed());
+        }
     }
     Ok(())
 }
@@ -250,7 +333,7 @@ fn parse_count(s: &str) -> Result<(String, usize), String> {
 
 /// Load a schema from a `.dbs` file or by introspecting a database.
 fn load_schema(path: &Path) -> Result<Schema> {
-    if let Some(url) = path.to_str().filter(|p| db::is_url(p)) {
+    if let Some(url) = path.to_str().filter(|p| db::is_url(p) || p.starts_with('@')) {
         return db::Database::open(url)?.introspect();
     }
     ensure_exists(path)?;
@@ -275,9 +358,10 @@ fn load_valid_schema(path: &Path) -> Result<Schema> {
     Ok(s)
 }
 
-/// Connect to a database URL, or open a SQLite file that must already exist.
+/// Connect to a database URL or saved connection, or open a SQLite file that
+/// must already exist.
 fn open_existing(target: &str) -> Result<db::Database> {
-    if !db::is_url(target) {
+    if !db::is_url(target) && !target.starts_with('@') {
         ensure_exists(Path::new(target))?;
     }
     db::Database::open(target)

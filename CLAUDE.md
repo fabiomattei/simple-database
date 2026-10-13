@@ -40,6 +40,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `ddl.rs` | `Dialect` enum and all CREATE/DROP SQL; `quote()` quotes only when needed; `canonical()` = the schema as a dialect reports it back |
 | `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change |
 | `diagram.rs` | Text diagrams: Mermaid / Graphviz DOT (the GUI canvas is separate, in `gui/er.rs`) |
+| `connections.rs` | Saved connections (`Store`: `connections.json` + 0600 `secrets.json` in `config_dir()`). `Connection::from_target` / `target` convert to and from URLs. `resolve("@name")` is called by `Database::open` |
 | `db.rs` | `Database`: one live connection (SQLite path or `postgres://` / `mysql://` URL). `introspect`, `run` / `run_limited`, `row_counts`, `migration`, `apply_migration`, `normalize_checks`. Also `Cell` / `QueryResult` and `split_statements` |
 | `sqlite.rs` | SQLite introspection, `run_limited` (multi-statement via `rusqlite::Batch`), `apply_migration` |
 | `pg.rs` | Postgres via the `postgres` crate (NoTls): catalog introspection; queries are prepared for column types, then run with the simple protocol so every value arrives as text |
@@ -55,6 +56,7 @@ Binaries:
 | `src/main.rs` | `sdb` clap CLI; `load_schema` accepts a `.dbs` file **or** a SQLite file (detected by magic header) |
 | `src/gui/main.rs` | `sdb-gui`: `App` state, menus, sidebar, one `tab_*` method per tab, modal `Dialog`s, `Settings` persisted via eframe storage |
 | `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom) |
+| `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
 | `src/gui/grid.rs` | Virtualized result grid (egui_extras `TableBuilder`), shared by Query and Data |
 | `src/gui/editor.rs` | `code_editor`: `TextEdit` plus column selection (multi-caret, consumed from input before `TextEdit` sees it) and the autocomplete popup (`Vocabulary` from a `Schema`) |
 | `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view` |

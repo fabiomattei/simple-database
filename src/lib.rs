@@ -2,6 +2,7 @@
 //! access (SQLite, PostgreSQL, MySQL) and seeding. Shared by the `sdb` CLI and
 //! the `sdb-gui` desktop app.
 
+pub mod connections;
 pub mod db;
 pub mod ddl;
 pub mod diagram;

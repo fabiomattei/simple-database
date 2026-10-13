@@ -23,10 +23,22 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | **Data** | Browse any table, 200 rows per page |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
 
-**File → Connect to server…** (or **Connect…** in the sidebar) opens a PostgreSQL or MySQL
-URL. The app remembers the last schema file and database between sessions. For servers it
-stores the URL without the password, so a password must come from `PGPASSWORD` / `MYSQL_PWD`
-or be typed again. It asks before closing or
+**File → Connections…** (Ctrl+K, or **Connections…** in the sidebar) manages saved
+connections (see [Saved connections](#saved-connections)). The list on the left has a search
+box (it matches name, host, database, user, type and group), **Favorites**, the five most
+**Recent** connections, and the rest in collapsible groups. Double-click a connection to
+connect. The form on the right edits the selected connection: name, type (PostgreSQL, MySQL,
+SQLite), host, port, user, password (**Save password** keeps it), database or file, group,
+color and favorite. **TLS and options** holds the SSL mode and certificate files. **Import
+URL** fills the form from a pasted URL. **Test** connects without opening the database,
+**Connect** saves the form and connects (with an empty name it connects without saving), and
+**Duplicate** and **Delete** do what they say. Favorites and recent connections are also
+listed in the sidebar while no database is open. When a connection fails, for example because
+a password is missing, the dialog opens with the error.
+
+The app remembers the last schema file and database between sessions. For a saved connection
+it stores `@name`. For a plain server URL it stores the URL without the password, so the
+password must come from `PGPASSWORD` / `MYSQL_PWD` or be typed again. It asks before closing or
 replacing unsaved edits. `--tab <name>` opens a specific tab. Ctrl+S / Ctrl+O / Ctrl+N save,
 open and start a new schema. On Linux, file dialogs use the XDG desktop portal.
 
@@ -92,12 +104,13 @@ table post_tags {
 
 Any `SCHEMA` argument may be a `.dbs` file, **a SQLite database file or a database URL**: databases are introspected automatically.
 
-`--db` takes a SQLite file or a server URL:
+`--db` takes a SQLite file, a server URL or a saved connection:
 
 ```sh
 --db app.db                                   # SQLite (push creates it if missing)
 --db postgres://user:password@localhost:5432/app
 --db mysql://user:password@localhost:3306/app # also mariadb://
+--db @prod                                    # saved connection (see below)
 ```
 
 Without a password in the URL, `PGPASSWORD` or `MYSQL_PWD` is used. PostgreSQL works on the
@@ -136,6 +149,28 @@ verifies the CA, as libpq does:
 | `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42]` | Fill tables with realistic fake data (see below) |
 | `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown]` | Run SQL, print results |
 | `sdb shell [--db app.db]` | Interactive SQL shell (in-memory if no `--db`) |
+| `sdb conn list` | List saved connections by group |
+| `sdb conn add NAME URL\|FILE [-g GROUP] [--no-password] [-f]` | Save a connection. A password in the URL is saved unless `--no-password`; `-f` replaces an existing one |
+| `sdb conn remove NAME` | Delete a saved connection |
+| `sdb conn test NAME` | Connect and report how many tables there are |
+
+### Saved connections
+
+Connections saved in the app or with `sdb conn add` are shared by both, and `@name` works
+wherever a database is expected (`--db`, `SCHEMA` arguments, `sdb-gui @prod`):
+
+```sh
+sdb conn add prod "postgres://app:secret@db.example.com/app?sslmode=verify-full" -g Work
+sdb conn add dev dev.db                   # SQLite paths are stored as absolute paths
+sdb push schema.dbs --db @prod --dry-run
+sdb diff @prod schema.dbs -d postgres
+```
+
+They are stored in `connections.json` in `$SDB_CONFIG_DIR`, else `$XDG_CONFIG_HOME/sdb`, else
+`~/.config/sdb` (`%APPDATA%\sdb` on Windows). Saved passwords are kept apart in `secrets.json`,
+which only you can read (mode 0600, like `~/.pgpass`; it is not encrypted). That way
+`connections.json` can be copied or shared without them. A connection without a saved
+password uses `PGPASSWORD` / `MYSQL_PWD`, or the app asks for it.
 
 ### Typical workflow
 
