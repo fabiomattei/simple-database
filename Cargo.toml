@@ -1,0 +1,29 @@
+[package]
+name = "simple_database"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+comfy-table = "8.0.1"
+eframe = { version = "0.36.2", features = ["persistence"] }
+egui_extras = "0.36.2"
+mysql = { version = "28.0.3", default-features = false, features = ["minimal-rust"] }
+postgres = "0.19.14"
+rfd = "0.17.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustyline = "18.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sdb"
+path = "src/main.rs"
+
+[[bin]]
+name = "sdb-gui"
+path = "src/gui/main.rs"
