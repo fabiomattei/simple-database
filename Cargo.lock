@@ -3731,6 +3731,7 @@ dependencies = [
  "comfy-table",
  "eframe",
  "egui_extras",
+ "image",
  "mysql",
  "postgres",
  "rfd",

@@ -16,7 +16,7 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | Tab | What you do there |
 |---|---|
 | **Schema** | Edit the `.dbs` file with syntax highlighting and line numbers. Errors and design warnings update as you type |
-| **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll to zoom. Show the schema file or the live database; copy as Mermaid or export Graphviz DOT |
+| **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file or the live database. **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
 | **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save |
 | **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **Pull** replaces the editor with the database's schema |
 | **Query** | Run SQL (Ctrl+Enter) and see the results in a grid. Shows up to 10,000 rows per result |

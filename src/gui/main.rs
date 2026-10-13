@@ -473,6 +473,7 @@ impl App {
                 let resp = ui.selectable_label(selected, label).on_hover_text(format!("{} columns", t.columns.len()));
                 if resp.clicked() {
                     self.er.selected = Some(t.name.clone());
+                    self.er.set_hidden(&t.name, false);
                     self.er_source = DiagramSource::SchemaFile;
                     self.tab = Tab::Diagram;
                 }
@@ -663,20 +664,71 @@ impl App {
             if ui.button("Fit").clicked() {
                 self.er.request_fit();
             }
+            if ui.button("−").on_hover_text("Zoom out").clicked() {
+                self.er.zoom_by(1.0 / 1.25);
+            }
+            if ui.button(format!("{:.0}%", self.er.zoom() * 100.0)).on_hover_text("Reset zoom to 100%").clicked() {
+                self.er.set_zoom(1.0);
+            }
+            if ui.button("+").on_hover_text("Zoom in").clicked() {
+                self.er.zoom_by(1.25);
+            }
             ui.separator();
-            let schema = self.diagram_schema(&db_schema);
-            if ui.button("Copy Mermaid").on_hover_text("Paste into GitHub/GitLab markdown").clicked() {
-                ui.ctx().copy_text(diagram::render(&schema, DiagramFormat::Mermaid));
-                self.set_status("Mermaid diagram copied to clipboard", false);
-            }
-            if ui.button("Export DOT…").clicked()
-                && let Some(p) = rfd::FileDialog::new().add_filter("Graphviz", &["dot", "gv"]).set_file_name("schema.dot").save_file()
-            {
-                match std::fs::write(&p, diagram::render(&schema, DiagramFormat::Dot)) {
-                    Ok(()) => self.set_status(format!("Wrote {}", p.display()), false),
-                    Err(e) => self.set_status(format!("Cannot write {}: {e}", p.display()), true),
+            let full = self.diagram_schema(&db_schema);
+            let shown = full.tables.iter().filter(|t| !self.er.is_hidden(&t.name)).count();
+            let config = egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+            egui::containers::menu::MenuButton::new(format!("Tables {shown}/{} ⏷", full.tables.len())).config(config).ui(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Show all").clicked() {
+                        self.er.show_all();
+                    }
+                    if ui.button("Hide all").clicked() {
+                        self.er.hide_all(&full);
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    for t in &full.tables {
+                        let mut visible = !self.er.is_hidden(&t.name);
+                        if ui.checkbox(&mut visible, &t.name).changed() {
+                            self.er.set_hidden(&t.name, !visible);
+                        }
+                    }
+                });
+            });
+            let schema = self.er.visible(&full);
+            ui.menu_button("Export ⏷", |ui| {
+                if ui.button("PNG image…").on_hover_text("The canvas as shown; press Fit first for the whole diagram").clicked() {
+                    ui.close();
+                    if let Some(p) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name("schema.png").save_file() {
+                        self.er.export_png(p);
+                    }
                 }
-            }
+                if ui.button("SVG image…").on_hover_text("Every visible table, at 100%, light background").clicked() {
+                    ui.close();
+                    if let Some(p) = rfd::FileDialog::new().add_filter("SVG image", &["svg"]).set_file_name("schema.svg").save_file() {
+                        match std::fs::write(&p, self.er.svg(&full)) {
+                            Ok(()) => self.set_status(format!("Wrote {}", p.display()), false),
+                            Err(e) => self.set_status(format!("Cannot write {}: {e}", p.display()), true),
+                        }
+                    }
+                }
+                ui.separator();
+                if ui.button("Copy Mermaid").on_hover_text("Paste into GitHub/GitLab markdown").clicked() {
+                    ui.close();
+                    ui.ctx().copy_text(diagram::render(&schema, DiagramFormat::Mermaid));
+                    self.set_status("Mermaid diagram copied to clipboard", false);
+                }
+                if ui.button("Graphviz DOT…").clicked() {
+                    ui.close();
+                    if let Some(p) = rfd::FileDialog::new().add_filter("Graphviz", &["dot", "gv"]).set_file_name("schema.dot").save_file() {
+                        match std::fs::write(&p, diagram::render(&schema, DiagramFormat::Dot)) {
+                            Ok(()) => self.set_status(format!("Wrote {}", p.display()), false),
+                            Err(e) => self.set_status(format!("Cannot write {}: {e}", p.display()), true),
+                        }
+                    }
+                }
+            });
             if self.er_source == DiagramSource::SchemaFile && self.analysis.result.is_err() {
                 ui.colored_label(warn_color(ui), "⚠ showing last valid version");
             }
@@ -684,6 +736,11 @@ impl App {
         ui.add_space(4.0);
         let schema = self.diagram_schema(&db_schema);
         self.er.ui(ui, &schema);
+        match self.er.take_png_result() {
+            Some(Ok(p)) => self.set_status(format!("Wrote {}", p.display()), false),
+            Some(Err(e)) => self.set_status(e, true),
+            None => {}
+        }
     }
 
     fn diagram_schema(&self, db_schema: &Option<Schema>) -> Schema {

@@ -57,6 +57,9 @@ fn mermaid(schema: &Schema) -> String {
     for t in &schema.tables {
         for c in &t.columns {
             let Some(fk) = &c.references else { continue };
+            if schema.table(&fk.table).is_none() {
+                continue;
+            }
             let parent = if c.nullable { "|o" } else { "||" };
             let child = if c.unique { "o|" } else { "o{" };
             out.push_str(&format!(
@@ -102,7 +105,9 @@ fn dot(schema: &Schema) -> String {
     out.push('\n');
     for t in &schema.tables {
         for c in &t.columns {
-            if let Some(fk) = &c.references {
+            if let Some(fk) = &c.references
+                && schema.table(&fk.table).is_some()
+            {
                 out.push_str(&format!(
                     "    \"{}\":\"{}\" -> \"{}\":\"{}\";\n",
                     fk.table, fk.column, t.name, c.name
@@ -132,5 +137,13 @@ mod tests {
         assert!(m.contains("users |o--o{ posts : \"editor_id\""));
         let d = render(&s, DiagramFormat::Dot);
         assert!(d.contains("\"users\":\"id\" -> \"posts\":\"author_id\";"));
+    }
+
+    #[test]
+    fn skips_relationships_to_missing_tables() {
+        let mut s = parse("table users { id int pk }\ntable posts { id int pk\n author_id int -> users.id }").unwrap();
+        s.tables.retain(|t| t.name == "posts");
+        assert!(!render(&s, DiagramFormat::Mermaid).contains("users"));
+        assert!(!render(&s, DiagramFormat::Dot).contains("users"));
     }
 }
