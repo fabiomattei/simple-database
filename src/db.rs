@@ -244,6 +244,73 @@ impl Database {
         };
         self.query_value(sql)
     }
+
+    /// The query plan of each statement in `sql`, as one `QUERY PLAN` text column.
+    /// SQLite only plans (`EXPLAIN QUERY PLAN`). Postgres and MySQL run the
+    /// statement with `EXPLAIN ANALYZE` inside a transaction that is rolled
+    /// back, so the plan shows real timings while writes are discarded.
+    pub fn explain(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
+        let mut results = Vec::new();
+        for stmt in split_statements(sql) {
+            let explained = stmt.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+            let result = if explained {
+                self.run(&stmt)?.pop()
+            } else {
+                match self.dialect() {
+                    Dialect::Sqlite => self.run(&format!("EXPLAIN QUERY PLAN {stmt}"))?.pop().map(sqlite_plan_tree),
+                    Dialect::Postgres => self.rolled_back(&format!("EXPLAIN (ANALYZE, BUFFERS) {stmt}"))?,
+                    // EXPLAIN ANALYZE needs MySQL 8.0.18+ and supports only some statements.
+                    Dialect::Mysql => match self.rolled_back(&format!("EXPLAIN ANALYZE {stmt}")) {
+                        Ok(r) => r,
+                        Err(_) => self.run(&format!("EXPLAIN {stmt}"))?.pop(),
+                    },
+                }
+            };
+            results.extend(result.map(plan_lines));
+        }
+        Ok(results)
+    }
+
+    /// Run one statement in a transaction and roll it back, even on error.
+    fn rolled_back(&mut self, stmt: &str) -> Result<Option<QueryResult>> {
+        self.execute(if self.dialect() == Dialect::Mysql { "START TRANSACTION" } else { "BEGIN" })?;
+        let result = self.run(stmt);
+        self.execute("ROLLBACK")?;
+        Ok(result?.pop())
+    }
+}
+
+/// `EXPLAIN QUERY PLAN` rows (id, parent, notused, detail) as an indented tree.
+fn sqlite_plan_tree(r: QueryResult) -> QueryResult {
+    let mut depth: HashMap<i64, usize> = HashMap::new();
+    let rows = r
+        .rows
+        .into_iter()
+        .map(|row| {
+            let id = |i: usize| if let Some(Cell::Int(n)) = row.get(i) { *n } else { 0 };
+            let d = depth.get(&id(1)).map_or(0, |d| d + 1);
+            depth.insert(id(0), d);
+            let detail = row.get(3).map(Cell::display).unwrap_or_default();
+            let line = if d == 0 { detail } else { format!("{}->  {detail}", "      ".repeat(d - 1)) };
+            vec![Cell::Text(line)]
+        })
+        .collect();
+    QueryResult { columns: vec!["QUERY PLAN".into()], rows, changes: None, truncated: false }
+}
+
+/// Split a single-column plan whose cells hold several lines (MySQL's
+/// `EXPLAIN ANALYZE`) into one row per line.
+fn plan_lines(r: QueryResult) -> QueryResult {
+    if r.columns.len() != 1 || !r.rows.iter().flatten().any(|c| matches!(c, Cell::Text(s) if s.contains('\n'))) {
+        return r;
+    }
+    let rows = r
+        .rows
+        .iter()
+        .flatten()
+        .flat_map(|c| c.display().lines().map(|l| vec![Cell::Text(l.to_string())]).collect::<Vec<_>>())
+        .collect();
+    QueryResult { columns: vec!["QUERY PLAN".into()], rows, ..r }
 }
 
 fn is_comment(stmt: &str) -> bool {
@@ -480,6 +547,21 @@ mod tests {
         assert_eq!(redact("app.db"), "app.db");
     }
 
+    #[test]
+    fn explains_sqlite_queries_as_a_tree() {
+        let mut db = Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "mem");
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INT); CREATE TABLE b (id INTEGER PRIMARY KEY); \
+                    INSERT INTO b VALUES (1)")
+            .unwrap();
+        let plans = db.explain("SELECT (SELECT count(*) FROM b WHERE b.id > a.b_id) FROM a; DELETE FROM b").unwrap();
+        assert_eq!(plans.len(), 2);
+        let lines: Vec<String> = plans[0].rows.iter().map(|r| r[0].display()).collect();
+        assert!(lines.iter().any(|l| l.starts_with("SCAN") || l.starts_with("SEARCH")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("->  ")), "{lines:?}");
+        assert_eq!(db.query_value("SELECT count(*) FROM b").unwrap(), Cell::Int(1));
+        assert_eq!(db.explain("EXPLAIN QUERY PLAN SELECT 1").unwrap()[0].columns.len(), 4);
+    }
+
     /// Push `src` into a live server twice: the second time there must be
     /// nothing to do, and seeding must fill every table.
     fn live_round_trip(url: &str) {
@@ -522,6 +604,12 @@ mod tests {
         let r = db.run("SELECT count(*) FROM posts; SELECT published, title FROM posts LIMIT 2").unwrap();
         assert_eq!(r[0].rows[0][0], Cell::Int(15));
         assert_eq!(r[1].rows.len(), 2);
+
+        // Explain shows a plan and keeps no changes.
+        let plans = db.explain("SELECT * FROM posts WHERE id = 1; DELETE FROM post_tags").unwrap();
+        assert_eq!(plans.len(), 2);
+        assert!(plans.iter().all(|p| p.columns == ["QUERY PLAN"] && !p.rows.is_empty()), "{:?}", plans[0].columns);
+        assert_eq!(db.query_value("SELECT count(*) FROM post_tags").unwrap(), Cell::Int(15));
         drop_all(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
     }

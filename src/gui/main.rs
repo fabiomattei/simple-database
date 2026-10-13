@@ -873,10 +873,16 @@ impl App {
         }
         let run_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
         let mut run = ui.input_mut(|i| i.consume_shortcut(&run_shortcut));
+        let mut explain = false;
         ui.horizontal(|ui| {
             if ui.button(RichText::new("▶ Run").strong()).on_hover_text(ui.ctx().format_shortcut(&run_shortcut)).clicked() {
                 run = true;
             }
+            let explain_hint = match self.db.as_ref().map(|d| d.conn.dialect()) {
+                Some(Dialect::Sqlite) => "Show the query plan (EXPLAIN QUERY PLAN) without running the query",
+                _ => "Run with EXPLAIN ANALYZE in a transaction that is rolled back: real timings, no changes kept",
+            };
+            explain = ui.button("Explain").on_hover_text(explain_hint).clicked();
             ui.label(RichText::new(format!("{} runs all statements", ui.ctx().format_shortcut(&run_shortcut))).weak());
         });
         egui::Panel::top("query_editor")
@@ -892,6 +898,8 @@ impl App {
 
         if run {
             self.run_query();
+        } else if explain {
+            self.explain_query();
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -928,6 +936,13 @@ impl App {
                 }
             }
         });
+    }
+
+    fn explain_query(&mut self) {
+        let Some(db) = &mut self.db else { return };
+        let start = Instant::now();
+        let results = db.conn.explain(&self.query).map_err(|e| format!("{e:#}"));
+        self.query_out = Some(QueryOutput { results, elapsed: start.elapsed(), selected: 0 });
     }
 
     fn run_query(&mut self) {
