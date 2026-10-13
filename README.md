@@ -30,6 +30,21 @@ or be typed again. It asks before closing or
 replacing unsaved edits. `--tab <name>` opens a specific tab. Ctrl+S / Ctrl+O / Ctrl+N save,
 open and start a new schema. On Linux, file dialogs use the XDG desktop portal.
 
+Both editors (Schema and Query) support TextMate-style column selection and autocomplete:
+
+| Keys | Effect |
+|---|---|
+| Alt+drag | Select a rectangle, with one caret per line |
+| Tap Alt | Turn a multi-line selection into a rectangle |
+| Alt+Shift+↑ / ↓ | Add a caret on the line above / below |
+| Typing, Backspace, Delete, ← → Home End, copy / cut / paste | Act on every line. Pasting as many lines as there are carets puts one on each |
+| Esc, click, or any other key | Back to a single caret |
+| Ctrl+Space | Open autocomplete (it also opens while you type a word, or after `table.`) |
+| ↑ ↓, Enter / Tab, Esc | Choose, accept, or close a suggestion |
+
+Suggestions are keywords, types, table names and column names. In SQL, `alias.` completes
+the columns of `FROM users u`-style aliases.
+
 ## Command line (`sdb`)
 
 Everything the app does is also available from the terminal, for scripts and CI:
@@ -170,7 +185,7 @@ cargo clippy --all-targets
 
 Source layout: `src/lib.rs` is the shared core and `src/main.rs` the CLI. `src/gui/` is the
 desktop app: `main.rs` (window, tabs), `er.rs` (diagram canvas), `grid.rs` (result grid),
-`highlight.rs` (code editor). Core modules: `parser.rs` (DSL) → `schema.rs` (model) → `validate.rs`, `ddl.rs`,
+`editor.rs` (code editor: column selection, autocomplete), `highlight.rs` (syntax colors). Core modules: `parser.rs` (DSL) → `schema.rs` (model) → `validate.rs`, `ddl.rs`,
 `diff.rs`, `diagram.rs`, `format.rs`; `seed.rs` (fake data); `db.rs` (live connections), which
 dispatches to `sqlite.rs`, `pg.rs` and `mysqldb.rs` (introspection & queries); `shell.rs`, `output.rs`.
 

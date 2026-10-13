@@ -8,18 +8,18 @@ pub enum Lang {
     Sql,
 }
 
-const DBS_KEYWORDS: &[&str] = &[
+pub const DBS_KEYWORDS: &[&str] = &[
     "table", "pk", "primary", "key", "autoincrement", "auto_increment", "unique", "not", "null",
     "nullable", "default", "check", "references", "ref", "on", "delete", "update", "index",
     "cascade", "set_null", "set_default", "restrict", "no_action", "set", "no", "action", "now",
     "true", "false",
 ];
-const DBS_TYPES: &[&str] = &[
+pub const DBS_TYPES: &[&str] = &[
     "int", "integer", "bigint", "smallint", "real", "float", "double", "decimal", "numeric", "bool",
     "boolean", "text", "string", "varchar", "char", "date", "time", "timestamp", "datetime", "blob",
     "bytes", "uuid", "json", "jsonb",
 ];
-const SQL_KEYWORDS: &[&str] = &[
+pub const SQL_KEYWORDS: &[&str] = &[
     "select", "from", "where", "and", "or", "not", "null", "is", "in", "like", "between", "join",
     "left", "right", "inner", "outer", "cross", "on", "using", "group", "by", "order", "having",
     "limit", "offset", "asc", "desc", "distinct", "as", "insert", "into", "values", "update", "set",
@@ -142,24 +142,6 @@ pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> LayoutJob {
         i += len;
     }
     job
-}
-
-/// A monospace code editor with highlighting. Returns the response of the text edit.
-pub fn code_editor(ui: &mut egui::Ui, text: &mut String, lang: Lang, id: &str, rows: usize) -> egui::Response {
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        let mut job = highlight(ui, buf.as_str(), lang);
-        job.wrap.max_width = wrap_width;
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
-    ui.add(
-        egui::TextEdit::multiline(text)
-            .id_salt(id)
-            .code_editor()
-            .desired_rows(rows)
-            .desired_width(f32::INFINITY)
-            .lock_focus(true)
-            .layouter(&mut layouter),
-    )
 }
 
 /// Read-only highlighted code, selectable for copying. Never wraps or

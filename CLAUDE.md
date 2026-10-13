@@ -56,7 +56,8 @@ Binaries:
 | `src/gui/main.rs` | `sdb-gui`: `App` state, menus, sidebar, one `tab_*` method per tab, modal `Dialog`s, `Settings` persisted via eframe storage |
 | `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom) |
 | `src/gui/grid.rs` | Virtualized result grid (egui_extras `TableBuilder`), shared by Query and Data |
-| `src/gui/highlight.rs` | DSL/SQL highlighter, `code_editor`, `code_view` |
+| `src/gui/editor.rs` | `code_editor`: `TextEdit` plus column selection (multi-caret, consumed from input before `TextEdit` sees it) and the autocomplete popup (`Vocabulary` from a `Schema`) |
+| `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view` |
 
 `examples/blog.dbs` is not just an example. It is the output of `sdb init`, the GUI's "New
 schema" and its first-run content. The GUI's Help → Schema syntax dialog is built from its
@@ -79,7 +80,7 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
 - **Round-trip with the DSL**: `parse(format_schema(s)) == s`. Test: `format::tests::round_trips`.
 - **Any DSL change** touches `parser.rs` (parse), `format.rs` (print), the round-trip tests and
   the `examples/blog.dbs` header. It usually also touches `ddl.rs`, `diff.rs`, `sqlite.rs`
-  introspection, the README syntax table and the keyword lists in `gui/highlight.rs`.
+  introspection, the README syntax table and the keyword lists in `gui/highlight.rs` (which also feed autocomplete).
 - Foreign key constraints are named `fk_<table>_<column>`. Postgres/MySQL migrations rely on
   that name to drop them.
 - Check constraints are named `<table>_<column>_check` (Postgres picks this name; MySQL DDL
@@ -98,6 +99,8 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   `MenuBar::new().ui(..)`; `ui.fonts_mut(..)` for layout. Check the crate source under
   `~/.cargo/registry/src/` before assuming older egui APIs.
 - egui's bundled fonts lack many symbols (▦ ▤ ◈ → showed as boxes). Check new icons on screen.
+- Code editors don't wrap lines (column selection maps the pointer to line/column by x
+  position), so put them in a `ScrollArea::both`.
 - Read-only code goes through `highlight::code_view`, which forces a non-justified, non-wrapping
   layout. Plain labels inside `ui.columns` get justified and mangle SQL.
 - All database work is synchronous on the UI thread (fine for local SQLite). Query results are

@@ -3,6 +3,7 @@
 //! Usage: `sdb-gui [schema.dbs] [database.db | postgres://… | mysql://…] [--tab schema|diagram|sql|migrate|query|data|seed]`
 //! Arguments may come in either order; SQLite files are recognised by their header.
 
+mod editor;
 mod er;
 mod grid;
 mod highlight;
@@ -636,7 +637,8 @@ impl App {
                     let lines = self.schema_text.lines().count().max(1) + usize::from(self.schema_text.ends_with('\n'));
                     let gutter: String = (1..=lines).map(|n| format!("{n:>3}\n")).collect();
                     ui.add(egui::Label::new(RichText::new(gutter.trim_end()).monospace().size(13.5).weak()).selectable(false));
-                    highlight::code_editor(ui, &mut self.schema_text, Lang::Dbs, "schema_editor", 30);
+                    let vocab = editor::Vocabulary::from_schema(&self.analysis.last_good);
+                    editor::code_editor(ui, &mut self.schema_text, Lang::Dbs, "schema_editor", 30, &vocab);
                 });
             });
         });
@@ -825,8 +827,9 @@ impl App {
             .default_size(170.0)
             .min_size(80.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("query_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                    highlight::code_editor(ui, &mut self.query, Lang::Sql, "query_editor", 8);
+                let vocab = self.db.as_ref().map(|d| editor::Vocabulary::from_schema(&d.schema)).unwrap_or_default();
+                egui::ScrollArea::both().id_salt("query_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    editor::code_editor(ui, &mut self.query, Lang::Sql, "query_editor", 8, &vocab);
                 });
             });
 
