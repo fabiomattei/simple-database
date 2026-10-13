@@ -124,7 +124,14 @@ pub fn align(src: &str) -> Option<String> {
 /// ones removed. Comments in untouched tables survive. Falls back to
 /// `format_schema(new)` when `src` doesn't parse or its layout defeats this.
 pub fn patch(src: &str, new: &Schema) -> String {
+    patch_renamed(src, new, &[])
+}
+
+/// `patch`, where the tables in `renamed` (old name, new name) are reprinted
+/// where the old one was instead of being dropped and appended.
+pub fn patch_renamed(src: &str, new: &Schema, renamed: &[(String, String)]) -> String {
     let Ok(old) = parse(src) else { return format_schema(new) };
+    let new_name = |old: &str| renamed.iter().find(|(o, _)| o == old).map_or(old, |(_, n)| n.as_str()).to_string();
     let outline = crate::parser::outline(src);
     let mut lines: Vec<String> = src.split('\n').map(String::from).collect();
     // Bottom-up, so earlier line numbers stay valid.
@@ -132,7 +139,7 @@ pub fn patch(src: &str, new: &Schema) -> String {
     blocks.sort_by_key(|t| std::cmp::Reverse(t.line));
     for t in blocks {
         let (lo, hi) = (t.line - 1, t.end_line.min(lines.len()) - 1);
-        match new.table(&t.name) {
+        match new.table(&new_name(&t.name)) {
             Some(nt) if old.table(&t.name) == Some(nt) => {}
             Some(nt) => {
                 let printed = format_table(nt);
@@ -145,7 +152,8 @@ pub fn patch(src: &str, new: &Schema) -> String {
         }
     }
     let mut text = lines.join("\n");
-    for t in new.tables.iter().filter(|t| old.table(&t.name).is_none()) {
+    let kept: Vec<String> = old.tables.iter().map(|t| new_name(&t.name)).collect();
+    for t in new.tables.iter().filter(|t| !kept.contains(&t.name)) {
         if !text.is_empty() && !text.ends_with("\n\n") {
             text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
         }
@@ -265,6 +273,11 @@ mod tests {
         assert_eq!(out, "# header\ntable a { # keep me\n  x  int  pk\n}\n\ntable b {\n  y  int  not null\n}\n\ntable d {\n  w  text\n}\n");
         assert!(parse(&out).unwrap().same_tables(&new));
         assert_eq!(patch(src, &parse(src).unwrap()), src, "nothing to do");
+
+        let mut renamed = parse(src).unwrap();
+        renamed.rename_table("b", "bee");
+        let out = patch_renamed(src, &renamed, &[("b".into(), "bee".into())]);
+        assert_eq!(out, src.replace("table b {\n  y int\n}", "table bee {\n  y  int\n}"));
     }
 }
 

@@ -8,6 +8,7 @@ mod editor;
 mod er;
 mod grid;
 mod highlight;
+mod table_edit;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use highlight::Lang;
@@ -103,6 +104,7 @@ enum Dialog {
     ConfirmPush,
     Syntax,
     Connections(Box<conns::Manager>),
+    Table(Box<table_edit::TableEditor>),
 }
 
 struct Analysis {
@@ -159,6 +161,10 @@ struct App {
     show_preview: bool,
     outline_filter: String,
     sql: SqlSync,
+    /// Schema texts before each diagram edit, for Undo.
+    diagram_undo: Vec<String>,
+    /// The text after the last diagram edit; typing elsewhere voids the undo history.
+    diagram_after: String,
     er: er::ErView,
     er_source: DiagramSource,
     query: String,
@@ -197,6 +203,8 @@ impl App {
             show_preview: settings.show_preview,
             outline_filter: String::new(),
             sql: SqlSync::default(),
+            diagram_undo: Vec::new(),
+            diagram_after: String::new(),
             er: er::ErView::default(),
             er_source: DiagramSource::SchemaFile,
             query: default_query(Dialect::Sqlite).into(),
@@ -841,6 +849,11 @@ impl App {
 
     fn tab_diagram(&mut self, ui: &mut egui::Ui) {
         let db_schema = self.db.as_ref().map(|d| d.schema.clone());
+        let editable = self.er_source == DiagramSource::SchemaFile && self.analysis.result.is_ok();
+        if self.schema_text != self.diagram_after {
+            self.diagram_undo.clear();
+        }
+        let undo_key = self.dialog.is_none() && editor::take_key(ui.ctx(), Modifiers::COMMAND, Key::Z);
         ui.horizontal(|ui| {
             ui.label("Source:");
             let before = self.er_source;
@@ -923,18 +936,93 @@ impl App {
                     }
                 }
             });
+            ui.separator();
+            let undo = ui
+                .add_enabled(!self.diagram_undo.is_empty(), egui::Button::new("Undo"))
+                .on_hover_text(format!("Undo the last change made in the diagram ({})", ui.ctx().format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z))));
+            if (undo.clicked() || undo_key)
+                && let Some(text) = self.diagram_undo.pop()
+            {
+                self.schema_text = text.clone();
+                self.diagram_after = text;
+            }
             if self.er_source == DiagramSource::SchemaFile && self.analysis.result.is_err() {
-                ui.colored_label(warn_color(ui), "⚠ showing last valid version");
+                ui.colored_label(warn_color(ui), "⚠ showing last valid version; fix the syntax error to edit");
+            } else if self.er_source == DiagramSource::Database {
+                ui.label(RichText::new("Read-only; switch to Schema file to edit").weak());
             }
         });
         ui.add_space(4.0);
         let schema = self.diagram_schema(&db_schema);
-        self.er.ui(ui, &schema);
+        if let Some(action) = self.er.ui(ui, &schema, editable) {
+            self.diagram_action(action, &schema);
+        }
         match self.er.take_png_result() {
             Some(Ok(p)) => self.set_status(format!("Wrote {}", p.display()), false),
             Some(Err(e)) => self.set_status(e, true),
             None => {}
         }
+    }
+
+    /// Carries out a change asked for on the diagram canvas.
+    fn diagram_action(&mut self, action: er::ErAction, schema: &Schema) {
+        use er::ErAction as A;
+        let mut new = schema.clone();
+        let edit = |s: &mut Schema, table: &str, column: &str, f: &dyn Fn(&mut simple_database::schema::Column)| {
+            if let Some(c) = s.tables.iter_mut().find(|t| t.name == table).and_then(|t| t.columns.iter_mut().find(|c| c.name == column)) {
+                f(c);
+            }
+        };
+        match action {
+            A::EditTable(t) | A::AddColumn(t) if schema.table(&t).is_none() => return,
+            A::EditTable(t) => {
+                self.dialog = Some(Dialog::Table(Box::new(table_edit::TableEditor::edit(schema.table(&t).unwrap()))));
+                return;
+            }
+            A::AddColumn(t) => {
+                self.dialog = Some(Dialog::Table(Box::new(table_edit::TableEditor::edit(schema.table(&t).unwrap()).with_new_column())));
+                return;
+            }
+            A::NewTable(pos) => {
+                self.dialog = Some(Dialog::Table(Box::new(table_edit::TableEditor::create(schema, pos))));
+                return;
+            }
+            A::DeleteTable(t) => new.drop_table(&t),
+            A::DeleteColumn { table, column } => {
+                if schema.table(&table).is_some_and(|t| t.columns.len() == 1) {
+                    self.set_status(format!("'{column}' is the only column of {table}; delete the table instead"), true);
+                    return;
+                }
+                new.drop_column(&table, &column);
+            }
+            A::Unlink { table, column } => edit(&mut new, &table, &column, &|c| c.references = None),
+            A::Link { table, column, target, target_column } => {
+                let fk = simple_database::schema::ForeignKey {
+                    table: target.clone(),
+                    column: target_column.clone(),
+                    on_delete: simple_database::schema::RefAction::NoAction,
+                    on_update: simple_database::schema::RefAction::NoAction,
+                };
+                edit(&mut new, &table, &column, &|c| c.references = Some(fk.clone()));
+                self.set_status(format!("{table}.{column} now references {target}.{target_column}"), false);
+            }
+        }
+        self.apply_diagram_edit(&new, None);
+    }
+
+    /// Writes a schema changed on the diagram into the schema text, rewriting
+    /// only the tables that changed.
+    fn apply_diagram_edit(&mut self, new: &Schema, renamed: Option<(String, String)>) {
+        let renames: Vec<(String, String)> = renamed.iter().cloned().collect();
+        let text = format::patch_renamed(&self.schema_text, new, &renames);
+        if text == self.schema_text {
+            return;
+        }
+        if let Some((old, new_name)) = &renamed {
+            self.er.rename(old, new_name);
+        }
+        self.diagram_undo.push(std::mem::replace(&mut self.schema_text, text.clone()));
+        self.diagram_after = text;
     }
 
     fn diagram_schema(&self, db_schema: &Option<Schema>) -> Schema {
@@ -1463,6 +1551,28 @@ impl App {
                     None => {}
                 }
                 self.dialog = Some(Dialog::Connections(m));
+                resp.should_close()
+            }
+            Dialog::Table(_) => {
+                let Some(Dialog::Table(mut editor)) = self.dialog.take() else { unreachable!() };
+                let schema = self.analysis.last_good.clone();
+                let mut outcome = None;
+                let resp = egui::Modal::new(egui::Id::new("table_edit")).show(ctx, |ui| {
+                    outcome = editor.show(ui, &schema);
+                });
+                match outcome {
+                    Some(table_edit::Outcome::Apply { schema: new, table, renamed }) => {
+                        if let Some(pos) = editor.place {
+                            self.er.place(&table, pos);
+                        }
+                        self.er.selected = Some(table);
+                        self.apply_diagram_edit(&new, renamed);
+                        return;
+                    }
+                    Some(table_edit::Outcome::Cancel) => return,
+                    None => {}
+                }
+                self.dialog = Some(Dialog::Table(editor));
                 resp.should_close()
             }
             Dialog::Syntax => {

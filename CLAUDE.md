@@ -28,6 +28,8 @@ cargo run --bin sdb-gui -- schema.dbs app.db --tab diagram
 
 Everything flows through the dialect-independent model in `src/schema.rs`
 (`Schema` → `Table` → `Column` / `Index`, `DataType`, `DefaultValue`, `ForeignKey`).
+Structural edits go through `Schema::rename_table` / `drop_table` / `rename_column` /
+`drop_column`, which keep composite keys, indexes and foreign keys pointing at the right names.
 
 Core library (`src/`, exported from `lib.rs`):
 
@@ -35,7 +37,7 @@ Core library (`src/`, exported from `lib.rs`):
 |---|---|
 | `lib.rs` | Module list plus `STARTER_SCHEMA` (`include_str!` of `examples/blog.dbs`) |
 | `parser.rs` | `.dbs` DSL → `Schema`. Hand-written tokenizer: `(...)` groups become one raw `Paren` token, and newline, `,` and `;` all end a statement. `outline` / `locate`: lenient table/column → line scan for the editor, works on text that doesn't parse |
-| `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Pull). `align` re-aligns columns in place keeping comments (GUI Format); it returns `None` unless the result parses to the same schema. `patch` rewrites only the changed tables of a text (SQL tab → schema sync) |
+| `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Pull). `align` re-aligns columns in place keeping comments (GUI Format); it returns `None` unless the result parses to the same schema. `patch` rewrites only the changed tables of a text (SQL tab and Diagram edits → schema text); `patch_renamed` also reprints renamed tables in place |
 | `validate.rs` | Errors (unusable schema) and warnings (design lint); `print_issues` is the CLI's ANSI printer |
 | `ddl.rs` | `Dialect` enum and all CREATE/DROP SQL; `quote()` quotes only when needed; `canonical()` = the schema as a dialect reports it back |
 | `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change |
@@ -55,7 +57,8 @@ Binaries:
 |---|---|
 | `src/main.rs` | `sdb` clap CLI; `load_schema` accepts a `.dbs` file **or** a SQLite file (detected by magic header) |
 | `src/gui/main.rs` | `sdb-gui`: `App` state, menus, sidebar, one `tab_*` method per tab, modal `Dialog`s, `Settings` persisted via eframe storage |
-| `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom) |
+| `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
+| `src/gui/table_edit.rs` | Diagram's table editor dialog: column grid → DSL lines → `parser::parse`, renames via `Schema::rename_table` / `rename_column`; refuses edits that add validation errors |
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
 | `src/gui/grid.rs` | Virtualized result grid (egui_extras `TableBuilder`), shared by Query and Data |
 | `src/gui/editor.rs` | `code_editor`: `TextEdit` plus gutter and problem `Mark`s, line commands (`command`, pure and unit-tested), find/replace bar, column selection (multi-caret, consumed from input before `TextEdit` sees it) and autocomplete (`Vocabulary` from a `Schema`; context-aware for the DSL). `goto_line` / `caret_line` talk to it by id. Use `take_key` for exact-modifier shortcuts: `consume_key` also matches with Shift held |
@@ -83,6 +86,7 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
 - **Any DSL change** touches `parser.rs` (parse), `format.rs` (print), the round-trip tests and
   the `examples/blog.dbs` header. It usually also touches `ddl.rs`, `diff.rs`, `sqlite.rs`
   introspection, the README syntax table and the keyword lists in `gui/highlight.rs` (which also feed autocomplete).
+  A new column modifier also needs a field in `gui/table_edit.rs`, which writes DSL lines and parses them.
 - Foreign key constraints are named `fk_<table>_<column>`. Postgres/MySQL migrations rely on
   that name to drop them.
 - Check constraints are named `<table>_<column>_check` (Postgres picks this name; MySQL DDL
@@ -109,6 +113,11 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   capped with `sqlite::run_limited` (10,000 rows); Data pages are 200 rows.
 - Started without file arguments, the app reopens the previous session's schema and database
   (eframe storage key `sdb-gui`). Pass files explicitly when testing for a predictable state.
+- Diagram editing works only on the schema file, and only while the text parses: `patch` falls
+  back to reprinting the whole file when the text doesn't parse, which would drop the user's
+  comments. Diagram Undo keeps snapshots of the text and is cleared once the text changes some
+  other way. Debug a dialog without clicking through a temporary startup hook that sets
+  `self.dialog`, and remove the hook afterwards.
 - The Migrate tab diffs in the open database's dialect (`Database::migration`), whatever
   dialect the SQL tab shows. Saved settings keep server URLs without the password.
 - **Checking it visually on this machine** (GNOME Wayland, no xdotool/Xvfb):

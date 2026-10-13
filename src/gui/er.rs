@@ -1,5 +1,6 @@
 //! Interactive entity-relationship diagram: drag tables, pan, zoom, hide tables,
-//! export as PNG (what the canvas shows) or SVG (every visible table).
+//! export as PNG (what the canvas shows) or SVG (every visible table). When
+//! editable, it also asks for schema changes through `ErAction`s.
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use simple_database::schema::{Schema, Table};
@@ -30,12 +31,29 @@ pub struct ErView {
     /// Canvas and box sizes (world units) from the last frame.
     canvas: Option<Rect>,
     sizes: HashMap<String, Vec2>,
-    /// Table under the pointer when the context menu opened.
+    /// Table, column and world position under the pointer when the context menu opened.
     context_table: Option<String>,
+    context_column: Option<String>,
+    context_world: Option<Pos2>,
+    /// A relationship being drawn from this (table, column)'s handle.
+    linking: Option<(String, String)>,
     png_request: Option<PathBuf>,
     /// A screenshot is on its way: keep hover effects and the hint off the canvas.
     capturing: bool,
     png_result: Option<Result<PathBuf, String>>,
+}
+
+/// A schema change asked for on the canvas, applied by the caller.
+pub enum ErAction {
+    EditTable(String),
+    AddColumn(String),
+    /// A new table whose top-left corner goes here (world coordinates).
+    NewTable(Pos2),
+    DeleteTable(String),
+    DeleteColumn { table: String, column: String },
+    /// Make `table.column` a foreign key to `target.target_column`.
+    Link { table: String, column: String, target: String, target_column: String },
+    Unlink { table: String, column: String },
 }
 
 /// Sent with the screenshot command, returned with the screenshot.
@@ -63,6 +81,24 @@ struct BoxLayout {
 }
 
 impl ErView {
+    /// Keep a renamed table's position, visibility and selection.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        if let Some(p) = self.positions.remove(old) {
+            self.positions.insert(new.to_string(), p);
+        }
+        if self.hidden.remove(old) {
+            self.hidden.insert(new.to_string());
+        }
+        if self.selected.as_deref() == Some(old) {
+            self.selected = Some(new.to_string());
+        }
+    }
+
+    /// Put a table's top-left corner at `pos` (world coordinates).
+    pub fn place(&mut self, table: &str, pos: Pos2) {
+        self.positions.insert(table.to_string(), pos);
+    }
+
     pub fn reset_layout(&mut self) {
         self.positions.clear();
         self.fit_requested = true;
@@ -164,8 +200,10 @@ impl ErView {
             .collect()
     }
 
-    /// `full` is the whole schema; hidden tables are left out here.
-    pub fn ui(&mut self, ui: &mut egui::Ui, full: &Schema) {
+    /// `full` is the whole schema; hidden tables are left out here. With
+    /// `editable`, double-clicks, the context menu and the column handles
+    /// return the changes the user asks for.
+    pub fn ui(&mut self, ui: &mut egui::Ui, full: &Schema, editable: bool) -> Option<ErAction> {
         if self.zoom == 0.0 {
             self.zoom = 1.0;
             self.fit_requested = true;
@@ -179,10 +217,18 @@ impl ErView {
         painter.rect_filled(canvas, 0.0, visuals.extreme_bg_color);
 
         if schema.tables.is_empty() {
-            let msg = if full.tables.is_empty() { "No tables to draw" } else { "All tables are hidden (see the Tables menu)" };
+            let msg = match (full.tables.is_empty(), editable) {
+                (true, true) => "No tables yet: right-click to add one",
+                (true, false) => "No tables to draw",
+                _ => "All tables are hidden (see the Tables menu)",
+            };
             painter.text(canvas.center(), Align2::CENTER_CENTER, msg, FontId::proportional(16.0), visuals.weak_text_color());
-            self.context_menu(&response, full);
-            return;
+            if response.secondary_clicked() {
+                self.context_table = None;
+                self.context_column = None;
+                self.context_world = response.interact_pointer_pos().map(|p| ((p - canvas.min - self.pan) / self.zoom).to_pos2());
+            }
+            return self.context_menu(&response, full, editable);
         }
 
         // Measure boxes in world units (zoom 1).
@@ -219,11 +265,41 @@ impl ErView {
                 .find(|t| layouts[&t.name].rect.contains(w))
                 .map(|t| t.name.clone())
         });
+        let hovered_column = hovered_table.as_ref().zip(hover_world).and_then(|(t, w)| row_at(&layouts[t], w));
+        // The handle at the right end of a row, where relationships are drawn from.
+        let handle_r = 5.0 / self.zoom.max(0.5);
+        let hovered_handle = hover_world.filter(|_| editable && !capturing).and_then(|w| {
+            schema.tables.iter().rev().find_map(|t| {
+                let l = &layouts[&t.name];
+                l.rows.iter().find(|(_, y)| w.distance(pos2(l.rect.max.x, **y)) <= handle_r * 1.6).map(|(c, _)| (t.name.clone(), c.clone()))
+            })
+        });
+        let mut action = None;
 
         if response.drag_started() {
-            self.dragging = hovered_table.clone();
+            if let Some(h) = hovered_handle.clone() {
+                self.linking = Some(h);
+            } else {
+                self.dragging = hovered_table.clone();
+            }
         }
-        if response.dragged() {
+        if self.linking.is_some() {
+            if response.drag_stopped() {
+                let (table, column) = self.linking.take().unwrap();
+                let target = hovered_table.clone().and_then(|t| {
+                    let c = hovered_column.clone().or_else(|| match full.table(&t)?.primary_key().as_slice() {
+                        [pk] => Some(pk.clone()),
+                        _ => None,
+                    })?;
+                    Some((t, c))
+                });
+                if let Some((t, c)) = target
+                    && (t != table || c != column)
+                {
+                    action = Some(ErAction::Link { table, column, target: t, target_column: c });
+                }
+            }
+        } else if response.dragged() {
             let delta = response.drag_delta();
             match &self.dragging {
                 Some(name) => {
@@ -249,16 +325,30 @@ impl ErView {
         if response.clicked() {
             self.selected = hovered_table.clone();
         }
+        if response.double_clicked()
+            && editable
+            && let Some(t) = &hovered_table
+        {
+            action = Some(ErAction::EditTable(t.clone()));
+        }
         if response.secondary_clicked() {
             self.context_table = hovered_table.clone();
+            self.context_column = hovered_column.clone();
+            self.context_world = hover_world;
         }
-        self.context_menu(&response, full);
+        if let Some(a) = self.context_menu(&response, full, editable) {
+            action = Some(a);
+        }
         let focus = if capturing {
             self.selected.clone()
         } else {
             self.dragging.clone().or(hovered_table.clone()).or(self.selected.clone())
         };
-        if self.dragging.is_some() {
+        if self.linking.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if hovered_handle.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        } else if self.dragging.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         } else if hovered_table.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -358,29 +448,82 @@ impl ErView {
             }
         }
 
+        // ---- relationship handles and the one being drawn
+        if editable && !capturing {
+            let handles_of = self.linking.as_ref().map(|(t, _)| t.clone()).or(hovered_table.clone());
+            for t in schema.tables.iter().filter(|t| Some(&t.name) == handles_of.as_ref()) {
+                let l = &layouts[&t.name];
+                for (c, y) in &l.rows {
+                    let at = to_screen(pos2(l.rect.max.x, *y));
+                    let active = hovered_handle.as_ref().is_some_and(|(ht, hc)| *ht == t.name && hc == c)
+                        || self.linking.as_ref().is_some_and(|(lt, lc)| *lt == t.name && lc == c);
+                    let r = handle_r * self.zoom;
+                    painter.circle(at, r, if active { accent } else { visuals.window_fill }, Stroke::new(1.5, accent));
+                }
+            }
+            if let Some((t, c)) = &self.linking
+                && let Some(l) = layouts.get(t)
+                && let Some(y) = l.rows.get(c)
+                && let Some(pointer) = response.hover_pos().or(ui.ctx().pointer_latest_pos())
+            {
+                let from = to_screen(pos2(l.rect.max.x, *y));
+                let stroke = Stroke::new(2.0, accent);
+                painter.line_segment([from, pointer], stroke);
+                if let Some(ht) = &hovered_table {
+                    let hl = &layouts[ht];
+                    let row = hovered_column.as_ref().and_then(|hc| hl.rows.get(hc)).map(|y| {
+                        Rect::from_min_max(to_screen(pos2(hl.rect.min.x, y - ROW_H / 2.0)), to_screen(pos2(hl.rect.max.x, y + ROW_H / 2.0)))
+                    });
+                    let target = row.unwrap_or_else(|| Rect::from_min_max(to_screen(hl.rect.min), to_screen(hl.rect.max)));
+                    painter.rect_stroke(target, 2.0, stroke, StrokeKind::Inside);
+                }
+            }
+        }
+
         if capturing {
-            return;
+            return action;
         }
         let hidden = full.tables.len() - schema.tables.len();
         painter.text(
             canvas.left_bottom() + vec2(8.0, -8.0),
             Align2::LEFT_BOTTOM,
             format!(
-                "{:.0}%{}  ·  drag tables to move, drag background to pan, scroll to zoom, right-click a table for options  ·  ! = not null",
+                "{:.0}%{}  ·  drag tables to move, drag background to pan, scroll to zoom, right-click for options{}  ·  ! = not null",
                 self.zoom * 100.0,
-                if hidden > 0 { format!("  ·  {hidden} hidden") } else { String::new() }
+                if hidden > 0 { format!("  ·  {hidden} hidden") } else { String::new() },
+                if editable { ", double-click a table to edit, drag a column's ○ onto another column to link them" } else { "" }
             ),
             FontId::proportional(11.0),
             visuals.weak_text_color(),
         );
+        action
     }
 
-    fn context_menu(&mut self, response: &egui::Response, full: &Schema) {
+    fn context_menu(&mut self, response: &egui::Response, full: &Schema, editable: bool) -> Option<ErAction> {
+        let mut action = None;
         response.context_menu(|ui| {
             if let Some(table) = self.context_table.clone()
-                && full.table(&table).is_some()
+                && let Some(t) = full.table(&table)
             {
                 ui.label(egui::RichText::new(&table).strong());
+                if editable {
+                    let mut pick = |ui: &mut egui::Ui, label: &str, a: ErAction| {
+                        if ui.button(label).clicked() {
+                            action = Some(a);
+                            ui.close();
+                        }
+                    };
+                    pick(ui, "Edit table…", ErAction::EditTable(table.clone()));
+                    pick(ui, "Add column…", ErAction::AddColumn(table.clone()));
+                    if let Some(column) = self.context_column.clone() {
+                        if t.column(&column).is_some_and(|c| c.references.is_some()) {
+                            pick(ui, &format!("Remove reference of {column}"), ErAction::Unlink { table: table.clone(), column: column.clone() });
+                        }
+                        pick(ui, &format!("Delete column {column}"), ErAction::DeleteColumn { table: table.clone(), column });
+                    }
+                    pick(ui, "Delete table", ErAction::DeleteTable(table.clone()));
+                    ui.separator();
+                }
                 if ui.button("Hide table").clicked() {
                     self.set_hidden(&table, true);
                     ui.close();
@@ -391,6 +534,13 @@ impl ErView {
                 }
                 ui.separator();
             }
+            if editable
+                && self.context_table.is_none()
+                && ui.button("New table…").clicked()
+            {
+                action = Some(ErAction::NewTable(self.context_world.unwrap_or_default()));
+                ui.close();
+            }
             if ui.add_enabled(!self.hidden.is_empty(), egui::Button::new("Show all tables")).clicked() {
                 self.show_all();
                 ui.close();
@@ -400,6 +550,7 @@ impl ErView {
                 ui.close();
             }
         });
+        action
     }
 
     fn receive_screenshot(&mut self, ui: &egui::Ui) {
@@ -596,6 +747,11 @@ fn column_tag(pk: &[String], c: &simple_database::schema::Column) -> &'static st
 
 fn column_type(c: &simple_database::schema::Column) -> String {
     format!("{}{}", c.data_type, if c.nullable { "" } else { " !" })
+}
+
+/// The column whose row contains `world`, if any.
+fn row_at(layout: &BoxLayout, world: Pos2) -> Option<String> {
+    layout.rows.iter().find(|(_, y)| (world.y - **y).abs() <= ROW_H / 2.0).map(|(c, _)| c.clone())
 }
 
 /// Relationship lines between laid-out tables, in world coordinates.

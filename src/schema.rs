@@ -241,6 +241,61 @@ impl Schema {
         self.tables.iter().find(|t| t.name == name)
     }
 
+    fn table_mut(&mut self, name: &str) -> Option<&mut Table> {
+        self.tables.iter_mut().find(|t| t.name == name)
+    }
+
+    fn foreign_keys_mut(&mut self) -> impl Iterator<Item = &mut ForeignKey> {
+        self.tables.iter_mut().flat_map(|t| t.columns.iter_mut()).filter_map(|c| c.references.as_mut())
+    }
+
+    /// Renames a table and every foreign key that points at it.
+    pub fn rename_table(&mut self, old: &str, new: &str) {
+        if let Some(t) = self.table_mut(old) {
+            t.name = new.to_string();
+        }
+        for fk in self.foreign_keys_mut().filter(|fk| fk.table == old) {
+            fk.table = new.to_string();
+        }
+    }
+
+    /// Drops a table; columns that referenced it lose their foreign key.
+    pub fn drop_table(&mut self, name: &str) {
+        self.tables.retain(|t| t.name != name);
+        for c in self.tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
+            if c.references.as_ref().is_some_and(|fk| fk.table == name) {
+                c.references = None;
+            }
+        }
+    }
+
+    /// Renames a column, in its table's key and indexes and in the foreign keys
+    /// that point at it.
+    pub fn rename_column(&mut self, table: &str, old: &str, new: &str) {
+        let Some(t) = self.table_mut(table) else { return };
+        let names = t.columns.iter_mut().map(|c| &mut c.name).chain(&mut t.composite_pk).chain(t.indexes.iter_mut().flat_map(|i| i.columns.iter_mut()));
+        for n in names.filter(|n| *n == old) {
+            *n = new.to_string();
+        }
+        for fk in self.foreign_keys_mut().filter(|fk| fk.table == table && fk.column == old) {
+            fk.column = new.to_string();
+        }
+    }
+
+    /// Drops a column with the indexes that use it. It leaves the composite
+    /// key, and columns that referenced it lose their foreign key.
+    pub fn drop_column(&mut self, table: &str, column: &str) {
+        let Some(t) = self.table_mut(table) else { return };
+        t.columns.retain(|c| c.name != column);
+        t.composite_pk.retain(|c| c != column);
+        t.indexes.retain(|i| !i.columns.iter().any(|c| c == column));
+        for c in self.tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
+            if c.references.as_ref().is_some_and(|fk| fk.table == table && fk.column == column) {
+                c.references = None;
+            }
+        }
+    }
+
     /// Equal apart from the order of the tables.
     pub fn same_tables(&self, other: &Schema) -> bool {
         self.tables.len() == other.tables.len() && self.tables.iter().all(|t| other.table(&t.name) == Some(t))
@@ -276,5 +331,30 @@ impl Schema {
             visit(self, t, &mut out, &mut visiting);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::parse;
+
+    const SRC: &str = "table users {\n  id int pk\n  email text\n  index (email)\n}\n\ntable posts {\n  id int pk\n  author int -> users.id\n  parent int -> posts.id\n}\n";
+
+    #[test]
+    fn rename_and_drop_follow_references() {
+        let mut s = parse(SRC).unwrap();
+        s.rename_table("users", "people");
+        s.rename_column("people", "id", "pid");
+        s.rename_column("people", "email", "mail");
+        let fk = s.table("posts").unwrap().column("author").unwrap().references.clone().unwrap();
+        assert_eq!((fk.table.as_str(), fk.column.as_str()), ("people", "pid"));
+        assert_eq!(s.table("people").unwrap().indexes[0].columns, vec!["mail"]);
+        assert_eq!(s.table("posts").unwrap().column("parent").unwrap().references.as_ref().unwrap().table, "posts");
+
+        s.drop_column("people", "mail");
+        assert!(s.table("people").unwrap().indexes.is_empty());
+        s.drop_table("people");
+        assert!(s.table("posts").unwrap().column("author").unwrap().references.is_none());
+        assert!(s.table("posts").unwrap().column("parent").unwrap().references.is_some());
     }
 }
