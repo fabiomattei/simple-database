@@ -7,6 +7,7 @@
 //!
 //! Anywhere a database target is accepted, `@name` means a saved connection.
 
+pub use crate::safety::SafeMode;
 use anyhow::{Context, Result, bail};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -112,6 +113,8 @@ pub struct Connection {
     pub save_password: bool,
     /// Unix seconds of the last successful connection.
     pub last_used: Option<u64>,
+    /// What may run without asking.
+    pub safe_mode: SafeMode,
 }
 
 /// Characters escaped in the user, password and database parts of a URL.
@@ -406,22 +409,29 @@ impl Store {
     }
 }
 
-/// If `target` is `@name`, the saved connection's target (with its saved
-/// password) and the name; otherwise `None`.
-pub fn resolve(target: &str) -> Result<Option<(String, String)>> {
+/// A saved connection looked up by `@name`.
+pub struct Resolved {
+    /// The SQLite path or URL, with the saved password.
+    pub target: String,
+    pub name: String,
+    pub safe_mode: SafeMode,
+}
+
+/// If `target` is `@name`, the saved connection; otherwise `None`.
+pub fn resolve(target: &str) -> Result<Option<Resolved>> {
     let Some(name) = target.strip_prefix('@') else { return Ok(None) };
     let mut store = Store::load()?;
     let Some(c) = store.get(name) else {
         bail!("no saved connection named '{name}' (see `sdb conn list`)");
     };
-    let target = c.target(store.password(name));
+    let resolved = Resolved { target: c.target(store.password(name)), name: name.to_string(), safe_mode: c.safe_mode };
     store.touch(name);
     // Recording the last use is a nicety; a read-only config must not stop the connection.
     let _ = store.save();
-    Ok(Some((target, name.to_string())))
+    Ok(Some(resolved))
 }
 
-fn write_file(path: &Path, text: &str, private: bool) -> Result<()> {
+pub(crate) fn write_file(path: &Path, text: &str, private: bool) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);

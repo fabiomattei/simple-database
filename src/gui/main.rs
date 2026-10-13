@@ -4,6 +4,7 @@
 //! Arguments may come in either order; SQLite files are recognised by their header.
 
 mod conns;
+mod data_view;
 mod editor;
 mod er;
 mod grid;
@@ -17,8 +18,11 @@ use simple_database::ddl::{self, Dialect};
 use simple_database::diagram::{self, DiagramFormat};
 use simple_database::parser::{self, ParseError};
 use simple_database::schema::Schema;
-use simple_database::connections::Store;
+use simple_database::connections::{SafeMode, Store};
 use simple_database::db::{self, Database, QueryResult};
+use simple_database::history::{self, QueryLog};
+use simple_database::import::{self, ImportFormat};
+use simple_database::output::{self, ExportFormat};
 use simple_database::seed::{self, SeedOptions, TableReport};
 use simple_database::sqlite;
 use simple_database::validate::{self, Issue, Severity};
@@ -28,7 +32,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_QUERY_ROWS: usize = 10_000;
-const PAGE_SIZE: usize = 200;
 const SETTINGS_KEY: &str = "sdb-gui";
 const SCHEMA_EDITOR: &str = "schema_editor";
 
@@ -56,6 +59,7 @@ struct Settings {
     dialect: u8,
     hide_outline: bool,
     show_preview: bool,
+    hide_history: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +109,37 @@ enum Dialog {
     Syntax,
     Connections(Box<conns::Manager>),
     Table(Box<table_edit::TableEditor>),
+    /// Safe mode asks before these statements run.
+    ConfirmWrite(Box<ConfirmWrite>),
+    Import(Box<ImportState>),
+}
+
+/// A write held back until the user confirms it.
+enum Write {
+    Query,
+    SaveRows(Vec<simple_database::data::RowChange>),
+    Seed,
+}
+
+struct ConfirmWrite {
+    /// Statement and, for dangerous ones, why.
+    statements: Vec<(String, Option<String>)>,
+    write: Write,
+}
+
+/// The Import dialog: a file read and waiting to go into a table.
+struct ImportState {
+    path: PathBuf,
+    rows: import::Rows,
+    table: String,
+    error: Option<String>,
+}
+
+/// What the Migrate tab makes the open database look like.
+enum MigrateSource {
+    SchemaFile,
+    /// Another database's schema, read when it was picked.
+    Database { label: String, schema: Schema },
 }
 
 struct Analysis {
@@ -169,9 +204,16 @@ struct App {
     er_source: DiagramSource,
     query: String,
     query_out: Option<QueryOutput>,
-    data_table: Option<String>,
-    data_page: usize,
-    data_out: Option<Result<QueryResult, String>>,
+    /// Query history and saved queries.
+    log: QueryLog,
+    show_history: bool,
+    /// The history panel shows saved queries instead.
+    show_saved: bool,
+    history_search: String,
+    /// Name being typed for "Save query", while the field is open.
+    save_name: Option<String>,
+    data: data_view::DataView,
+    migrate_source: MigrateSource,
     seed: SeedState,
     status: Option<(String, bool, Instant)>,
     dialog: Option<Dialog>,
@@ -209,9 +251,13 @@ impl App {
             er_source: DiagramSource::SchemaFile,
             query: default_query(Dialect::Sqlite).into(),
             query_out: None,
-            data_table: None,
-            data_page: 0,
-            data_out: None,
+            log: QueryLog::default(),
+            show_history: !settings.hide_history,
+            show_saved: false,
+            history_search: String::new(),
+            save_name: None,
+            data: data_view::DataView::default(),
+            migrate_source: MigrateSource::SchemaFile,
             seed: SeedState {
                 rows: 10,
                 seed: seed::random_seed(),
@@ -226,6 +272,10 @@ impl App {
         match Store::load() {
             Ok(store) => app.conns = store,
             Err(e) => app.set_status(format!("Cannot read saved connections: {e:#}"), true),
+        }
+        match QueryLog::load() {
+            Ok(log) => app.log = log,
+            Err(e) => app.set_status(format!("Cannot read query history: {e:#}"), true),
         }
 
         // Arguments on the command line win over the last session.
@@ -406,19 +456,41 @@ impl App {
         if [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql].iter().any(|d| self.query == default_query(*d)) {
             self.query = default_query(dialect).into();
         }
-        self.data_table = db.schema.tables.first().map(|t| t.name.clone());
+        self.data.open(db.schema.tables.first().map(|t| t.name.clone()));
         self.db = Some(db);
-        self.data_page = 0;
-        self.data_out = None;
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;
         Ok(())
     }
 
+    /// Follow safe mode changes made to the open saved connection.
+    fn sync_safe_mode(&mut self) {
+        let Some(db) = &mut self.db else { return };
+        let Some(c) = db.conn.label().strip_prefix('@').and_then(|n| self.conns.get(n)) else { return };
+        if c.safe_mode != db.conn.safe_mode() {
+            let mode = c.safe_mode;
+            match db.conn.set_safe_mode(mode) {
+                Ok(()) => self.set_status(format!("Safe mode: {}", mode.label()), false),
+                Err(e) => self.set_status(format!("Cannot change safe mode: {e:#}"), true),
+            }
+        }
+    }
+
     fn open_connections(&mut self) {
         let current = self.db.as_ref().and_then(|d| d.conn.label().strip_prefix('@'));
-        self.dialog = Some(Dialog::Connections(Box::new(conns::Manager::new(&self.conns, current))));
+        // Look for databases next to the schema file and in the working directory.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = self.schema_path.as_ref().and_then(|p| p.parent()) {
+            dirs.push(if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir.to_path_buf() });
+        }
+        if let Ok(cwd) = std::env::current_dir()
+            && !dirs.iter().any(|d| d.canonicalize().ok() == cwd.canonicalize().ok())
+        {
+            dirs.push(cwd);
+        }
+        let manager = conns::Manager::new(&self.conns, current).with_detected(&dirs);
+        self.dialog = Some(Dialog::Connections(Box::new(manager)));
     }
 
     /// Reload schema and row counts after the database changed.
@@ -432,10 +504,11 @@ impl App {
             Ok((schema, counts)) => {
                 db.schema = schema;
                 db.counts = counts;
-                if self.data_table.as_ref().is_none_or(|t| db.schema.table(t).is_none()) {
-                    self.data_table = db.schema.tables.first().map(|t| t.name.clone());
+                if self.data.table.as_ref().is_none_or(|t| db.schema.table(t).is_none()) {
+                    self.data.open(db.schema.tables.first().map(|t| t.name.clone()));
+                } else if self.data.pending() == 0 {
+                    self.data.reset();
                 }
-                self.data_out = None;
             }
             Err(e) => self.set_status(format!("Cannot read database: {e:#}"), true),
         }
@@ -623,12 +696,20 @@ impl App {
                     ui.label(RichText::new(name).strong()).on_hover_text(saved.map_or_else(|| label.to_string(), |c| c.summary()));
                     ui.label(RichText::new(kind).small().weak());
                 });
+                let mode = db.conn.safe_mode();
+                if mode != SafeMode::Off {
+                    let (icon, color) = match mode {
+                        SafeMode::ReadOnly => ("🔒", error_color(ui)),
+                        _ => ("⚠", warn_color(ui)),
+                    };
+                    ui.colored_label(color, RichText::new(format!("{icon} {}", mode.label())).small()).on_hover_text(mode.description());
+                }
                 egui::ScrollArea::vertical().id_salt("db_tables").show(ui, |ui| {
                     if db.counts.is_empty() {
                         ui.label(RichText::new("(empty — push a schema)").weak());
                     }
                     for (t, n) in &db.counts {
-                        let selected = self.tab == Tab::Data && self.data_table.as_deref() == Some(t.as_str());
+                        let selected = self.tab == Tab::Data && self.data.table.as_deref() == Some(t.as_str());
                         ui.horizontal(|ui| {
                             if ui.selectable_label(selected, format!("  {t}")).clicked() {
                                 open_table = Some(Some(t.clone()));
@@ -642,10 +723,15 @@ impl App {
             }
         }
         if let Some(Some(t)) = open_table {
-            self.data_table = Some(t);
-            self.data_page = 0;
-            self.data_out = None;
-            self.tab = Tab::Data;
+            if self.data.table.as_deref() == Some(t.as_str()) {
+                self.tab = Tab::Data;
+            } else if self.data.pending() > 0 {
+                self.tab = Tab::Data;
+                self.set_status("Save or discard the changes to this table first", true);
+            } else {
+                self.data.open(Some(t));
+                self.tab = Tab::Data;
+            }
         }
     }
 
@@ -1126,32 +1212,100 @@ impl App {
     }
 
     fn tab_migrate(&mut self, ui: &mut egui::Ui) {
-        let Some(db) = &mut self.db else {
+        if self.db.is_none() {
             empty_state(ui, "No database open", "Open or create a SQLite database, or connect to a server (File menu or sidebar), to push this schema into it.");
             return;
-        };
-        let schema = match &self.analysis.result {
-            Err(e) => {
-                empty_state(ui, "Schema has a syntax error", &e.to_string());
-                return;
+        }
+        // Pick what to compare with: the schema file or another database.
+        let mut pick: Option<Option<String>> = None;
+        ui.horizontal(|ui| {
+            ui.label("From");
+            let current = match &self.migrate_source {
+                MigrateSource::SchemaFile => format!("📄 {}", self.file_label()),
+                MigrateSource::Database { label, .. } => format!("🗄 {label}"),
+            };
+            ui.menu_button(format!("{current} ⏷"), |ui| {
+                if ui.button(format!("📄 Schema file ({})", self.file_label())).clicked() {
+                    pick = Some(None);
+                    ui.close();
+                }
+                ui.separator();
+                ui.label(RichText::new("Another database").small().weak());
+                let mut saved: Vec<_> = self.conns.connections.iter().collect();
+                saved.sort_by_key(|c| c.name.to_lowercase());
+                for c in saved {
+                    let resp = ui.horizontal(|ui| {
+                        conns::color_dot(ui, c.color);
+                        ui.button(&c.name).on_hover_text(c.summary())
+                    });
+                    if resp.inner.clicked() {
+                        pick = Some(Some(format!("@{}", c.name)));
+                        ui.close();
+                    }
+                }
+                if ui.button("SQLite file…").clicked() {
+                    ui.close();
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("SQLite database", &["db", "sqlite", "sqlite3"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                    {
+                        pick = Some(Some(p.to_string_lossy().into_owned()));
+                    }
+                }
+            });
+            if let MigrateSource::Database { .. } = self.migrate_source
+                && ui.button("⟳").on_hover_text("Read the source database again").clicked()
+                && let MigrateSource::Database { label, .. } = &self.migrate_source
+            {
+                pick = Some(Some(label.clone()));
             }
-            Ok(s) => s.clone(),
+        });
+        if let Some(choice) = pick {
+            match choice {
+                None => self.migrate_source = MigrateSource::SchemaFile,
+                Some(target) => match Database::open(&target).and_then(|mut d| Ok((d.introspect()?, d.label().to_string()))) {
+                    Ok((schema, label)) => self.migrate_source = MigrateSource::Database { label, schema },
+                    Err(e) => self.set_status(format!("Cannot read {}: {e:#}", db::redact(&target)), true),
+                },
+            }
+        }
+
+        let from_file = matches!(self.migrate_source, MigrateSource::SchemaFile);
+        let (schema, source_label) = match &self.migrate_source {
+            MigrateSource::Database { label, schema } => (schema.clone(), label.clone()),
+            MigrateSource::SchemaFile => match &self.analysis.result {
+                Err(e) => {
+                    empty_state(ui, "Schema has a syntax error", &e.to_string());
+                    return;
+                }
+                Ok(s) => (s.clone(), self.file_label()),
+            },
         };
-        let errors = self.analysis.issues.iter().filter(|i| i.severity == Severity::Error).count();
+        let errors = if from_file { self.analysis.issues.iter().filter(|i| i.severity == Severity::Error).count() } else { 0 };
+        let Some(db) = &mut self.db else { return };
         let m = db.conn.migration(&db.schema, &schema);
         let db_name = db.conn.label().to_string();
+        let read_only = db.conn.safe_mode() == SafeMode::ReadOnly;
 
         ui.horizontal(|ui| {
-            ui.heading(format!("{}  ➡  {db_name}", self.file_label()));
+            ui.heading(format!("{source_label}  ➡  {db_name}"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Pull database into editor").on_hover_text("Replace the editor contents with the database's current schema").clicked() {
+                if ui.button("Pull database into editor").on_hover_text("Replace the editor contents with the open database's schema").clicked() {
                     let ctx = ui.ctx().clone();
                     self.request(Pending::PullIntoEditor, &ctx);
                 }
-                let can_push = !m.is_empty() && errors == 0;
+                let can_push = !m.is_empty() && errors == 0 && !read_only;
+                let why = if read_only {
+                    "The connection is read-only"
+                } else if errors > 0 {
+                    "Fix schema errors first"
+                } else {
+                    "Nothing to push"
+                };
                 if ui
                     .add_enabled(can_push, egui::Button::new(RichText::new("⬆ Push to database").strong()))
-                    .on_disabled_hover_text(if errors == 0 { "Nothing to push" } else { "Fix schema errors first" })
+                    .on_disabled_hover_text(why)
                     .clicked()
                 {
                     self.dialog = Some(Dialog::ConfirmPush);
@@ -1165,7 +1319,8 @@ impl App {
             return;
         }
         if m.is_empty() {
-            empty_state(ui, "✔ Database is up to date", "The database already matches the schema file.");
+            let body = if from_file { "The database already matches the schema file." } else { "Both databases have the same schema." };
+            empty_state(ui, "✔ Database is up to date", body);
             return;
         }
         ui.columns(2, |cols| {
@@ -1194,10 +1349,19 @@ impl App {
         });
     }
 
+    /// The schema the open database should get: the schema file's, or the
+    /// source database's when comparing two databases.
+    fn desired_schema(&self) -> Option<Schema> {
+        match &self.migrate_source {
+            MigrateSource::Database { schema, .. } => Some(schema.clone()),
+            MigrateSource::SchemaFile => self.analysis.result.as_ref().ok().cloned(),
+        }
+    }
+
     fn push_now(&mut self) {
+        let Some(schema) = self.desired_schema() else { return };
         let Some(db) = &mut self.db else { return };
-        let Ok(schema) = &self.analysis.result else { return };
-        let m = db.conn.migration(&db.schema, schema);
+        let m = db.conn.migration(&db.schema, &schema);
         match db.conn.apply_migration(&m) {
             Ok(()) => {
                 let n = m.changes.len();
@@ -1228,8 +1392,52 @@ impl App {
                 _ => "Run with EXPLAIN ANALYZE in a transaction that is rolled back: real timings, no changes kept",
             };
             explain = ui.button("Explain").on_hover_text(explain_hint).clicked();
+            ui.separator();
+            ui.toggle_value(&mut self.show_history, "🕘 History").on_hover_text("Past queries and saved queries");
+            if ui.button("💾 Save query…").clicked() {
+                self.save_name = Some(String::new());
+            }
             ui.label(RichText::new(format!("{} runs all statements", ui.ctx().format_shortcut(&run_shortcut))).weak());
         });
+        if let Some(name) = &mut self.save_name {
+            let mut save = false;
+            let mut close = false;
+            ui.horizontal(|ui| {
+                ui.label("Save as");
+                let edit = ui.add(egui::TextEdit::singleline(name).hint_text("query name").desired_width(220.0));
+                if !edit.has_focus() && name.is_empty() {
+                    edit.request_focus();
+                }
+                save = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                save |= ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Save")).clicked();
+                close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+                if self.log.get(name.trim()).is_some() {
+                    ui.colored_label(warn_color(ui), "replaces the saved query with this name");
+                }
+            });
+            if save && !name.trim().is_empty() {
+                let name = name.trim().to_string();
+                match self.log.save_query(&name, &self.query) {
+                    Ok(()) => {
+                        self.set_status(format!("Saved query \"{name}\""), false);
+                        self.show_history = true;
+                        self.show_saved = true;
+                        self.save_name = None;
+                    }
+                    Err(e) => self.set_status(format!("{e:#}"), true),
+                }
+            } else if close {
+                self.save_name = None;
+            }
+        }
+        if self.show_history {
+            egui::Panel::left("query_history").resizable(true).default_size(250.0).min_size(160.0).show(ui, |ui| {
+                if let Some((sql, now)) = self.history_panel(ui) {
+                    self.query = sql;
+                    run |= now;
+                }
+            });
+        }
         egui::Panel::top("query_editor")
             .resizable(true)
             .default_size(170.0)
@@ -1242,11 +1450,14 @@ impl App {
             });
 
         if run {
-            self.run_query();
+            self.request_run();
         } else if explain {
             self.explain_query();
         }
 
+        let d = self.dialect_of_db();
+        let source = from_table(&self.query).unwrap_or_else(|| "result".into());
+        let mut status = None;
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(out) = &mut self.query_out else {
                 ui.label(RichText::new("Results appear here.").weak());
@@ -1269,6 +1480,35 @@ impl App {
                                 ui.selectable_value(&mut out.selected, i, label);
                             }
                         }
+                        if let Some(r) = results.get(out.selected).filter(|r| r.changes.is_none()) {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.menu_button("Export ⏷", |ui| {
+                                    for f in ExportFormat::ALL {
+                                        if ui.button(format!("Save as {}…", f.label())).clicked() {
+                                            ui.close();
+                                            if let Some(p) = rfd::FileDialog::new()
+                                                .add_filter(f.label(), &[f.extension()])
+                                                .set_file_name(format!("{source}.{}", f.extension()))
+                                                .save_file()
+                                            {
+                                                status = Some(match std::fs::write(&p, output::export(r, f, &source, d)) {
+                                                    Ok(()) => (format!("Exported {} row(s) to {}", r.rows.len(), p.display()), false),
+                                                    Err(e) => (format!("Cannot write {}: {e}", p.display()), true),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    ui.separator();
+                                    for f in [ExportFormat::Csv, ExportFormat::Tsv, ExportFormat::Markdown, ExportFormat::Json, ExportFormat::Sql] {
+                                        if ui.button(format!("Copy as {}", f.label())).clicked() {
+                                            ui.ctx().copy_text(output::export(r, f, &source, d));
+                                            status = Some((format!("Copied {} row(s) as {}", r.rows.len(), f.label()), false));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            });
+                        }
                     });
                     if let Some(r) = results.get(out.selected) {
                         if r.truncated {
@@ -1281,6 +1521,108 @@ impl App {
                 }
             }
         });
+        if let Some((msg, err)) = status {
+            self.set_status(msg, err);
+        }
+    }
+
+    /// History or saved queries. Returns SQL to load, and whether to run it.
+    fn history_panel(&mut self, ui: &mut egui::Ui) -> Option<(String, bool)> {
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.show_saved, false, "History");
+            ui.selectable_value(&mut self.show_saved, true, format!("Saved ({})", self.log.saved.len()));
+        });
+        ui.add(egui::TextEdit::singleline(&mut self.history_search).hint_text("🔍 Search").desired_width(f32::INFINITY));
+        ui.add_space(4.0);
+        let query = self.history_search.trim().to_lowercase();
+        let mut remove = None;
+        let mut clear = false;
+        egui::ScrollArea::vertical().id_salt("history_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            if self.show_saved {
+                if self.log.saved.is_empty() {
+                    ui.label(RichText::new("No saved queries. Use 💾 Save query… to keep the editor's SQL here.").weak());
+                }
+                for q in self.log.saved.iter().filter(|q| query.is_empty() || q.name.to_lowercase().contains(&query) || q.sql.to_lowercase().contains(&query)) {
+                    let resp = ui.selectable_label(false, RichText::new(&q.name).strong()).on_hover_ui(|ui| {
+                        highlight::code_view(ui, &q.sql, Lang::Sql);
+                    });
+                    if resp.double_clicked() {
+                        picked = Some((q.sql.clone(), true));
+                    } else if resp.clicked() {
+                        picked = Some((q.sql.clone(), false));
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Delete").clicked() {
+                            remove = Some(q.name.clone());
+                            ui.close();
+                        }
+                    });
+                }
+            } else {
+                let now = history::now();
+                let entries = self.log.search(&query);
+                if entries.is_empty() {
+                    ui.label(RichText::new("Queries you run are listed here.").weak());
+                }
+                for e in entries.into_iter().take(300) {
+                    let first: String = e.sql.trim().lines().next().unwrap_or_default().chars().take(80).collect();
+                    let resp = ui
+                        .vertical(|ui| {
+                            let r = ui.add(egui::Label::new(RichText::new(first).monospace()).truncate().sense(egui::Sense::click()));
+                            ui.horizontal(|ui| {
+                                if e.error.is_some() {
+                                    ui.colored_label(error_color(ui), RichText::new("✖").small());
+                                }
+                                ui.label(RichText::new(format!("{} · {}", e.database, history::ago(e.at, now))).small().weak());
+                            });
+                            r
+                        })
+                        .inner
+                        .on_hover_ui(|ui| {
+                            highlight::code_view(ui, e.sql.trim(), Lang::Sql);
+                            if let Some(err) = &e.error {
+                                ui.colored_label(error_color(ui), err);
+                            }
+                        });
+                    if resp.double_clicked() {
+                        picked = Some((e.sql.trim().to_string(), true));
+                    } else if resp.clicked() {
+                        picked = Some((e.sql.trim().to_string(), false));
+                    }
+                    ui.separator();
+                }
+                if !self.log.history.is_empty() && ui.small_button("Clear history").clicked() {
+                    clear = true;
+                }
+            }
+        });
+        if let Some(name) = remove
+            && let Err(e) = self.log.remove_query(&name)
+        {
+            self.set_status(format!("{e:#}"), true);
+        }
+        if clear && let Err(e) = self.log.clear_history() {
+            self.set_status(format!("{e:#}"), true);
+        }
+        ui.label(RichText::new("Click to load · double-click to run").small().weak());
+        picked
+    }
+
+    /// Run the editor's SQL, asking first if the connection's safe mode wants it.
+    fn request_run(&mut self) {
+        let Some(db) = &self.db else { return };
+        let asks = db.conn.needs_confirmation(&self.query);
+        if asks.is_empty() {
+            self.run_query();
+        } else {
+            let statements = asks
+                .into_iter()
+                .map(|(s, k)| (s, if let simple_database::safety::Kind::Dangerous(why) = k { Some(why) } else { None }))
+                .collect();
+            self.dialog = Some(Dialog::ConfirmWrite(Box::new(ConfirmWrite { statements, write: Write::Query })));
+        }
     }
 
     fn explain_query(&mut self) {
@@ -1294,12 +1636,23 @@ impl App {
         let Some(db) = &mut self.db else { return };
         let start = Instant::now();
         let results = db.conn.run_limited(&self.query, MAX_QUERY_ROWS).map_err(|e| format!("{e:#}"));
+        let elapsed = start.elapsed();
+        let entry = history::Entry {
+            sql: self.query.trim().to_string(),
+            database: db.conn.label().to_string(),
+            at: history::now(),
+            elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+            error: results.as_ref().err().cloned(),
+        };
         let wrote = results.as_ref().is_ok_and(|rs| rs.iter().any(|r| r.changes.is_some()));
         // Show the last statement that returned rows, else the last one.
         let selected = results.as_ref().map_or(0, |rs| {
             rs.iter().rposition(|r| r.changes.is_none()).unwrap_or(rs.len().saturating_sub(1))
         });
-        self.query_out = Some(QueryOutput { results, elapsed: start.elapsed(), selected });
+        self.query_out = Some(QueryOutput { results, elapsed, selected });
+        if let Err(e) = self.log.record(entry) {
+            self.set_status(format!("Cannot save query history: {e:#}"), true);
+        }
         if wrote {
             self.refresh_db();
         }
@@ -1310,74 +1663,125 @@ impl App {
             empty_state(ui, "No database open", "Open a SQLite database or connect to a server to browse its data.");
             return;
         };
-        let dialect = db.conn.dialect();
         if db.counts.is_empty() {
             empty_state(ui, "The database has no tables", "Push a schema from the Migrate tab first.");
             return;
         }
-        let tables: Vec<(String, i64)> = db.counts.clone();
-        let current = self.data_table.clone().unwrap_or_else(|| tables[0].0.clone());
-        let total = tables.iter().find(|(t, _)| *t == current).map_or(0, |(_, n)| *n) as usize;
-        let pages = total.div_ceil(PAGE_SIZE).max(1);
-
-        let mut table = current.clone();
-        let mut page = self.data_page.min(pages - 1);
-        let mut refresh = false;
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("data_table")
-                .selected_text(&table)
-                .show_ui(ui, |ui| {
-                    for (t, n) in &tables {
-                        ui.selectable_value(&mut table, t.clone(), format!("{t}  ({n})"));
-                    }
-                });
-            ui.separator();
-            if ui.add_enabled(page > 0, egui::Button::new("◀")).clicked() {
-                page -= 1;
+        if self.data.table.is_none() {
+            self.data.open(db.counts.first().map(|(t, _)| t.clone()));
+        }
+        if self.data.out.is_none() {
+            self.load_data();
+        }
+        let Some(db) = &self.db else { return };
+        let table = self.data.table.as_ref().and_then(|t| db.schema.table(t)).cloned();
+        let read_only = db.conn.safe_mode() == SafeMode::ReadOnly;
+        let action = self.data.ui(ui, &db.counts.clone(), table.as_ref(), db.conn.dialect(), read_only);
+        match action {
+            Some(data_view::DataAction::Load) => self.load_data(),
+            Some(data_view::DataAction::Save(changes)) => {
+                if self.db.as_ref().is_some_and(|d| d.conn.confirms_writes()) {
+                    let statements = match &table {
+                        Some(t) => changes.iter().map(|c| (c.sql(t, self.dialect_of_db()).unwrap_or_default(), None)).collect(),
+                        None => vec![],
+                    };
+                    self.dialog = Some(Dialog::ConfirmWrite(Box::new(ConfirmWrite { statements, write: Write::SaveRows(changes) })));
+                } else {
+                    self.save_rows(&changes);
+                }
             }
-            ui.label(format!("page {} of {pages}", page + 1));
-            if ui.add_enabled(page + 1 < pages, egui::Button::new("▶")).clicked() {
-                page += 1;
-            }
-            ui.label(RichText::new(format!("{total} rows")).weak());
-            ui.separator();
-            if ui.button("⟳ Refresh").clicked() {
-                refresh = true;
-            }
-            if ui.button("Query this table").clicked() {
-                self.query = format!("SELECT *\nFROM {}\nLIMIT 100;", ddl::quote(&table, dialect));
+            Some(data_view::DataAction::Query(sql)) => {
+                self.query = sql;
                 self.tab = Tab::Query;
             }
-        });
-        if table != current {
-            page = 0;
+            Some(data_view::DataAction::Import) => self.pick_import(),
+            Some(data_view::DataAction::Export(f)) => self.export_table(f),
+            None => {}
         }
-        if table != current || page != self.data_page || refresh || self.data_out.is_none() {
-            self.data_table = Some(table.clone());
-            self.data_page = page;
-            let sql = format!(
-                "SELECT * FROM {} LIMIT {PAGE_SIZE} OFFSET {}",
-                ddl::quote(&table, dialect),
-                page * PAGE_SIZE
-            );
-            let Some(db) = &mut self.db else { return };
-            self.data_out = Some(
-                db.conn
-                    .run(&sql)
-                    .map_err(|e| format!("{e:#}"))
-                    .and_then(|mut r| r.pop().ok_or_else(|| "no result".to_string())),
-            );
-            if refresh {
+    }
+
+    fn dialect_of_db(&self) -> Dialect {
+        self.db.as_ref().map_or(Dialect::Sqlite, |d| d.conn.dialect())
+    }
+
+    /// Load the Data tab's page and its row count.
+    fn load_data(&mut self) {
+        let Some(db) = &mut self.db else { return };
+        let Some(t) = self.data.table.as_ref().and_then(|t| db.schema.table(t)) else {
+            self.data.out = Some(Err("no such table".into()));
+            return;
+        };
+        let d = db.conn.dialect();
+        let view = &self.data.view;
+        let offset = self.data.page * data_view::PAGE_SIZE;
+        let res = (|| -> anyhow::Result<(QueryResult, usize)> {
+            let total = db.conn.query_value(&view.count_sql(t, d)?)?.display().parse().unwrap_or(0);
+            let page = db.conn.run(&view.page_sql(t, data_view::PAGE_SIZE, offset, d)?)?.pop();
+            Ok((page.ok_or_else(|| anyhow::anyhow!("no result"))?, total))
+        })();
+        match res {
+            Ok((page, total)) => {
+                self.data.total = total;
+                self.data.out = Some(Ok(page));
+            }
+            Err(e) => self.data.out = Some(Err(format!("{e:#}"))),
+        }
+    }
+
+    fn save_rows(&mut self, changes: &[simple_database::data::RowChange]) {
+        let Some(db) = &mut self.db else { return };
+        let Some(t) = self.data.table.as_ref().and_then(|t| db.schema.table(t)).cloned() else { return };
+        match db.conn.apply_changes(&t, changes) {
+            Ok(n) => {
+                self.set_status(format!("Saved {} change(s), {n} row(s) affected", changes.len()), false);
+                self.data.reset();
                 self.refresh_db();
             }
+            Err(e) => self.data.error = Some(format!("{e:#}")),
         }
-        ui.separator();
-        match &self.data_out {
-            Some(Ok(r)) => grid::result_grid(ui, egui::Id::new(("data", &table, page)), r),
-            Some(Err(e)) => {
-                ui.colored_label(error_color(ui), format!("✖ {e}"));
+    }
+
+    /// Export every row matching the Data tab's filters.
+    fn export_table(&mut self, f: ExportFormat) {
+        let Some(db) = &mut self.db else { return };
+        let Some(t) = self.data.table.as_ref().and_then(|t| db.schema.table(t)) else { return };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(f.label(), &[f.extension()])
+            .set_file_name(format!("{}.{}", t.name, f.extension()))
+            .save_file()
+        else {
+            return;
+        };
+        let d = db.conn.dialect();
+        let res = self.data.view.all_sql(t, d).and_then(|sql| db.conn.run(&sql)).and_then(|mut r| {
+            let r = r.pop().ok_or_else(|| anyhow::anyhow!("no result"))?;
+            std::fs::write(&path, output::export(&r, f, &t.name, d))?;
+            Ok(r.rows.len())
+        });
+        match res {
+            Ok(n) => self.set_status(format!("Exported {n} row(s) to {}", path.display()), false),
+            Err(e) => self.set_status(format!("Export failed: {e:#}"), true),
+        }
+    }
+
+    /// Choose a file and open the Import dialog for it.
+    fn pick_import(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Data files", &["csv", "tsv", "tab", "json", "jsonl", "ndjson"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        let format = ImportFormat::from_path(&path).unwrap_or(ImportFormat::Csv);
+        match import::read_file(&path, Some(format)) {
+            Ok(rows) => {
+                let stem = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let tables = self.db.as_ref().map(|d| d.schema.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
+                let table = tables.iter().find(|t| t.to_lowercase() == stem).cloned().or_else(|| self.data.table.clone()).unwrap_or_default();
+                self.dialog = Some(Dialog::Import(Box::new(ImportState { path, rows, table, error: None })));
             }
-            None => {}
+            Err(e) => self.set_status(format!("{e:#}"), true),
         }
     }
 
@@ -1450,7 +1854,26 @@ impl App {
         });
         ui.add_space(10.0);
         let any = self.seed.tables.values().any(|(on, n)| *on && *n > 0);
-        if ui.add_enabled(any, egui::Button::new(RichText::new("🌱 Seed database").strong())).clicked() {
+        let read_only = self.db.as_ref().is_some_and(|d| d.conn.safe_mode() == SafeMode::ReadOnly);
+        let seed = ui
+            .add_enabled(any && !read_only, egui::Button::new(RichText::new("🌱 Seed database").strong()))
+            .on_disabled_hover_text(if read_only { "The connection is read-only" } else { "Choose tables to fill" });
+        if seed.clicked() {
+            if self.db.as_ref().is_some_and(|d| d.conn.confirms_writes()) {
+                let n = self.seed.tables.values().filter(|(on, n)| *on && *n > 0).count();
+                let statements = vec![(format!("-- insert fake rows into {n} table(s)"), None)];
+                self.dialog = Some(Dialog::ConfirmWrite(Box::new(ConfirmWrite { statements, write: Write::Seed })));
+            } else {
+                self.seed_now();
+            }
+        }
+        if let Some(Err(e)) = &self.seed.report {
+            ui.colored_label(error_color(ui), format!("✖ {e}"));
+        }
+    }
+
+    fn seed_now(&mut self) {
+        {
             let opts = SeedOptions {
                 rows: self.seed.rows,
                 counts: self.seed.tables.iter().filter(|(_, (on, _))| *on).map(|(t, (_, n))| (t.clone(), *n)).collect(),
@@ -1465,9 +1888,6 @@ impl App {
             }
             self.seed.report = Some(res);
             self.refresh_db();
-        }
-        if let Some(Err(e)) = &self.seed.report {
-            ui.colored_label(error_color(ui), format!("✖ {e}"));
         }
     }
 
@@ -1503,8 +1923,9 @@ impl App {
                 let resp = egui::Modal::new(egui::Id::new("push")).show(ctx, |ui| {
                     ui.set_width(420.0);
                     ui.heading("Apply migration?");
-                    let (warnings, dialect) = match (&mut self.db, &self.analysis.result) {
-                        (Some(db), Ok(s)) => (db.conn.migration(&db.schema, s).warnings, db.conn.dialect()),
+                    let desired = self.desired_schema();
+                    let (warnings, dialect) = match (&mut self.db, desired) {
+                        (Some(db), Some(s)) => (db.conn.migration(&db.schema, &s).warnings, db.conn.dialect()),
                         _ => (vec![], Dialect::Sqlite),
                     };
                     if dialect == Dialect::Mysql {
@@ -1540,7 +1961,9 @@ impl App {
                     action = m.show(ui, &mut self.conns);
                 });
                 match action {
-                    Some(conns::Action::Connect { target, label }) => match self.attach_db(Database::open_labeled(&target, label)) {
+                    Some(conns::Action::Connect { target, label, safe_mode }) => match self.attach_db(
+                        Database::open_labeled(&target, label).and_then(|mut d| d.set_safe_mode(safe_mode).map(|()| d)),
+                    ) {
                         Ok(()) => {
                             self.tab = Tab::Migrate;
                             return;
@@ -1574,6 +1997,146 @@ impl App {
                 }
                 self.dialog = Some(Dialog::Table(editor));
                 resp.should_close()
+            }
+            Dialog::ConfirmWrite(_) => {
+                let Some(Dialog::ConfirmWrite(c)) = self.dialog.take() else { unreachable!() };
+                let mut answer = None;
+                let label = self.db.as_ref().map(|d| d.conn.label().to_string()).unwrap_or_default();
+                let resp = egui::Modal::new(egui::Id::new("confirm_write")).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(format!("Change {label}?"));
+                    ui.label(RichText::new("Safe mode asks before these statements run.").weak());
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        for (stmt, why) in &c.statements {
+                            highlight::code_view(ui, stmt, Lang::Sql);
+                            if let Some(why) = why {
+                                ui.colored_label(error_color(ui), format!("⚠ {why}"));
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Run").strong()).clicked() {
+                            answer = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+                match answer {
+                    Some(true) => match c.write {
+                        Write::Query => self.run_query(),
+                        Write::SaveRows(changes) => self.save_rows(&changes),
+                        Write::Seed => self.seed_now(),
+                    },
+                    Some(false) => {}
+                    None if resp.should_close() => {}
+                    None => self.dialog = Some(Dialog::ConfirmWrite(c)),
+                }
+                return;
+            }
+            Dialog::Import(_) => {
+                let Some(Dialog::Import(mut st)) = self.dialog.take() else { unreachable!() };
+                let mut answer = None;
+                let (tables, read_only, confirm) = match &self.db {
+                    Some(d) => (
+                        d.schema.tables.clone(),
+                        d.conn.safe_mode() == SafeMode::ReadOnly,
+                        d.conn.confirms_writes(),
+                    ),
+                    None => (vec![], true, false),
+                };
+                let resp = egui::Modal::new(egui::Id::new("import")).show(ctx, |ui| {
+                    ui.set_width(640.0);
+                    ui.heading("Import rows");
+                    ui.label(RichText::new(st.path.display().to_string()).monospace().small().weak());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Into table");
+                        egui::ComboBox::from_id_salt("import_table").selected_text(&st.table).show_ui(ui, |ui| {
+                            for t in &tables {
+                                ui.selectable_value(&mut st.table, t.name.clone(), &t.name);
+                            }
+                        });
+                        ui.label(RichText::new(format!("{} row(s) in the file", st.rows.rows.len())).weak());
+                    });
+                    let table = tables.iter().find(|t| t.name == st.table);
+                    if let Some(t) = table {
+                        let plan = import::plan(t, &st.rows);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Columns:");
+                            for (_, c) in &plan.mapping {
+                                ui.colored_label(ok_color(ui), format!("✔ {c}"));
+                            }
+                            for c in &plan.skipped {
+                                ui.label(RichText::new(format!("✖ {c}")).weak()).on_hover_text("Not in the table, or empty and filled by the database: skipped");
+                            }
+                        });
+                        if !plan.missing.is_empty() {
+                            ui.colored_label(
+                                warn_color(ui),
+                                format!("⚠ {} need a value, but the file has no such column", plan.missing.join(", ")),
+                            );
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Preview").small().strong());
+                    let preview = QueryResult {
+                        columns: st.rows.columns.clone(),
+                        rows: st.rows.rows.iter().take(8).cloned().collect(),
+                        changes: None,
+                        truncated: false,
+                    };
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 200.0), |ui| {
+                        grid::result_grid(ui, egui::Id::new("import_preview"), &preview);
+                    });
+                    ui.label(RichText::new("All rows go in one transaction: if one fails, nothing is imported.").small().weak());
+                    if confirm {
+                        ui.colored_label(warn_color(ui), "Safe mode: importing writes to the database.");
+                    }
+                    if let Some(e) = &st.error {
+                        ui.colored_label(error_color(ui), format!("✖ {e}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ok = table.is_some() && !read_only && !st.rows.rows.is_empty();
+                        let button = egui::Button::new(RichText::new(format!("Import {} row(s)", st.rows.rows.len())).strong());
+                        if ui.add_enabled(ok, button).on_disabled_hover_text(if read_only { "The connection is read-only" } else { "Choose a table" }).clicked() {
+                            answer = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+                match answer {
+                    Some(true) => {
+                        let res = match (&mut self.db, tables.iter().find(|t| t.name == st.table)) {
+                            (Some(db), Some(t)) => import::import(&mut db.conn, t, &st.rows).map_err(|e| format!("{e:#}")),
+                            _ => Err("no such table".into()),
+                        };
+                        match res {
+                            Ok(n) => {
+                                self.set_status(format!("Imported {n} row(s) into {}", st.table), false);
+                                let table = st.table.clone();
+                                self.refresh_db();
+                                self.data.open(Some(table));
+                                self.tab = Tab::Data;
+                            }
+                            Err(e) => {
+                                st.error = Some(e);
+                                self.dialog = Some(Dialog::Import(st));
+                            }
+                        }
+                    }
+                    Some(false) => {}
+                    None if resp.should_close() => {}
+                    None => self.dialog = Some(Dialog::Import(st)),
+                }
+                return;
             }
             Dialog::Syntax => {
                 let resp = egui::Modal::new(egui::Id::new("syntax")).show(ctx, |ui| {
@@ -1653,6 +2216,7 @@ impl eframe::App for App {
             }
         });
         self.dialogs(&ctx);
+        self.sync_safe_mode();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1666,6 +2230,7 @@ impl eframe::App for App {
             },
             hide_outline: !self.show_outline,
             show_preview: self.show_preview,
+            hide_history: !self.show_history,
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
     }
@@ -1678,6 +2243,15 @@ fn analyze(text: &str, last_good: Schema) -> Analysis {
     let issues = result.as_ref().map(validate::validate).unwrap_or_default();
     let last_good = result.as_ref().map_or(last_good, Clone::clone);
     Analysis { text: text.to_string(), result, issues, last_good, outline: parser::outline(text) }
+}
+
+/// The table after the first FROM in `sql`, to name exported results.
+fn from_table(sql: &str) -> Option<String> {
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let i = words.iter().position(|w| w.eq_ignore_ascii_case("from"))?;
+    let name = words.get(i + 1)?.trim_end_matches([';', ',', ')']).trim_matches(['"', '`']);
+    let name = name.rsplit('.').next().unwrap_or(name);
+    (!name.is_empty() && !name.starts_with('(')).then(|| name.to_string())
 }
 
 /// The Query tab's starting text: list the tables.

@@ -2,8 +2,10 @@
 //! recent, groups), the selected connection's form on the right.
 
 use eframe::egui::{self, Color32, RichText};
-use simple_database::connections::{Color, Connection, Kind, Store};
+use simple_database::connections::{Color, Connection, Kind, SafeMode, Store};
 use simple_database::db::{self, Database};
+use simple_database::discover::{self, Found};
+use std::path::PathBuf;
 use std::time::Instant;
 
 const SSL_MODES: [&str; 6] = ["", "disable", "prefer", "require", "verify-ca", "verify-full"];
@@ -20,11 +22,13 @@ pub struct Manager {
     /// Outcome of the last action: (text, is_error).
     pub message: Option<(String, bool)>,
     confirm_delete: bool,
+    /// Databases described by files in the project folders.
+    detected: Vec<Found>,
 }
 
 /// What the dialog asks the app to do.
 pub enum Action {
-    Connect { target: String, label: String },
+    Connect { target: String, label: String, safe_mode: SafeMode },
     Close,
 }
 
@@ -60,7 +64,20 @@ impl Manager {
             import_url: String::new(),
             message: None,
             confirm_delete: false,
+            detected: Vec::new(),
         }
+    }
+
+    /// Also list databases found in `dirs` (.env, docker-compose.yml, Prisma).
+    pub fn with_detected(mut self, dirs: &[PathBuf]) -> Manager {
+        for d in dirs {
+            for f in discover::discover(d) {
+                if !self.detected.iter().any(|x| x.target == f.target) {
+                    self.detected.push(f);
+                }
+            }
+        }
+        self
     }
 
     fn load(&mut self, c: &Connection) {
@@ -124,11 +141,12 @@ impl Manager {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("🔍 Search").desired_width(150.0));
             if ui.button("➕ New").clicked() {
-                *self = Manager { search: std::mem::take(&mut self.search), ..Manager::blank() };
+                *self = Manager { search: std::mem::take(&mut self.search), detected: std::mem::take(&mut self.detected), ..Manager::blank() };
             }
         });
         ui.add_space(4.0);
         let mut picked: Option<(String, bool)> = None;
+        let mut detected_pick: Option<Found> = None;
         egui::ScrollArea::vertical().id_salt("conn_list").max_height(440.0).auto_shrink([false, false]).show(ui, |ui| {
             if store.connections.is_empty() {
                 ui.label(RichText::new("No saved connections yet. Fill in the form and press Save.").weak());
@@ -166,6 +184,26 @@ impl Manager {
                     ui.add_space(6.0);
                 }
             }
+            // Found in the project and not saved yet.
+            let saved: Vec<String> = store.connections.iter().map(|c| db::redact(&c.target(None))).collect();
+            let fresh: Vec<&Found> = self.detected.iter().filter(|f| !saved.contains(&db::redact(&f.target))).collect();
+            if query.is_empty() && !fresh.is_empty() {
+                ui.label(RichText::new("DETECTED IN PROJECT").small().strong().weak());
+                for f in fresh {
+                    let resp = ui
+                        .horizontal(|ui| {
+                            let r = ui.selectable_label(false, format!("🔎 {}", f.name));
+                            ui.label(RichText::new(kind_of(&f.target)).small().weak());
+                            r
+                        })
+                        .inner
+                        .on_hover_text(format!("{}\nfrom {}", db::redact(&f.target), f.source));
+                    if resp.clicked() {
+                        detected_pick = Some(f.clone());
+                    }
+                }
+                ui.add_space(6.0);
+            }
             for (group, conns) in store.grouped(&query) {
                 if group.is_empty() {
                     ui.label(RichText::new("ALL").small().strong().weak());
@@ -184,8 +222,22 @@ impl Manager {
             self.load(c);
             if connect {
                 let (target, label) = self.target(store);
-                *action = Some(Action::Connect { target, label });
+                *action = Some(Action::Connect { target, label, safe_mode: self.form.safe_mode });
             }
+        }
+        if let Some(f) = detected_pick
+            && let Ok((mut c, pw)) = Connection::from_target(&store.unique_name(&f.name), &f.target)
+        {
+            c.save_password = pw.is_some();
+            *self = Manager {
+                search: std::mem::take(&mut self.search),
+                detected: std::mem::take(&mut self.detected),
+                ..Manager::blank()
+            };
+            self.form = c;
+            self.password_edited = pw.is_some();
+            self.password = pw.unwrap_or_default();
+            self.message = Some((format!("Found in {}; Save to keep it", f.source), false));
         }
         ui.label(RichText::new("Double-click to connect.").small().weak());
     }
@@ -323,6 +375,15 @@ impl Manager {
             });
             ui.end_row();
 
+            ui.label("Safe mode");
+            ui.horizontal(|ui| {
+                for m in SafeMode::ALL {
+                    let text = if m == SafeMode::ReadOnly { format!("🔒 {}", m.label()) } else { m.label().to_string() };
+                    ui.selectable_value(&mut f.safe_mode, m, text).on_hover_text(m.description());
+                }
+            });
+            ui.end_row();
+
             ui.label("Color");
             ui.horizontal(|ui| {
                 for c in Color::ALL {
@@ -401,7 +462,7 @@ impl Manager {
                 let saved = !named || !unsaved || self.save(store).map_err(|e| self.message = Some((format!("{e:#}"), true))).is_ok();
                 if saved {
                     let (target, label) = self.target(store);
-                    *action = Some(Action::Connect { target, label });
+                    *action = Some(Action::Connect { target, label, safe_mode: self.form.safe_mode });
                 }
             }
             if ui.button("Test").clicked() {
@@ -448,7 +509,11 @@ impl Manager {
                         match res {
                             Ok(fresh) => {
                                 *store = fresh;
-                                *self = Manager { search: std::mem::take(&mut self.search), ..Manager::blank() };
+                                *self = Manager {
+                                    search: std::mem::take(&mut self.search),
+                                    detected: std::mem::take(&mut self.detected),
+                                    ..Manager::blank()
+                                };
                                 self.message = Some((format!("Deleted @{name}"), false));
                             }
                             Err(e) => self.message = Some((format!("{e:#}"), true)),
@@ -479,6 +544,13 @@ pub fn color_dot(ui: &mut egui::Ui, c: Color) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     if let Some(col) = to_color32(c) {
         ui.painter().circle_filled(rect.center(), 4.5, col);
+    }
+}
+
+fn kind_of(target: &str) -> &'static str {
+    match Connection::from_target("", target) {
+        Ok((c, _)) => c.kind.label(),
+        Err(_) => "",
     }
 }
 

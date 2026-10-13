@@ -18,10 +18,24 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | **Schema** | Edit the `.dbs` file with syntax highlighting and line numbers. Errors and design warnings update as you type |
 | **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file or the live database. The schema file's diagram is editable (see below). **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
 | **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save. In SQLite it is editable and kept in sync with the schema (see below) |
-| **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **Pull** replaces the editor with the database's schema |
-| **Query** | Run SQL (Ctrl+Enter) and see the results in a grid. Shows up to 10,000 rows per result. **Explain** shows each statement's query plan: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept |
-| **Data** | Browse any table, 200 rows per page |
+| **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, or another database (a saved connection or a SQLite file), to make the open database match it. **Pull** replaces the editor with the database's schema |
+| **Query** | Run SQL (Ctrl+Enter) and see the results in a grid. Shows up to 10,000 rows per result. **Explain** shows each statement's query plan: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept. **History** lists past queries (searchable; click to load, double-click to run) and saved queries (**Save query…**). **Export** saves the result as CSV, TSV, JSON, JSON Lines, Markdown, HTML or SQL INSERTs, or copies it |
+| **Data** | Browse and edit a table, 200 rows per page (see below) |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
+
+The **Data** tab edits rows in place. Click a column header to sort (again to reverse, a third
+time to clear). **Filter** adds conditions per column (=, ≠, <, >, contains, starts with, in, is
+NULL…) and an optional SQL `WHERE` condition; **Apply** or Enter runs them. Double-click a cell
+to edit it (Enter or clicking elsewhere keeps the value, Esc cancels), right-click for **Set
+NULL**, **Revert cell**, **Copy value**, **Duplicate row** and **Delete row**. **➕ Row** adds a
+row whose empty cells get their defaults. Click row numbers to select rows (Ctrl+click for
+several), then **Delete** or the Delete key. Nothing is written until **Save changes**: the
+pending changes are listed with **Show SQL**, values are checked against the column types first,
+and everything runs in one transaction. An update or delete that no longer matches exactly one
+row (someone changed it meanwhile) rolls all of it back. Editing needs a primary key; tables
+without one can only get new rows. **Import…** inserts a CSV, TSV, JSON or JSON Lines file
+(preview and column mapping first; see `sdb import`), and **Export** saves every row that
+matches the filters.
 
 **File → Connections…** (Ctrl+K, or **Connections…** in the sidebar) manages saved
 connections (see [Saved connections](#saved-connections)). The list on the left has a search
@@ -29,8 +43,10 @@ box (it matches name, host, database, user, type and group), **Favorites**, the 
 **Recent** connections, and the rest in collapsible groups. Double-click a connection to
 connect. The form on the right edits the selected connection: name, type (PostgreSQL, MySQL,
 SQLite), host, port, user, password (**Save password** keeps it), database or file, group,
-color and favorite. **TLS and options** holds the SSL mode and certificate files. **Import
-URL** fills the form from a pasted URL. **Test** connects without opening the database,
+color, favorite and [safe mode](#safe-mode). **TLS and options** holds the SSL mode and
+certificate files. **Import URL** fills the form from a pasted URL. **Detected in project** lists
+databases described next to the schema file or in the working directory (see `sdb conn
+detect`); click one to fill the form. **Test** connects without opening the database,
 **Connect** saves the form and connects (with an empty name it connects without saving), and
 **Duplicate** and **Delete** do what they say. Favorites and recent connections are also
 listed in the sidebar while no database is open. When a connection fails, for example because
@@ -186,11 +202,13 @@ verifies the CA, as libpq does:
 | `sdb diff FROM TO -d DIALECT [-o file]` | Summary of changes + migration SQL |
 | `sdb push SCHEMA --db app.db [--dry-run] [-y]` | Migrate a database to match the schema |
 | `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database |
-| `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42]` | Fill tables with realistic fake data (see below) |
-| `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown]` | Run SQL, print results |
+| `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42] [-y]` | Fill tables with realistic fake data (see below) |
+| `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown] [-y]` | Run SQL, print results. `-y` skips safe mode's question |
+| `sdb import --db app.db FILE [-t TABLE] [-f csv\|tsv\|json\|jsonl] [-y]` | Insert rows from a file (see below) |
 | `sdb shell [--db app.db]` | Interactive SQL shell (in-memory if no `--db`) |
 | `sdb conn list` | List saved connections by group |
-| `sdb conn add NAME URL\|FILE [-g GROUP] [--no-password] [-f]` | Save a connection. A password in the URL is saved unless `--no-password`; `-f` replaces an existing one |
+| `sdb conn add NAME URL\|FILE [-g GROUP] [--no-password] [-f] [--safe-mode MODE]` | Save a connection. A password in the URL is saved unless `--no-password`; `-f` replaces an existing one |
+| `sdb conn detect [DIR] [--save]` | List databases a project describes; `--save` saves the new ones (without passwords) |
 | `sdb conn remove NAME` | Delete a saved connection |
 | `sdb conn test NAME` | Connect and report how many tables there are |
 
@@ -210,7 +228,42 @@ They are stored in `connections.json` in `$SDB_CONFIG_DIR`, else `$XDG_CONFIG_HO
 `~/.config/sdb` (`%APPDATA%\sdb` on Windows). Saved passwords are kept apart in `secrets.json`,
 which only you can read (mode 0600, like `~/.pgpass`; it is not encrypted). That way
 `connections.json` can be copied or shared without them. A connection without a saved
-password uses `PGPASSWORD` / `MYSQL_PWD`, or the app asks for it.
+password uses `PGPASSWORD` / `MYSQL_PWD`, or the app asks for it. The app's query history
+(`history.json`, last 500 queries, also 0600) and saved queries (`queries.json`) live in the
+same folder.
+
+`sdb conn detect` finds databases a project already describes: `DATABASE_URL`-style values and
+Laravel `DB_*` settings in `.env`, `.env.local`, `.env.development` and `.env.example`;
+PostgreSQL, MySQL and MariaDB services in `compose.yaml` / `docker-compose.yml` (user, password
+and database from their environment, `${VAR}` filled from `.env`, the published port); and the
+`datasource` of `prisma/schema.prisma`. SQLite paths become absolute.
+
+### Safe mode
+
+Each saved connection has a safe mode, set in the app or with `sdb conn add --safe-mode`:
+
+| Mode | Effect |
+|---|---|
+| `off` | Run everything (the default) |
+| `warn` | Ask before DROP, TRUNCATE, ALTER … DROP, and DELETE or UPDATE without WHERE |
+| `confirm` | Ask before every statement that writes, including saving edits, importing and seeding |
+| `read-only` | Refuse every write. The session is also made read-only on the server (`SET SESSION … READ ONLY`, SQLite `PRAGMA query_only`), so nothing gets past the check |
+
+The app shows the mode under the database name and asks in a dialog that lists the statements.
+The CLI asks on the terminal; `-y` answers yes. `push` always asks unless `-y`.
+
+To compare two live databases, pass both: `sdb diff @prod @staging -d postgres`, or make one
+match the other with `sdb push @prod --db @staging` (in the app: Migrate → **From**).
+
+### Importing data
+
+`sdb import --db app.db users.csv` inserts the file into the table named like the file (or
+`-t TABLE`). The format comes from the extension: `.csv`, `.tsv`, `.json` (an array of
+objects) or `.jsonl`. Columns are matched by name, ignoring case; others are skipped. In CSV and
+TSV an empty field is NULL and `""` is an empty string. NULL in a NOT NULL column with a default
+gets the default, and a column that is empty in every row and filled by the database
+(auto-increment or default) is left out. Values are checked against the column types, and all
+rows go in one transaction, so a bad row means nothing is inserted.
 
 ### Typical workflow
 

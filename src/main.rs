@@ -5,7 +5,6 @@ use simple_database::diagram::DiagramFormat;
 use simple_database::output::OutputFormat;
 use simple_database::schema::Schema;
 use simple_database::*;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use simple_database::validate::{Issue, Severity, print_issues};
 
@@ -94,6 +93,28 @@ enum Command {
         sql: String,
         #[arg(short, long, value_enum, default_value = "table")]
         format: OutputFormat,
+        /// Run without asking, even if the connection's safe mode would ask
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Insert rows from a CSV, TSV, JSON or JSON Lines file into a table
+    ///
+    /// File columns are matched to table columns by name (any case); others are
+    /// skipped. In CSV/TSV an empty field is NULL and "" is an empty string. All
+    /// rows go in one transaction: one bad row and nothing is inserted.
+    Import {
+        #[arg(long)]
+        db: String,
+        file: PathBuf,
+        /// Target table (default: the file name without extension)
+        #[arg(short, long)]
+        table: Option<String>,
+        /// File format (default: from the extension)
+        #[arg(short, long, value_enum)]
+        format: Option<import::ImportFormat>,
+        /// Import without asking, even if the connection's safe mode would ask
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Fill a database with realistic fake data
     ///
@@ -115,6 +136,9 @@ enum Command {
         /// Random seed, for reproducible data
         #[arg(long)]
         seed: Option<u64>,
+        /// Seed without asking, even if the connection's safe mode would ask
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Interactive SQL shell (in-memory database if --db is omitted)
     Shell {
@@ -144,6 +168,18 @@ enum ConnCommand {
         /// Replace an existing connection with the same name
         #[arg(short, long)]
         force: bool,
+        /// What may run without asking: off, warn (dangerous statements),
+        /// confirm (every write) or read-only
+        #[arg(long, value_enum, default_value = "off")]
+        safe_mode: connections::SafeMode,
+    },
+    /// List databases a project folder describes (.env, docker-compose.yml, Prisma)
+    Detect {
+        /// Folder to look in (default: the current one)
+        dir: Option<PathBuf>,
+        /// Save the ones not saved yet, without their passwords
+        #[arg(long)]
+        save: bool,
     },
     /// Delete a saved connection
     Remove { name: String },
@@ -241,13 +277,46 @@ fn run(cli: Cli) -> Result<()> {
             let s = open_existing(&db)?.introspect()?;
             emit(output.as_deref(), &format::format_schema(&s))?;
         }
-        Command::Query { db, sql, format } => {
-            for r in open_existing(&db)?.run(&sql)? {
+        Command::Query { db, sql, format, yes } => {
+            let mut db = open_existing(&db)?;
+            let asks = db.needs_confirmation(&sql);
+            if !asks.is_empty() && !yes && !shell::confirm_statements(&asks, db.label())? {
+                bail!("not run");
+            }
+            for r in db.run(&sql)? {
                 println!("{}", output::render(&r, format));
             }
         }
-        Command::Seed { db, rows, counts, only, seed } => {
+        Command::Import { db, file, table, format, yes } => {
+            let rows = import::read_file(&file, format)?;
             let mut db = open_existing(&db)?;
+            db.ensure_writable()?;
+            let table = match table {
+                Some(t) => t,
+                None => file.file_stem().map(|s| s.to_string_lossy().into_owned()).context("name the table with --table")?,
+            };
+            let schema = db.introspect()?;
+            let t = schema.table(&table).with_context(|| format!("{} has no table '{table}'", db.label()))?;
+            let plan = import::plan(t, &rows);
+            let cols: Vec<&str> = plan.mapping.iter().map(|(_, c)| c.as_str()).collect();
+            eprintln!("{} row(s) into {table} ({})", rows.rows.len(), cols.join(", "));
+            if !plan.skipped.is_empty() {
+                eprintln!("\x1b[33mskipped:\x1b[0m {} (not in {table})", plan.skipped.join(", "));
+            }
+            if !plan.missing.is_empty() {
+                eprintln!("\x1b[33mwarning:\x1b[0m {} need a value but the file has no such column", plan.missing.join(", "));
+            }
+            if db.confirms_writes() && !yes && !confirm(&format!("Import into {}?", db.label()))? {
+                bail!("not imported");
+            }
+            let n = import::import(&mut db, t, &rows)?;
+            println!("Imported {n} row(s) into {table}.");
+        }
+        Command::Seed { db, rows, counts, only, seed, yes } => {
+            let mut db = open_existing(&db)?;
+            if db.confirms_writes() && !yes && !confirm(&format!("Insert fake data into {}?", db.label()))? {
+                bail!("not seeded");
+            }
             let seed = seed.unwrap_or_else(seed::random_seed);
             let opts = seed::SeedOptions {
                 rows,
@@ -286,17 +355,22 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
                     let indent = if group.is_empty() { "" } else { "  " };
                     let star = if c.favorite { " ★" } else { "" };
                     let key = if store.password(&c.name).is_some() { " (password saved)" } else { "" };
-                    println!("{indent}@{:<20} {:<10} {}{key}{star}", c.name, c.kind.label(), c.summary());
+                    let mode = match c.safe_mode {
+                        connections::SafeMode::Off => String::new(),
+                        m => format!(" [{}]", m.label().to_lowercase()),
+                    };
+                    println!("{indent}@{:<20} {:<10} {}{key}{star}{mode}", c.name, c.kind.label(), c.summary());
                 }
             }
         }
-        ConnCommand::Add { name, target, group, no_password, force } => {
+        ConnCommand::Add { name, target, group, no_password, force, safe_mode } => {
             let (mut conn, password) = connections::Connection::from_target(&name, &target)?;
             if conn.kind == connections::Kind::Sqlite {
                 // Saved connections are used from any directory.
                 conn.database = std::path::absolute(&conn.database)?.to_string_lossy().into_owned();
             }
             conn.group = group;
+            conn.safe_mode = safe_mode;
             conn.save_password = password.is_some() && !no_password;
             let old = store.get(&conn.name).map(|c| c.name.clone());
             if old.is_some() && !force {
@@ -313,6 +387,29 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
             }
             store.save()?;
             println!("Removed @{name}");
+        }
+        ConnCommand::Detect { dir, save } => {
+            let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            let found = discover::discover(&dir);
+            if found.is_empty() {
+                eprintln!("Nothing found in {} (.env, docker-compose.yml, prisma/schema.prisma).", dir.display());
+            }
+            let mut saved = 0;
+            for f in &found {
+                let known = store.connections.iter().any(|c| db::redact(&c.target(None)) == db::redact(&f.target));
+                let note = if known { "  (already saved)" } else { "" };
+                println!("{:<24} {}  \x1b[2m{}\x1b[0m{note}", f.name, db::redact(&f.target), f.source);
+                if save && !known {
+                    let (mut conn, _) = connections::Connection::from_target(&store.unique_name(&f.name), &f.target)?;
+                    conn.group = dir.canonicalize()?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    store.upsert(None, conn, None)?;
+                    saved += 1;
+                }
+            }
+            if saved > 0 {
+                store.save()?;
+                println!("Saved {saved} connection(s); passwords are not saved.");
+            }
         }
         ConnCommand::Test { name } => {
             let name = name.trim_start_matches('@');
@@ -399,10 +496,4 @@ fn print_changes(m: &diff::Migration) {
     }
 }
 
-fn confirm(question: &str) -> Result<bool> {
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
-}
+use shell::confirm;

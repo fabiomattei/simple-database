@@ -3,15 +3,20 @@
 //! the `sdb-gui` desktop app.
 
 pub mod connections;
+pub mod data;
 pub mod db;
 pub mod ddl;
 pub mod diagram;
 pub mod diff;
+pub mod discover;
 pub mod format;
+pub mod history;
+pub mod import;
 pub mod mysqldb;
 pub mod output;
 pub mod parser;
 pub mod pg;
+pub mod safety;
 pub mod schema;
 pub mod seed;
 pub mod shell;

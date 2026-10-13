@@ -3,6 +3,7 @@
 use crate::diagram::{self, DiagramFormat};
 use crate::output::{self, OutputFormat};
 use crate::db::Database;
+use crate::safety::{Kind, SafeMode};
 use crate::{ddl, format, validate};
 use anyhow::Result;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -42,7 +43,11 @@ pub fn run(db: Database) -> Result<()> {
         let _ = rl.load_history(h);
     }
 
-    println!("sdb shell — connected to {label}. Type .help for commands.");
+    let mode = match shell.db.safe_mode() {
+        SafeMode::Off => String::new(),
+        m => format!(" Safe mode: {}.", m.label().to_lowercase()),
+    };
+    println!("sdb shell — connected to {label}.{mode} Type .help for commands.");
     let mut buffer = String::new();
     loop {
         let prompt = if buffer.is_empty() { "sdb> " } else { "...> " };
@@ -83,6 +88,11 @@ pub fn run(db: Database) -> Result<()> {
 
 impl Shell {
     fn exec(&mut self, sql: &str) {
+        let asks = self.db.needs_confirmation(sql);
+        if !asks.is_empty() && !confirm_statements(&asks, self.db.label()).unwrap_or(false) {
+            println!("Not run.");
+            return;
+        }
         let start = Instant::now();
         match self.db.run(sql) {
             Ok(results) => {
@@ -153,6 +163,9 @@ impl Shell {
                     validate::print_issues(&issues);
                 }
                 ".seed" => {
+                    if self.db.confirms_writes() && !confirm(&format!("Insert fake data into {}?", self.db.label()))? {
+                        return Ok(true);
+                    }
                     let rows = match arg {
                         Some(a) => a.parse().map_err(|_| anyhow::anyhow!("usage: .seed [rows] [table]"))?,
                         None => 10,
@@ -186,4 +199,27 @@ impl Shell {
             true
         })
     }
+}
+
+/// Ask a yes/no question on the terminal; anything but y/yes is no.
+pub fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// List the statements safe mode wants confirmed and ask.
+pub fn confirm_statements(stmts: &[(String, Kind)], database: &str) -> Result<bool> {
+    eprintln!("\x1b[33mSafe mode:\x1b[0m {} statement(s) change {database}:", stmts.len());
+    for (s, k) in stmts {
+        let first = s.lines().next().unwrap_or_default();
+        match k {
+            Kind::Dangerous(why) => eprintln!("  \x1b[31m{first}\x1b[0m  ({why})"),
+            _ => eprintln!("  {first}"),
+        }
+    }
+    confirm("Run them?")
 }

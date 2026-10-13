@@ -59,7 +59,7 @@ pub fn result_grid(ui: &mut egui::Ui, id: egui::Id, r: &QueryResult) {
     });
 }
 
-fn number_color(ui: &egui::Ui) -> Color32 {
+pub fn number_color(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
         Color32::from_rgb(0xb5, 0xce, 0xa8)
     } else {

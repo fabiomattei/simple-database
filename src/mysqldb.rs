@@ -382,6 +382,8 @@ pub fn run_limited(conn: &mut Conn, sql: &str, max_rows: usize) -> Result<Vec<Qu
             .iter()
             .map(|c| (c.name_str().into_owned(), c.column_type(), c.character_set()))
             .collect();
+        // Read before the rows: draining the set moves on to the next one.
+        let affected = set.affected_rows();
         let mut rows = Vec::new();
         let mut truncated = false;
         for row in set.by_ref() {
@@ -393,7 +395,7 @@ pub fn run_limited(conn: &mut Conn, sql: &str, max_rows: usize) -> Result<Vec<Qu
             rows.push(row.unwrap().into_iter().zip(&columns).map(|(v, c)| cell(v, c.1, c.2)).collect());
         }
         if columns.is_empty() {
-            results.push(QueryResult { columns: vec![], rows: vec![], changes: Some(set.affected_rows()), truncated: false });
+            results.push(QueryResult { columns: vec![], rows: vec![], changes: Some(affected), truncated: false });
         } else {
             results.push(QueryResult { columns: columns.into_iter().map(|c| c.0).collect(), rows, changes: None, truncated });
         }

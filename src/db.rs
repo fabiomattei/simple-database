@@ -4,10 +4,12 @@
 //! to [`crate::sqlite`], [`crate::pg`] or [`crate::mysqldb`].
 
 use crate::ddl::{self, Dialect};
+use crate::data::RowChange;
 use crate::diff::{self, Migration};
+use crate::safety::{self, Kind, SafeMode};
 use crate::schema::*;
 use crate::{mysqldb, pg, sqlite};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -20,6 +22,7 @@ pub enum Conn {
 pub struct Database {
     pub conn: Conn,
     label: String,
+    safe_mode: SafeMode,
     /// Server-normalized check expressions per scratch table definition.
     check_cache: HashMap<String, Vec<(String, String)>>,
 }
@@ -56,7 +59,11 @@ impl Database {
     /// `postgres://` / `mysql://` URL, or to the saved connection `@name`.
     pub fn open(target: &str) -> Result<Database> {
         match crate::connections::resolve(target)? {
-            Some((resolved, name)) => Database::open_labeled(&resolved, format!("@{name}")),
+            Some(r) => {
+                let mut db = Database::open_labeled(&r.target, format!("@{}", r.name))?;
+                db.set_safe_mode(r.safe_mode)?;
+                Ok(db)
+            }
             None => Database::open_labeled(target, redact(target)),
         }
     }
@@ -69,11 +76,71 @@ impl Database {
             Some(_) => Conn::Mysql(Box::new(mysqldb::connect(target)?)),
             None => Conn::Sqlite(sqlite::open(Path::new(target))?),
         };
-        Ok(Database { conn, label, check_cache: HashMap::new() })
+        Ok(Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new() })
     }
 
     pub fn from_sqlite(conn: rusqlite::Connection, label: impl Into<String>) -> Database {
-        Database { conn: Conn::Sqlite(conn), label: label.into(), check_cache: HashMap::new() }
+        Database { conn: Conn::Sqlite(conn), label: label.into(), safe_mode: SafeMode::Off, check_cache: HashMap::new() }
+    }
+
+    pub fn safe_mode(&self) -> SafeMode {
+        self.safe_mode
+    }
+
+    /// Set the safe mode. Read-only also makes the session read-only on the
+    /// server (`PRAGMA query_only` for SQLite), so nothing slips past the
+    /// classifier. The mode is set even if that server command fails.
+    pub fn set_safe_mode(&mut self, mode: SafeMode) -> Result<()> {
+        let ro = mode == SafeMode::ReadOnly;
+        if ro != (self.safe_mode == SafeMode::ReadOnly) {
+            let sql = match (self.dialect(), ro) {
+                (Dialect::Sqlite, true) => "PRAGMA query_only = ON",
+                (Dialect::Sqlite, false) => "PRAGMA query_only = OFF",
+                (Dialect::Postgres, true) => "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+                (Dialect::Postgres, false) => "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+                (Dialect::Mysql, true) => "SET SESSION TRANSACTION READ ONLY",
+                (Dialect::Mysql, false) => "SET SESSION TRANSACTION READ WRITE",
+            };
+            self.safe_mode = SafeMode::Off;
+            let result = self.execute(sql);
+            // The classifier still guards a read-only connection if the server refused.
+            self.safe_mode = mode;
+            return result;
+        }
+        self.safe_mode = mode;
+        Ok(())
+    }
+
+    /// The statements in `sql` the safe mode wants confirmed before they run.
+    pub fn needs_confirmation(&self, sql: &str) -> Vec<(String, Kind)> {
+        if !matches!(self.safe_mode, SafeMode::Warn | SafeMode::Confirm) {
+            return vec![];
+        }
+        safety::classify_all(sql).into_iter().filter(|(_, k)| self.safe_mode.asks(k)).collect()
+    }
+
+    /// Whether the safe mode wants writes confirmed (any write, not just dangerous ones).
+    pub fn confirms_writes(&self) -> bool {
+        self.safe_mode == SafeMode::Confirm
+    }
+
+    /// Refuse writes on a read-only connection.
+    fn guard(&self, sql: &str) -> Result<()> {
+        if self.safe_mode == SafeMode::ReadOnly
+            && let Some((stmt, _)) = safety::classify_all(sql).into_iter().find(|(_, k)| k.writes())
+        {
+            let first = stmt.lines().next().unwrap_or_default();
+            bail!("{} is read-only (safe mode), refused: {first}", self.label);
+        }
+        Ok(())
+    }
+
+    /// Refuse anything on a read-only connection; for writes built by sdb itself.
+    pub fn ensure_writable(&self) -> Result<()> {
+        if self.safe_mode == SafeMode::ReadOnly {
+            bail!("{} is read-only (safe mode)", self.label);
+        }
+        Ok(())
     }
 
     /// A file path, the URL without its password, or `@name` for a saved connection.
@@ -106,6 +173,7 @@ impl Database {
 
     /// Like [`Database::run`], but keep at most `max_rows` rows of each result set.
     pub fn run_limited(&mut self, sql: &str, max_rows: usize) -> Result<Vec<QueryResult>> {
+        self.guard(sql)?;
         match &mut self.conn {
             Conn::Sqlite(c) => sqlite::run_limited(c, sql, max_rows),
             Conn::Postgres(c) => pg::run_limited(c, sql, max_rows),
@@ -115,6 +183,7 @@ impl Database {
 
     /// Execute statements, discarding any rows.
     pub fn execute(&mut self, sql: &str) -> Result<()> {
+        self.guard(sql)?;
         match &mut self.conn {
             Conn::Sqlite(c) => c.execute_batch(sql)?,
             Conn::Postgres(c) => c.batch_execute(sql)?,
@@ -215,6 +284,7 @@ impl Database {
 
     /// Execute a migration produced by [`Database::migration`].
     pub fn apply_migration(&mut self, m: &Migration) -> Result<()> {
+        self.ensure_writable()?;
         match &mut self.conn {
             Conn::Sqlite(c) => sqlite::apply_migration(c, m),
             Conn::Postgres(c) => {
@@ -239,6 +309,54 @@ impl Database {
                     })?;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Apply staged row changes to `t` in one transaction. Updates and deletes
+    /// must each hit exactly one row, else everything is rolled back.
+    pub fn apply_changes(&mut self, t: &Table, changes: &[RowChange]) -> Result<u64> {
+        let d = self.dialect();
+        let stmts = changes
+            .iter()
+            .map(|c| Ok((c.sql(t, d)?, c.targets_one_row())))
+            .collect::<Result<Vec<_>>>()?;
+        self.write_statements(&stmts)
+    }
+
+    /// Run data-changing statements in one transaction, rolled back if any
+    /// fails. Statements flagged `true` must change exactly one row. Returns
+    /// the rows changed.
+    pub fn write_statements(&mut self, stmts: &[(String, bool)]) -> Result<u64> {
+        self.ensure_writable()?;
+        let mysql = self.dialect() == Dialect::Mysql;
+        self.execute(if mysql { "START TRANSACTION" } else { "BEGIN" })?;
+        let mut total = 0;
+        let mut result = Ok(());
+        for (stmt, one) in stmts {
+            let n: u64 = match self.run(stmt) {
+                Ok(r) => r.iter().filter_map(|r| r.changes).sum(),
+                Err(e) => {
+                    result = Err(e.context(format!("failed at: {stmt}")));
+                    break;
+                }
+            };
+            // MySQL counts only rows whose values changed, so 0 can be an unchanged row.
+            if *one && (n > 1 || (n == 0 && !(mysql && stmt.starts_with("UPDATE")))) {
+                let what = if n == 0 { "no row: it was changed or deleted meanwhile".to_string() } else { format!("{n} rows") };
+                result = Err(anyhow::anyhow!("{stmt}\nmatched {what}"));
+                break;
+            }
+            total += n;
+        }
+        match result {
+            Ok(()) => {
+                self.execute("COMMIT")?;
+                Ok(total)
+            }
+            Err(e) => {
+                let _ = self.execute("ROLLBACK");
+                Err(e.context("nothing was saved"))
             }
         }
     }
@@ -342,6 +460,7 @@ fn scratch_table_sql(t: &Table, checks: &[(String, String)], d: Dialect) -> Stri
 
 // ---------------------------------------------------------------- results
 
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Cell>>,
@@ -665,8 +784,67 @@ mod tests {
         assert_eq!(plans.len(), 2);
         assert!(plans.iter().all(|p| p.columns == ["QUERY PLAN"] && !p.rows.is_empty()), "{:?}", plans[0].columns);
         assert_eq!(db.query_value("SELECT count(*) FROM post_tags").unwrap(), Cell::Int(15));
+
+        // Staged edits and imports, typed by column, in one transaction.
+        live_edits(&mut db, &current);
         drop_all(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
+    }
+
+    fn live_edits(db: &mut Database, schema: &Schema) {
+        use crate::data::{Filter, Op, RowChange, View};
+        let posts = schema.table("posts").unwrap();
+        let id = db.query_value("SELECT min(id) FROM posts").unwrap();
+        let key = vec![("id".to_string(), id.clone())];
+        let changes = [RowChange::Update {
+            key: key.clone(),
+            values: vec![("title".into(), Cell::Text("it's \\ edited".into())), ("published".into(), Cell::Text("true".into()))],
+        }];
+        assert_eq!(db.apply_changes(posts, &changes).unwrap(), 1);
+        // Saving the same values again is fine (MySQL reports 0 changed rows).
+        db.apply_changes(posts, &changes).unwrap();
+        let view = View {
+            filters: vec![Filter { column: "title".into(), op: Op::Contains, value: "S \\ ED".into() }],
+            ..View::default()
+        };
+        let d = db.dialect();
+        let page = db.run(&view.page_sql(posts, 10, 0, d).unwrap()).unwrap().pop().unwrap();
+        assert_eq!(page.rows.len(), 1, "case-insensitive contains, backslash kept");
+        assert_eq!(db.query_value(&view.count_sql(posts, d).unwrap()).unwrap().display(), "1");
+        let deleted = [RowChange::Delete { key: vec![("id".into(), Cell::Int(-5))] }];
+        assert!(db.apply_changes(posts, &deleted).is_err());
+
+        let tags = schema.table("tags").unwrap();
+        let rows = crate::import::parse("NAME\nimported-a\nimported-b\n", crate::import::ImportFormat::Csv).unwrap();
+        assert_eq!(crate::import::import(db, tags, &rows).unwrap(), 2);
+        let dup = crate::import::parse("name\nimported-c\nimported-a\n", crate::import::ImportFormat::Csv).unwrap();
+        assert!(crate::import::import(db, tags, &dup).is_err());
+        assert_eq!(db.query_value("SELECT count(*) FROM tags WHERE name LIKE 'imported%'").unwrap().display(), "2");
+
+        // Read-only: the classifier refuses writes, and so does the server.
+        db.set_safe_mode(SafeMode::ReadOnly).unwrap();
+        assert!(db.run("DELETE FROM tags").is_err());
+        assert!(db.run("SELECT count(*) FROM tags").is_ok());
+        if let Conn::Postgres(c) = &mut db.conn {
+            assert!(c.batch_execute("DELETE FROM tags").is_err(), "the session itself is read-only");
+        }
+        db.set_safe_mode(SafeMode::Off).unwrap();
+        db.run("DELETE FROM tags WHERE name LIKE 'imported%'").unwrap();
+    }
+
+    #[test]
+    fn sqlite_read_only_mode() {
+        let mut db = Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "mem");
+        db.execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1)").unwrap();
+        db.set_safe_mode(SafeMode::ReadOnly).unwrap();
+        assert!(db.run("INSERT INTO t VALUES (2)").unwrap_err().to_string().contains("read-only"));
+        assert_eq!(db.query_value("SELECT count(*) FROM t").unwrap(), Cell::Int(1));
+        if let Conn::Sqlite(c) = &db.conn {
+            assert!(c.execute_batch("INSERT INTO t VALUES (3)").is_err(), "query_only is set");
+        }
+        db.set_safe_mode(SafeMode::Warn).unwrap();
+        assert_eq!(db.needs_confirmation("SELECT 1; DELETE FROM t; DELETE FROM t WHERE a = 1").len(), 1);
+        db.run("INSERT INTO t VALUES (2)").unwrap();
     }
 
     /// Runs when SDB_TEST_POSTGRES points at a scratch database, e.g.

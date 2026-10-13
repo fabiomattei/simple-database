@@ -42,6 +42,11 @@ Core library (`src/`, exported from `lib.rs`):
 | `ddl.rs` | `Dialect` enum and all CREATE/DROP SQL; `quote()` quotes only when needed; `canonical()` = the schema as a dialect reports it back |
 | `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change |
 | `diagram.rs` | Text diagrams: Mermaid / Graphviz DOT (the GUI canvas is separate, in `gui/er.rs`) |
+| `data.rs` | Data tab logic: `View` (filters, raw WHERE, sort → `page_sql` / `count_sql` / `all_sql`), `literal` (a `Cell` as SQL for a column type; checks text against the type), `RowChange` (staged update/insert/delete by primary key) |
+| `safety.rs` | `SafeMode` (off / warn / confirm / read-only) and `classify` (read, write, dangerous) over comment- and string-free words |
+| `history.rs` | `QueryLog`: query history (`history.json`, 500 entries, 0600) and saved queries (`queries.json`) in `config_dir()` |
+| `import.rs` | CSV/TSV/JSON/JSONL → `Rows`, `plan` (match columns by name), batched INSERTs, `import` in one transaction |
+| `discover.rs` | Find databases in a project folder: `.env` URLs and Laravel `DB_*`, compose services (lenient line-based YAML scan), Prisma datasource |
 | `connections.rs` | Saved connections (`Store`: `connections.json` + 0600 `secrets.json` in `config_dir()`). `Connection::from_target` / `target` convert to and from URLs. `resolve("@name")` is called by `Database::open` |
 | `db.rs` | `Database`: one live connection (SQLite path or `postgres://` / `mysql://` URL). `introspect`, `run` / `run_limited`, `row_counts`, `migration`, `apply_migration`, `normalize_checks`. Also `Cell` / `QueryResult`, `split_statements` and `schema_from_sqlite_ddl` (DDL → `Schema` via an in-memory SQLite; the GUI's editable SQL tab) |
 | `sqlite.rs` | SQLite introspection, `run_limited` (multi-statement via `rusqlite::Batch`), `apply_migration` |
@@ -49,7 +54,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `mysqldb.rs` | MySQL via the `mysql` crate (pure Rust, no TLS): `information_schema` introspection; checks are parsed from `SHOW CREATE TABLE` |
 | `seed.rs` | Fake data. Seedable SplitMix64 RNG (no `rand` crate), heuristics based on column names, retries on constraint errors |
 | `shell.rs` | CLI REPL (rustyline) and its `.meta` commands |
-| `output.rs` | CLI table / csv / json / markdown rendering (comfy-table 8: `load_style`, not `load_preset`) |
+| `output.rs` | CLI table / csv / json / markdown rendering (comfy-table 8: `load_style`, not `load_preset`); `export` to files (adds TSV, JSONL, HTML, SQL INSERTs) |
 
 Binaries:
 
@@ -60,7 +65,8 @@ Binaries:
 | `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
 | `src/gui/table_edit.rs` | Diagram's table editor dialog: column grid → DSL lines → `parser::parse`, renames via `Schema::rename_table` / `rename_column`; refuses edits that add validation errors |
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
-| `src/gui/grid.rs` | Virtualized result grid (egui_extras `TableBuilder`), shared by Query and Data |
+| `src/gui/grid.rs` | Read-only virtualized result grid (egui_extras `TableBuilder`): Query results, import preview |
+| `src/gui/data_view.rs` | Data tab: `DataView` (page, filters, sort, `Staged` edits/deletes/new rows), editable grid; returns `DataAction`s that `App` carries out (load, save, import, export) |
 | `src/gui/editor.rs` | `code_editor`: `TextEdit` plus gutter and problem `Mark`s, line commands (`command`, pure and unit-tested), find/replace bar, column selection (multi-caret, consumed from input before `TextEdit` sees it) and autocomplete (`Vocabulary` from a `Schema`; context-aware for the DSL). `goto_line` / `caret_line` talk to it by id. Use `take_key` for exact-modifier shortcuts: `consume_key` also matches with Shift held |
 | `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view` |
 
@@ -97,6 +103,14 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   GUI keeps its connection open. Don't replace this with a single `execute_batch`.
 - The parser forces `nullable = false` on inline `pk` columns; composite-pk columns keep their
   declared nullability.
+- **Safe mode lives in `Database`.** `run_limited`, `execute`, `apply_migration` and
+  `write_statements` refuse writes when read-only (`guard` / `ensure_writable`), and
+  `set_safe_mode` also makes the server session read-only. Callers only ask the user:
+  `needs_confirmation` (statements) and `confirms_writes` (sdb's own writes: edits, import,
+  seed). `Database::open` takes the mode from the saved connection.
+- Row edits and imports go through `Database::write_statements`: one transaction, rolled back on
+  any failure; edits must hit exactly one row (MySQL reports 0 for an UPDATE that changes
+  nothing, so that is allowed there).
 
 ## GUI notes
 
