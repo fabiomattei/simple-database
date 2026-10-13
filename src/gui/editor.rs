@@ -12,7 +12,7 @@
 
 use crate::highlight::{self, DBS_KEYWORDS, DBS_TYPES, Lang, SQL_KEYWORDS};
 use eframe::egui::{
-    self, Event, FontId, Galley, Key, Pos2, RichText, Stroke,
+    self, Event, FontId, ImeEvent, Galley, Key, Pos2, RichText, Stroke,
     text::{CCursor, CCursorRange},
 };
 use simple_database::schema::Schema;
@@ -173,7 +173,7 @@ pub fn code_editor(
                         _ => {}
                     }
                 }
-                Event::Text(s) => typed = s.chars().all(|c| is_ident(c) || c == '.'),
+                Event::Text(s) | Event::Ime(ImeEvent::Commit(s)) => typed = s.chars().all(|c| is_ident(c) || c == '.'),
                 _ => {}
             }
         }
@@ -373,9 +373,12 @@ enum Column {
 
 fn column_event(text: &mut String, carets: &mut Vec<Caret>, event: &Event, copied: &mut Option<String>) -> Column {
     match event {
-        Event::Text(s) if !s.is_empty() && !s.contains(['\n', '\r']) => {
+        // With an input method running (GNOME/ibus), typed characters arrive as IME commits.
+        Event::Text(s) | Event::Ime(ImeEvent::Commit(s)) if !s.is_empty() && !s.contains(['\n', '\r']) => {
             splice(text, carets, |_, c, _| (c.range().0, c.range().1, s.clone()));
         }
+        // Composition in progress (dead keys…): wait for the commit.
+        Event::Ime(ImeEvent::Preedit { .. } | ImeEvent::DeleteSurrounding { .. }) => {}
         Event::Paste(s) => {
             let s = s.replace("\r\n", "\n");
             let parts: Vec<&str> = s.strip_suffix('\n').unwrap_or(&s).split('\n').collect();
@@ -436,7 +439,13 @@ fn column_event(text: &mut String, carets: &mut Vec<Caret>, event: &Event, copie
                         carets.push(Caret { line: l, anchor: last.anchor.min(lens[l]), head: last.head.min(lens[l]) });
                     }
                 }
-                _ => return Column::Exit { consume: false },
+                // Shortcuts (undo, select all…) and keys that leave the line.
+                Key::Enter | Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown => {
+                    return Column::Exit { consume: false };
+                }
+                _ if modifiers.command || modifiers.ctrl || modifiers.mac_cmd => return Column::Exit { consume: false },
+                // A character key: its `Event::Text` follows and is typed on every line.
+                _ => {}
             }
         }
         _ => return Column::Ignored,
@@ -726,6 +735,34 @@ mod tests {
         }, &mut copied);
         assert_eq!(text, " id int\n name text\nx");
         assert_eq!(carets, vec![Caret::at(0, 1), Caret::at(1, 1)]);
+    }
+
+    fn key(key: Key, modifiers: egui::Modifiers) -> Event {
+        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn character_keys_stay_in_column_mode() {
+        let mut text = "a\nb".to_string();
+        let mut carets = column_carets(&text, (0, 1), (1, 1));
+        // egui sends the key, then the text it produced.
+        assert!(matches!(column_event(&mut text, &mut carets, &key(Key::X, Default::default()), &mut None), Column::Consumed));
+        column_event(&mut text, &mut carets, &Event::Text("x".into()), &mut None);
+        assert_eq!(text, "ax\nbx");
+        assert!(matches!(column_event(&mut text, &mut carets, &key(Key::Z, egui::Modifiers::COMMAND), &mut None), Column::Exit { consume: false }));
+        assert!(matches!(column_event(&mut text, &mut carets, &key(Key::Enter, Default::default()), &mut None), Column::Exit { consume: false }));
+    }
+
+    #[test]
+    fn input_method_commits_type_on_every_line() {
+        let mut text = "a
+b".to_string();
+        let mut carets = column_carets(&text, (0, 1), (1, 1));
+        let preedit = Event::Ime(ImeEvent::Preedit { text: "x".into(), active_range_chars: None });
+        assert!(matches!(column_event(&mut text, &mut carets, &preedit, &mut None), Column::Consumed));
+        column_event(&mut text, &mut carets, &Event::Ime(ImeEvent::Commit("x".into())), &mut None);
+        assert_eq!(text, "ax
+bx");
     }
 
     #[test]
