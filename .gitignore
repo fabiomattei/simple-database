@@ -1,0 +1,20 @@
+# Build output
+/target/
+
+# Local databases from manual testing (e.g. `sdb push schema.dbs --db app.db`)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Screenshots from GUI checks
+*.png
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
