@@ -34,8 +34,8 @@ Core library (`src/`, exported from `lib.rs`):
 | Module | Role |
 |---|---|
 | `lib.rs` | Module list plus `STARTER_SCHEMA` (`include_str!` of `examples/blog.dbs`) |
-| `parser.rs` | `.dbs` DSL → `Schema`. Hand-written tokenizer: `(...)` groups become one raw `Paren` token, and newline, `,` and `;` all end a statement |
-| `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Format/Pull) |
+| `parser.rs` | `.dbs` DSL → `Schema`. Hand-written tokenizer: `(...)` groups become one raw `Paren` token, and newline, `,` and `;` all end a statement. `outline` / `locate`: lenient table/column → line scan for the editor, works on text that doesn't parse |
+| `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Pull). `align` re-aligns columns in place keeping comments (GUI Format); it returns `None` unless the result parses to the same schema |
 | `validate.rs` | Errors (unusable schema) and warnings (design lint); `print_issues` is the CLI's ANSI printer |
 | `ddl.rs` | `Dialect` enum and all CREATE/DROP SQL; `quote()` quotes only when needed; `canonical()` = the schema as a dialect reports it back |
 | `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change |
@@ -58,7 +58,7 @@ Binaries:
 | `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom) |
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
 | `src/gui/grid.rs` | Virtualized result grid (egui_extras `TableBuilder`), shared by Query and Data |
-| `src/gui/editor.rs` | `code_editor`: `TextEdit` plus column selection (multi-caret, consumed from input before `TextEdit` sees it) and the autocomplete popup (`Vocabulary` from a `Schema`) |
+| `src/gui/editor.rs` | `code_editor`: `TextEdit` plus gutter and problem `Mark`s, line commands (`command`, pure and unit-tested), find/replace bar, column selection (multi-caret, consumed from input before `TextEdit` sees it) and autocomplete (`Vocabulary` from a `Schema`; context-aware for the DSL). `goto_line` / `caret_line` talk to it by id. Use `take_key` for exact-modifier shortcuts: `consume_key` also matches with Shift held |
 | `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view` |
 
 `examples/blog.dbs` is not just an example. It is the output of `sdb init`, the GUI's "New

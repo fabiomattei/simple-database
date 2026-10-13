@@ -42,7 +42,26 @@ password must come from `PGPASSWORD` / `MYSQL_PWD` or be typed again. It asks be
 replacing unsaved edits. `--tab <name>` opens a specific tab. Ctrl+S / Ctrl+O / Ctrl+N save,
 open and start a new schema. On Linux, file dialogs use the XDG desktop portal.
 
-Both editors (Schema and Query) support TextMate-style column selection and autocomplete:
+The Schema tab is a text editor first. Problems from validation are shown on the line they are
+about, with the message after the text, and each entry in the problems list has a **line N**
+link. **Outline** lists tables and columns (with a filter); clicking one moves the caret there,
+as does clicking a table in the sidebar while the Schema tab is open. **Preview** shows the
+generated SQL next to the editor, in the dialect you pick. **Format** (Ctrl+Shift+F) aligns the
+columns of every table and keeps comments and blank lines.
+
+Both editors (Schema and Query) have line numbers, editing commands, find/replace,
+TextMate-style column selection and autocomplete:
+
+| Keys | Effect |
+|---|---|
+| Enter | New line with the same indentation; after `{` one level deeper, closing the block if needed |
+| Tab / Shift+Tab | Indent / outdent the selected lines |
+| Ctrl+/ | Comment or uncomment the selected lines (`#` in schemas, `--` in SQL) |
+| Ctrl+D | Duplicate the selected lines |
+| Alt+↑ / ↓ | Move the selected lines up / down |
+| Ctrl+Shift+K | Delete the selected lines |
+| Ctrl+F, F3 / Shift+F3 | Find and replace; next / previous match (Enter / Shift+Enter in the find field) |
+| Ctrl+click | In a schema, jump to the table or `table.column` under the pointer |
 
 | Keys | Effect |
 |---|---|
@@ -54,8 +73,11 @@ Both editors (Schema and Query) support TextMate-style column selection and auto
 | Ctrl+Space | Open autocomplete (it also opens while you type a word, or after `table.`) |
 | ↑ ↓, Enter / Tab, Esc | Choose, accept, or close a suggestion |
 
-Suggestions are keywords, types, table names and column names. In SQL, `alias.` completes
-the columns of `FROM users u`-style aliases.
+In SQL, suggestions are keywords, types, table names and column names, and `alias.` completes
+the columns of `FROM users u`-style aliases. In a schema they follow the position on the line:
+`table` (expands to a table skeleton) between tables; `index`, `unique index` and `pk` at the
+start of a line; types after a column name; then the modifiers not used yet, `table.column`
+after `->`, actions after `on delete`, and the table's own columns inside `index (…)`.
 
 ## Command line (`sdb`)
 
@@ -239,7 +261,7 @@ cargo clippy --all-targets
 
 Source layout: `src/lib.rs` is the shared core and `src/main.rs` the CLI. `src/gui/` is the
 desktop app: `main.rs` (window, tabs), `er.rs` (diagram canvas), `grid.rs` (result grid),
-`editor.rs` (code editor: column selection, autocomplete), `highlight.rs` (syntax colors). Core modules: `parser.rs` (DSL) → `schema.rs` (model) → `validate.rs`, `ddl.rs`,
+`editor.rs` (code editor: line numbers, commands, find/replace, column selection, autocomplete), `highlight.rs` (syntax colors). Core modules: `parser.rs` (DSL) → `schema.rs` (model) → `validate.rs`, `ddl.rs`,
 `diff.rs`, `diagram.rs`, `format.rs`; `seed.rs` (fake data); `db.rs` (live connections), which
 dispatches to `sqlite.rs`, `pg.rs` and `mysqldb.rs` (introspection & queries); `shell.rs`, `output.rs`.
 

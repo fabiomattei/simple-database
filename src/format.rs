@@ -1,5 +1,6 @@
 //! Pretty-print a schema back to the `.dbs` DSL.
 
+use crate::parser::parse;
 use crate::schema::*;
 
 pub fn format_schema(schema: &Schema) -> String {
@@ -79,10 +80,108 @@ fn modifiers(c: &Column) -> Vec<String> {
     m
 }
 
+/// Re-aligns the column definitions of every table the way `format_schema`
+/// does, keeping comments, blank lines and everything else as written.
+/// `None` when `src` doesn't parse, or if the result would mean something else.
+pub fn align(src: &str) -> Option<String> {
+    let before = parse(src).ok()?;
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        i += 1;
+        let code = code_part(line.trim()).unwrap_or("").trim_end();
+        let opens = code.get(..6).is_some_and(|p| p.trim_end().eq_ignore_ascii_case("table") && p.ends_with(char::is_whitespace))
+            && code.ends_with('{')
+            && !code.contains('}');
+        let Some(close) = lines[i..].iter().position(|l| l.trim_start().starts_with('}')).filter(|_| opens) else {
+            out.push(line.to_string());
+            continue;
+        };
+        out.push(line.trim_start().to_string());
+        let body = &lines[i..i + close];
+        let cols: Vec<Option<(&str, String, &str)>> = body.iter().map(|l| split_column(l.trim())).collect();
+        let name_w = cols.iter().flatten().map(|c| c.0.chars().count()).max().unwrap_or(0);
+        let type_w = cols.iter().flatten().map(|c| c.1.chars().count()).max().unwrap_or(0);
+        for (l, col) in body.iter().zip(&cols) {
+            let l = match col {
+                Some((name, ty, rest)) => format!("  {name:name_w$}  {ty:type_w$}  {rest}"),
+                None if l.trim().is_empty() => String::new(),
+                None => format!("  {}", l.trim()),
+            };
+            out.push(l.trim_end().to_string());
+        }
+        out.push(lines[i + close].trim().to_string());
+        i += close + 1;
+    }
+    let text = out.join("\n");
+    (parse(&text).ok()? == before).then_some(text)
+}
+
+/// `line` up to its comment; `None` if it holds more than one statement or
+/// leaves a quote or parenthesis open.
+fn code_part(line: &str) -> Option<&str> {
+    let mut depth = 0;
+    let mut quote = None;
+    let mut prev = ' ';
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' | ';' if depth == 0 => return None,
+                '#' => return (depth == 0).then_some(&line[..i]),
+                '/' if prev == '/' => return (depth == 0).then_some(&line[..i - 1]),
+                _ => {}
+            },
+        }
+        prev = c;
+    }
+    (depth == 0 && quote.is_none()).then_some(line)
+}
+
+/// A column definition split into name, type and the rest (modifiers and comment).
+fn split_column(line: &str) -> Option<(&str, String, &str)> {
+    let code = code_part(line)?;
+    let (name, after) = code.split_once(char::is_whitespace)?;
+    if name.contains('(') || ["index", "unique", "pk", "primary"].contains(&name.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    let after = after.trim_start();
+    let offset = code.len() - after.len();
+    let mut ty = String::new();
+    let mut depth = 0;
+    let mut end = after.len();
+    for (i, c) in after.char_indices() {
+        if depth == 0 && c.is_whitespace() {
+            // `decimal (10, 2)`: the arguments still belong to the type.
+            let next = after[i..].trim_start();
+            if next.starts_with('(') && !ty.contains('(') {
+                continue;
+            }
+            end = i;
+            break;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        ty.push(c);
+    }
+    if ty.is_empty() {
+        return None;
+    }
+    Some((name, ty, line[offset + end..].trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
 
     #[test]
     fn round_trips() {
@@ -93,5 +192,27 @@ mod tests {
         let schema = parse(src).unwrap();
         let printed = format_schema(&schema);
         assert_eq!(parse(&printed).unwrap(), schema, "{printed}");
+    }
+
+    #[test]
+    fn align_keeps_comments() {
+        let src = "# header\ntable users { # people\n    id int pk autoincrement\n  # contact\n  email varchar(255) unique   not null # login\n\n  score decimal (10, 2) default 0\n    index (email)\n}\n";
+        let aligned = align(src).unwrap();
+        assert_eq!(
+            aligned,
+            "# header\ntable users { # people\n  id     int             pk autoincrement\n  # contact\n  email  varchar(255)    unique   not null # login\n\n  score  decimal(10, 2)  default 0\n  index (email)\n}\n"
+        );
+        assert_eq!(align(&aligned).as_deref(), Some(aligned.as_str()), "idempotent");
+        assert_eq!(align("table x {").as_deref(), None, "doesn't parse");
+        // One-line tables and several statements on a line stay as written.
+        let src = "table a { id int pk }\ntable b {\n  x int, y int\n}\n";
+        assert_eq!(align(src).as_deref(), Some(src));
+    }
+
+    #[test]
+    fn align_matches_format_schema() {
+        let schema = parse(crate::STARTER_SCHEMA).unwrap();
+        let printed = format_schema(&schema);
+        assert_eq!(align(&printed).as_deref(), Some(printed.as_str()));
     }
 }

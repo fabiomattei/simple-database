@@ -1,5 +1,12 @@
-//! The code editor: egui's `TextEdit` plus TextMate-style column selection
-//! (one caret per line) and an autocomplete popup.
+//! The code editor: egui's `TextEdit` plus line numbers, problem marks,
+//! editing commands, find/replace, TextMate-style column selection (one caret
+//! per line) and an autocomplete popup.
+//!
+//! Commands: Enter keeps the indentation (and opens a block after `{`),
+//! Tab/Shift+Tab indent and outdent the selected lines, Ctrl+/ toggles
+//! comments, Ctrl+D duplicates lines, Alt+↑/↓ moves them, Ctrl+Shift+K
+//! deletes them. Ctrl+F finds and replaces; F3/Shift+F3 step through matches.
+//! In the DSL, Ctrl+click on a table or `table.column` jumps to it.
 //!
 //! Column selection: Alt+drag selects a rectangle; tapping Alt turns a
 //! multi-line selection into a rectangle; Alt+Shift+↑/↓ adds a caret on the
@@ -10,11 +17,12 @@
 //! Autocomplete opens while typing a word, after `table.` and on Ctrl+Space.
 //! ↑/↓ choose, Enter/Tab accept, Esc closes.
 
-use crate::highlight::{self, DBS_KEYWORDS, DBS_TYPES, Lang, SQL_KEYWORDS};
+use crate::highlight::{self, DBS_TYPES, Lang, SQL_KEYWORDS};
 use eframe::egui::{
-    self, Event, FontId, ImeEvent, Galley, Key, Pos2, RichText, Stroke,
+    self, Align, Align2, Color32, Event, FontId, ImeEvent, Galley, Key, Modifiers, Pos2, Rect, RichText, Shape, Stroke, vec2,
     text::{CCursor, CCursorRange},
 };
+use simple_database::parser;
 use simple_database::schema::Schema;
 use std::sync::Arc;
 
@@ -37,6 +45,46 @@ impl Vocabulary {
     fn columns_of(&self, table: &str) -> Option<&[String]> {
         self.tables.iter().find(|(t, _)| t.eq_ignore_ascii_case(table)).map(|(_, c)| c.as_slice())
     }
+}
+
+/// A problem shown on a line (0-based): tinted, with its message after the text.
+pub struct Mark {
+    pub line: usize,
+    pub error: bool,
+    pub message: String,
+}
+
+/// What the code around an editor asks of it and learns from it, by `id_salt`.
+#[derive(Clone, Default)]
+struct Shared {
+    goto: Option<usize>,
+    caret_line: Option<usize>,
+}
+
+fn shared_id(id_salt: &str) -> egui::Id {
+    egui::Id::new(("code_editor", id_salt))
+}
+
+/// Puts the caret of editor `id_salt` on `line` (0-based), focuses it and scrolls there.
+pub fn goto_line(ctx: &egui::Context, id_salt: &str, line: usize) {
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<Shared>(shared_id(id_salt)).goto = Some(line));
+    ctx.request_repaint();
+}
+
+/// The line (0-based) of the caret of editor `id_salt` while it has focus.
+pub fn caret_line(ctx: &egui::Context, id_salt: &str) -> Option<usize> {
+    ctx.data(|d| d.get_temp::<Shared>(shared_id(id_salt))).and_then(|s| s.caret_line)
+}
+
+/// Consumes a key press with exactly these modifiers (`consume_key` would
+/// also take Ctrl+Shift+F for Ctrl+F).
+pub fn take_key(ctx: &egui::Context, modifiers: Modifiers, key: Key) -> bool {
+    ctx.input_mut(|i| {
+        let found = i.events.iter().position(
+            |e| matches!(e, Event::Key { key: k, pressed: true, modifiers: m, .. } if *k == key && m.matches_exact(modifiers)),
+        );
+        found.map(|n| i.events.remove(n)).is_some()
+    })
 }
 
 /// One caret of a column selection. Columns are char offsets within `line`.
@@ -69,6 +117,26 @@ struct Popup {
 }
 
 #[derive(Clone, Default)]
+struct Find {
+    query: String,
+    replace: String,
+    match_case: bool,
+    /// Focus the query field on the next frame.
+    focus: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FindAction {
+    Next,
+    Prev,
+    /// The query changed: select the first match from the caret on.
+    Search,
+    Replace,
+    ReplaceAll,
+    Close,
+}
+
+#[derive(Clone, Default)]
 struct State {
     /// Column selection, sorted by line, one per line. Empty in normal editing.
     carets: Vec<Caret>,
@@ -78,13 +146,18 @@ struct State {
     /// Alt is down and nothing else happened since it went down.
     alt_tap: bool,
     popup: Option<Popup>,
+    find: Option<Find>,
+    /// Char index to bring into view after the next layout; `true` centers it.
+    scroll_to: Option<(usize, bool)>,
     /// Last frame's layout, to map the pointer before `TextEdit` handles it.
     galley: Option<(Arc<Galley>, Pos2)>,
 }
 
 const FONT_SIZE: f32 = 13.5;
 
-/// A monospace code editor with highlighting, column selection and autocomplete.
+/// A monospace code editor with line numbers, highlighting, editing commands,
+/// find/replace, column selection and autocomplete.
+#[allow(clippy::too_many_arguments)]
 pub fn code_editor(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -92,11 +165,15 @@ pub fn code_editor(
     id_salt: &str,
     rows: usize,
     vocab: &Vocabulary,
+    marks: &[Mark],
 ) -> egui::Response {
     let id = ui.make_persistent_id(id_salt);
     let state_id = id.with("editor");
+    let find_ids = [id.with("find_query"), id.with("find_replace")];
     let mut st: State = ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
+    let mut shared: Shared = ui.data(|d| d.get_temp(shared_id(id_salt))).unwrap_or_default();
     let focused = ui.memory(|m| m.has_focus(id));
+    let find_focused = ui.memory(|m| find_ids.iter().any(|f| m.has_focus(*f)));
     if !focused {
         st.carets.clear();
         st.popup = None;
@@ -105,6 +182,42 @@ pub fn code_editor(
     let mut cursor = te_state.cursor.char_range();
     let mut set_cursor: Option<CCursorRange> = None;
     let mut typed = false;
+
+    if let Some(line) = shared.goto.take() {
+        let line = line.min(line_count(text) - 1);
+        let indent = text.split('\n').nth(line).map_or(0, |l| l.chars().take_while(|c| c.is_whitespace()).count());
+        let at = char_index(text, line, indent);
+        let r = CCursorRange::one(CCursor::new(at));
+        set_cursor = Some(r);
+        cursor = Some(r);
+        st.carets.clear();
+        st.scroll_to = Some((at, true));
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+
+    // Find bar shortcuts work from the editor and from the bar itself.
+    let mut find_action = None;
+    if focused || find_focused {
+        if take_key(ui.ctx(), Modifiers::COMMAND, Key::F) {
+            let selected = cursor
+                .filter(|r| !r.is_empty())
+                .map(|r| char_slice(text, r.primary.index.0.min(r.secondary.index.0), r.primary.index.0.max(r.secondary.index.0)))
+                .filter(|s| !s.contains('\n'));
+            let find = st.find.get_or_insert_with(Find::default);
+            if let Some(s) = selected {
+                find.query = s;
+            }
+            find.focus = true;
+            st.popup = None;
+        }
+        if st.find.is_some() {
+            if take_key(ui.ctx(), Modifiers::NONE, Key::F3) {
+                find_action = Some(FindAction::Next);
+            } else if take_key(ui.ctx(), Modifiers::SHIFT, Key::F3) {
+                find_action = Some(FindAction::Prev);
+            }
+        }
+    }
 
     if focused {
         let events = ui.input(|i| i.events.clone());
@@ -158,8 +271,8 @@ pub fn code_editor(
                         Key::Enter | Key::Tab => {
                             let (start, cands) = completions(text, at, lang, vocab);
                             if let Some(c) = cands.get(p.selected) {
-                                let end = replace_chars(text, start, at, &c.text);
-                                let r = CCursorRange::one(CCursor::new(end));
+                                let (a, h) = accept(text, start, at, c);
+                                let r = CCursorRange::two(CCursor::new(a), CCursor::new(h));
                                 set_cursor = Some(r);
                                 cursor = Some(r);
                                 consumed[n] = true;
@@ -175,6 +288,17 @@ pub fn code_editor(
                 }
                 Event::Text(s) | Event::Ime(ImeEvent::Commit(s)) => typed = s.chars().all(|c| is_ident(c) || c == '.'),
                 _ => {}
+            }
+            if !consumed[n]
+                && let Some(r) = cursor
+                && let Some((a, h)) = command(text, (r.secondary.index.0, r.primary.index.0), event, lang)
+            {
+                let r = CCursorRange::two(CCursor::new(a), CCursor::new(h));
+                set_cursor = Some(r);
+                cursor = Some(r);
+                st.popup = None;
+                st.scroll_to = Some((h, false));
+                consumed[n] = true;
             }
         }
         if consumed.contains(&true) {
@@ -213,6 +337,31 @@ pub fn code_editor(
     }
     st.alt_down = alt;
 
+    // The find bar floats over the top right corner of the visible area.
+    if let Some(find) = &mut st.find {
+        let action = find_bar(ui, find, &find_ids, text, cursor);
+        find_action = action.or(find_action);
+    }
+    if let Some(action) = find_action
+        && let Some(find) = &st.find
+    {
+        if action == FindAction::Close {
+            st.find = None;
+            ui.memory_mut(|m| m.request_focus(id));
+        } else {
+            let sel = cursor.map_or((0, 0), |r| {
+                let (a, b) = (r.primary.index.0, r.secondary.index.0);
+                (a.min(b), a.max(b))
+            });
+            if let Some((a, h)) = find_step(text, &find.query, &find.replace, find.match_case, sel, action) {
+                let r = CCursorRange::two(CCursor::new(a), CCursor::new(h));
+                set_cursor = Some(r);
+                cursor = Some(r);
+                st.scroll_to = Some((h, true));
+            }
+        }
+    }
+
     // Keep TextEdit's own selection empty while a column selection is shown, so
     // it doesn't paint a stream selection over ours.
     if st.drag_from.is_some()
@@ -233,22 +382,127 @@ pub fn code_editor(
         job.wrap.max_width = f32::INFINITY;
         ui.fonts_mut(|f| f.layout_job(job))
     };
-    let out = egui::TextEdit::multiline(text)
-        .id(id)
-        .code_editor()
-        .desired_rows(rows)
-        .desired_width(f32::INFINITY)
-        .lock_focus(true)
-        .layouter(&mut layouter)
-        .show(ui);
+    let char_w = ui.fonts_mut(|f| f.glyph_width(&FontId::monospace(FONT_SIZE), ' '));
+    let digits = line_count(text).to_string().len().max(3);
+    let gutter_w = char_w * digits as f32 + 14.0;
+    let (out, backdrop, gutter_x) = ui
+        .horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            // Painted under the text once the layout is known.
+            let backdrop = ui.painter().add(Shape::Noop);
+            let (gutter, _) = ui.allocate_exact_size(vec2(gutter_w, 0.0), egui::Sense::hover());
+            let out = egui::TextEdit::multiline(text)
+                .id(id)
+                .code_editor()
+                .desired_rows(rows)
+                .desired_width(f32::INFINITY)
+                .lock_focus(true)
+                .background_color(Color32::TRANSPARENT)
+                .layouter(&mut layouter)
+                .show(ui);
+            (out, backdrop, gutter.left())
+        })
+        .inner;
     let response = out.response.response;
     let galley = out.galley;
     let origin = out.galley_pos;
-    let char_w = ui.fonts_mut(|f| f.glyph_width(&FontId::monospace(FONT_SIZE), ' '));
     let to_line_col = |p: Pos2| {
         let (line, _) = line_col(text, galley.cursor_from_pos(p - origin).index.0);
         (line, ((p.x - origin.x) / char_w).round().max(0.0) as usize)
     };
+    let lens = line_lengths(text);
+    let line_starts: Vec<usize> = lens.iter().scan(0, |s, len| {
+        let start = *s;
+        *s += len + 1;
+        Some(start)
+    }).collect();
+    let row_rect = |line: usize| {
+        let r = galley.pos_from_cursor(CCursor::new(line_starts[line])).translate(origin.to_vec2());
+        Rect::from_x_y_ranges(gutter_x..=response.rect.right(), r.y_range())
+    };
+
+    // Background, current line, problem lines, find matches, line numbers.
+    {
+        let visuals = ui.visuals();
+        let painter = ui.painter();
+        let mut shapes = vec![Shape::rect_filled(
+            Rect::from_min_max(Pos2::new(gutter_x, response.rect.top()), response.rect.max),
+            2.0,
+            visuals.text_edit_bg_color(),
+        )];
+        let caret_line = cursor.map(|r| line_col(text, r.primary.index.0).0);
+        if focused && st.carets.is_empty() && let Some(l) = caret_line.filter(|&l| l < line_starts.len()) {
+            shapes.push(Shape::rect_filled(row_rect(l), 0.0, visuals.faint_bg_color.gamma_multiply(1.6)));
+        }
+        let mark_color = |error: bool| if error { visuals.error_fg_color } else { visuals.warn_fg_color };
+        for m in marks.iter().filter(|m| m.line < line_starts.len()) {
+            shapes.push(Shape::rect_filled(row_rect(m.line), 0.0, mark_color(m.error).gamma_multiply(0.12)));
+        }
+        if let Some(find) = &st.find {
+            let sel = cursor.map(|r| (r.primary.index.0.min(r.secondary.index.0), r.primary.index.0.max(r.secondary.index.0)));
+            for (lo, hi) in find_all(text, &find.query, find.match_case) {
+                let a = galley.pos_from_cursor(CCursor::new(lo)).translate(origin.to_vec2());
+                let b = galley.pos_from_cursor(CCursor::new(hi)).translate(origin.to_vec2());
+                let current = sel == Some((lo, hi));
+                let color = if current { visuals.selection.bg_fill } else { visuals.selection.bg_fill.gamma_multiply(0.35) };
+                shapes.push(Shape::rect_filled(Rect::from_min_max(a.min, b.max), 2.0, color));
+            }
+        }
+        painter.set(backdrop, Shape::Vec(shapes));
+
+        let clip = ui.clip_rect();
+        let font = FontId::monospace(FONT_SIZE);
+        for (line, _) in line_starts.iter().enumerate() {
+            let r = row_rect(line);
+            if r.bottom() < clip.top() || r.top() > clip.bottom() {
+                continue;
+            }
+            let mark = marks.iter().filter(|m| m.line == line).min_by_key(|m| !m.error);
+            let color = match mark {
+                Some(m) => mark_color(m.error),
+                None if focused && caret_line == Some(line) => visuals.strong_text_color(),
+                None => visuals.weak_text_color(),
+            };
+            painter.text(Pos2::new(gutter_x + gutter_w - 8.0, r.center().y), Align2::RIGHT_CENTER, line + 1, font.clone(), color);
+        }
+        // Messages after the end of their line.
+        let small = FontId::proportional(FONT_SIZE - 1.5);
+        for (line, start) in line_starts.iter().enumerate() {
+            let line_marks: Vec<&Mark> = marks.iter().filter(|m| m.line == line).collect();
+            if line_marks.is_empty() {
+                continue;
+            }
+            let end = galley.pos_from_cursor(CCursor::new(start + lens[line])).translate(origin.to_vec2());
+            let message = line_marks
+                .iter()
+                .map(|m| format!("{} {}", if m.error { "✖" } else { "⚠" }, m.message))
+                .collect::<Vec<_>>()
+                .join("   ");
+            let error = line_marks.iter().any(|m| m.error);
+            painter.text(Pos2::new(end.right() + 3.0 * char_w, end.center().y), Align2::LEFT_CENTER, message, small.clone(), mark_color(error));
+        }
+        shared.caret_line = caret_line.filter(|_| focused);
+    }
+
+    if let Some((at, center)) = st.scroll_to.take() {
+        let r = galley.pos_from_cursor(CCursor::new(at.min(galley.len()))).translate(origin.to_vec2());
+        let r = Rect::from_x_y_ranges(gutter_x..=r.right() + 2.0 * char_w, r.y_range()).expand2(vec2(0.0, 2.0 * r.height()));
+        ui.scroll_to_rect(r, center.then_some(Align::Center));
+    }
+
+    // Ctrl+click on a table or `table.column` in the DSL jumps to its definition.
+    if lang == Lang::Dbs
+        && response.hovered()
+        && ui.input(|i| i.modifiers.command)
+        && let Some(p) = ui.input(|i| i.pointer.hover_pos())
+        && let Some(line) = definition(text, galley.cursor_from_pos(p - origin).index.0)
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            shared.goto = Some(line);
+            ui.ctx().request_repaint();
+        }
+    }
 
     // Alt+drag: rectangular selection.
     let (pressed, down, pointer) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos()));
@@ -316,9 +570,9 @@ pub fn code_editor(
                     p.selected = p.selected.min(cands.len() - 1);
                     let caret = galley.pos_from_cursor(CCursor::new(start)).translate(origin.to_vec2());
                     if let Some(chosen) = show_popup(ui, id, caret.left_bottom(), &cands, p) {
-                        let end = replace_chars(text, start, at, &cands[chosen].text);
+                        let (a, h) = accept(text, start, at, &cands[chosen]);
                         let mut s = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-                        s.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(end))));
+                        s.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(h))));
                         s.store(ui.ctx(), id);
                         ui.memory_mut(|m| m.request_focus(id));
                         st.popup = None;
@@ -330,7 +584,10 @@ pub fn code_editor(
     }
 
     st.galley = Some((galley, origin));
-    ui.data_mut(|d| d.insert_temp(state_id, st));
+    ui.data_mut(|d| {
+        d.insert_temp(state_id, st);
+        d.insert_temp(shared_id(id_salt), shared);
+    });
     response
 }
 
@@ -359,6 +616,87 @@ fn show_popup(ui: &egui::Ui, id: egui::Id, pos: Pos2, cands: &[Candidate], p: &m
         });
     p.scroll = false;
     chosen
+}
+
+/// The find/replace bar; returns what the user asked for this frame.
+fn find_bar(ui: &egui::Ui, find: &mut Find, ids: &[egui::Id; 2], text: &str, cursor: Option<CCursorRange>) -> Option<FindAction> {
+    let mut action = None;
+    let matches = find_all(text, &find.query, find.match_case);
+    let sel = cursor.map(|r| (r.primary.index.0.min(r.secondary.index.0), r.primary.index.0.max(r.secondary.index.0)));
+    let current = matches.iter().position(|m| Some(*m) == sel);
+    let pos = ui.clip_rect().right_top() + vec2(-12.0, 6.0);
+    egui::Area::new(ids[0].with("bar"))
+        .order(egui::Order::Foreground)
+        .pivot(Align2::RIGHT_TOP)
+        .fixed_pos(pos)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                let enter = |ui: &egui::Ui, r: &egui::Response| r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                let escape = |ui: &egui::Ui, r: &egui::Response| r.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape));
+                ui.horizontal(|ui| {
+                    let q = ui.add(egui::TextEdit::singleline(&mut find.query).id(ids[0]).hint_text("Find").desired_width(180.0));
+                    if find.focus {
+                        q.request_focus();
+                        // Select the query, so typing replaces it (once the field exists).
+                        if let Some(mut s) = egui::TextEdit::load_state(ui.ctx(), ids[0]) {
+                            let all = CCursorRange::two(CCursor::new(0), CCursor::new(find.query.chars().count()));
+                            s.cursor.set_char_range(Some(all));
+                            s.store(ui.ctx(), ids[0]);
+                            find.focus = false;
+                        }
+                    }
+                    if q.changed() {
+                        action = Some(FindAction::Search);
+                    }
+                    if enter(ui, &q) {
+                        action = Some(if ui.input(|i| i.modifiers.shift) { FindAction::Prev } else { FindAction::Next });
+                        q.request_focus();
+                    }
+                    if escape(ui, &q) {
+                        action = Some(FindAction::Close);
+                    }
+                    let count = match (current, matches.len()) {
+                        (_, 0) if !find.query.is_empty() => RichText::new("No results").color(ui.visuals().warn_fg_color),
+                        (_, 0) => RichText::new(""),
+                        (Some(c), n) => RichText::new(format!("{} of {n}", c + 1)),
+                        (None, n) => RichText::new(format!("{n} found")),
+                    };
+                    ui.add_sized([72.0, 18.0], egui::Label::new(count.small()));
+                    if ui.selectable_label(find.match_case, "Aa").on_hover_text("Match case").clicked() {
+                        find.match_case = !find.match_case;
+                        action = Some(FindAction::Search);
+                    }
+                    if ui.small_button("⏶").on_hover_text("Previous match (Shift+F3, Shift+Enter)").clicked() {
+                        action = Some(FindAction::Prev);
+                    }
+                    if ui.small_button("⏷").on_hover_text("Next match (F3, Enter)").clicked() {
+                        action = Some(FindAction::Next);
+                    }
+                    if ui.small_button("✖").on_hover_text("Close (Esc)").clicked() {
+                        action = Some(FindAction::Close);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let r = ui.add(egui::TextEdit::singleline(&mut find.replace).id(ids[1]).hint_text("Replace").desired_width(180.0));
+                    if enter(ui, &r) {
+                        action = Some(FindAction::Replace);
+                        r.request_focus();
+                    }
+                    if escape(ui, &r) {
+                        action = Some(FindAction::Close);
+                    }
+                    ui.add_enabled_ui(!matches.is_empty(), |ui| {
+                        if ui.button("Replace").on_hover_text("Replace this match and go to the next (Enter)").clicked() {
+                            action = Some(FindAction::Replace);
+                        }
+                        if ui.button("All").on_hover_text("Replace every match").clicked() {
+                            action = Some(FindAction::ReplaceAll);
+                        }
+                    });
+                });
+            });
+        });
+    action
 }
 
 // ---------------------------------------------------------------- column editing
@@ -539,6 +877,276 @@ fn replace_chars(text: &mut String, lo: usize, hi: usize, s: &str) -> usize {
     lo + s.chars().count()
 }
 
+// ---------------------------------------------------------------- commands
+
+/// A selection as (anchor, head) char indices.
+type Sel = (usize, usize);
+
+const INDENT: &str = "  ";
+
+/// Runs the editing command bound to `event`, if any; returns the new selection.
+fn command(text: &mut String, sel: Sel, event: &Event, lang: Lang) -> Option<Sel> {
+    let (lo, hi) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    match event {
+        Event::Key { key, pressed: true, modifiers: m, .. } => {
+            let cmd = m.command && !m.alt && !m.shift;
+            let one_line = line_col(text, lo).0 == line_col(text, hi).0;
+            match key {
+                Key::Enter if m.is_none() => Some(newline(text, lo, hi, lang)),
+                Key::Tab if m.is_none() && one_line => {
+                    let col = line_col(text, lo).1;
+                    let at = replace_chars(text, lo, hi, &" ".repeat(INDENT.len() - col % INDENT.len()));
+                    Some((at, at))
+                }
+                Key::Tab if m.is_none() || m.matches_exact(Modifiers::SHIFT) => Some(indent_lines(text, sel, !m.shift)),
+                Key::Slash if cmd => Some(toggle_comment(text, sel, lang)),
+                Key::D if cmd => Some(duplicate_lines(text, sel)),
+                Key::K if m.command && m.shift && !m.alt => Some(delete_lines(text, sel)),
+                Key::ArrowUp | Key::ArrowDown if m.alt && !m.shift && !m.command => Some(move_lines(text, sel, *key == Key::ArrowUp)),
+                _ => None,
+            }
+        }
+        // `}` typed on an indented blank line closes a block: one level less.
+        Event::Text(s) if s == "}" && lang == Lang::Dbs && lo == hi => {
+            let (line, col) = line_col(text, lo);
+            let before = char_slice(text, char_index(text, line, 0), lo);
+            if col == 0 || !before.chars().all(|c| c == ' ') {
+                return None;
+            }
+            let start = lo - col.min(INDENT.len());
+            let at = replace_chars(text, start, lo, "}");
+            Some((at, at))
+        }
+        _ => None,
+    }
+}
+
+/// Enter: a new line with the current indentation, one level more after an
+/// opening bracket. Between `{` and `}` the closing bracket gets its own line;
+/// after a `{` with no `}` to match it, the DSL gets one.
+fn newline(text: &mut String, lo: usize, hi: usize, lang: Lang) -> Sel {
+    replace_chars(text, lo, hi, "");
+    let (line, col) = line_col(text, lo);
+    let line_start = lo - col;
+    let line_text: String = text.split('\n').nth(line).unwrap_or_default().to_string();
+    let before: String = line_text.chars().take(col).collect();
+    let after: String = line_text.chars().skip(col).collect();
+    let indent: String = before.chars().take_while(|&c| c == ' ' || c == '\t').collect();
+    let opens = before.trim_end().ends_with(['{', '(']);
+    let closes = after.trim_start().starts_with(['}', ')']);
+    let unbalanced = lang == Lang::Dbs && before.trim_end().ends_with('{') && text.matches('{').count() > text.matches('}').count();
+    // A line left with only spaces loses them.
+    let lo = if before.trim().is_empty() {
+        replace_chars(text, line_start, lo, "");
+        line_start
+    } else {
+        lo
+    };
+    let inner = format!("\n{indent}{INDENT}");
+    if opens && closes {
+        let spaces = after.chars().take_while(|c| c.is_whitespace()).count();
+        replace_chars(text, lo, lo + spaces, &format!("{inner}\n{indent}"));
+        let at = lo + inner.chars().count();
+        (at, at)
+    } else if unbalanced && after.trim().is_empty() {
+        let at = replace_chars(text, lo, lo, &inner);
+        replace_chars(text, at, at, &format!("\n{indent}}}"));
+        (at, at)
+    } else {
+        let plain = format!("\n{indent}");
+        let at = replace_chars(text, lo, lo, if opens { &inner } else { &plain });
+        (at, at)
+    }
+}
+
+/// First and last line of a selection; a selection ending at the start of a
+/// line doesn't take that line in.
+fn line_span(text: &str, sel: Sel) -> (usize, usize) {
+    let (lo, hi) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    let (a, b) = (line_col(text, lo), line_col(text, hi));
+    (a.0, if b.0 > a.0 && b.1 == 0 { b.0 - 1 } else { b.0 })
+}
+
+/// Rewrites the lines of `text`; `f` gets them and returns how a (line,
+/// column) position moves, which is applied to the selection.
+fn edit_lines(text: &mut String, sel: Sel, f: impl FnOnce(&mut Vec<String>) -> Box<dyn Fn(usize, usize) -> (usize, usize)>) -> Sel {
+    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+    let (a, h) = (line_col(text, sel.0), line_col(text, sel.1));
+    let map = f(&mut lines);
+    *text = lines.join("\n");
+    let (a, h) = (map(a.0, a.1), map(h.0, h.1));
+    (char_index(text, a.0, a.1), char_index(text, h.0, h.1))
+}
+
+fn indent_lines(text: &mut String, sel: Sel, indent: bool) -> Sel {
+    let (first, last) = line_span(text, sel);
+    edit_lines(text, sel, |lines| {
+        let mut shift = vec![0isize; lines.len()];
+        for (n, l) in lines.iter_mut().enumerate().take(last + 1).skip(first) {
+            if indent && !l.trim().is_empty() {
+                l.insert_str(0, INDENT);
+                shift[n] = INDENT.len() as isize;
+            } else if !indent {
+                let n_spaces = if l.starts_with('\t') { 1 } else { l.chars().take(INDENT.len()).take_while(|&c| c == ' ').count() };
+                l.drain(..n_spaces);
+                shift[n] = -(n_spaces as isize);
+            }
+        }
+        Box::new(move |line, col| (line, col.saturating_add_signed(shift[line])))
+    })
+}
+
+fn toggle_comment(text: &mut String, sel: Sel, lang: Lang) -> Sel {
+    let (first, last) = line_span(text, sel);
+    let markers: &[&str] = if lang == Lang::Dbs { &["#", "//"] } else { &["--"] };
+    edit_lines(text, sel, |lines| {
+        let span = &mut lines[first..=last];
+        let filled = || span.iter().filter(|l| !l.trim().is_empty());
+        let commented = filled().count() > 0 && filled().all(|l| markers.iter().any(|m| l.trim_start().starts_with(m)));
+        let indent = filled().map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+        let mut shift = vec![(0usize, 0isize); span.len()];
+        for (n, l) in span.iter_mut().enumerate() {
+            if l.trim().is_empty() {
+                continue;
+            }
+            let at = l.len() - l.trim_start().len();
+            if commented {
+                let m = markers.iter().find(|m| l[at..].starts_with(**m)).unwrap();
+                let len = m.len() + usize::from(l[at + m.len()..].starts_with(' '));
+                l.drain(at..at + len);
+                shift[n] = (at, -(len as isize));
+            } else {
+                let prefix = format!("{} ", markers[0]);
+                l.insert_str(indent, &prefix);
+                shift[n] = (indent, prefix.len() as isize);
+            }
+        }
+        Box::new(move |line, col| match line.checked_sub(first).and_then(|n| shift.get(n)) {
+            Some(&(at, d)) if col >= at => (line, col.saturating_add_signed(d).max(at)),
+            _ => (line, col),
+        })
+    })
+}
+
+fn duplicate_lines(text: &mut String, sel: Sel) -> Sel {
+    let (first, last) = line_span(text, sel);
+    let count = last - first + 1;
+    edit_lines(text, sel, |lines| {
+        let copy: Vec<String> = lines[first..=last].to_vec();
+        lines.splice(last + 1..last + 1, copy);
+        Box::new(move |line, col| (line + count, col))
+    })
+}
+
+fn delete_lines(text: &mut String, sel: Sel) -> Sel {
+    let (first, last) = line_span(text, sel);
+    let head_col = line_col(text, sel.1).1;
+    edit_lines(text, sel, |lines| {
+        lines.drain(first..=last);
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let line = first.min(lines.len() - 1);
+        Box::new(move |_, _| (line, head_col))
+    })
+}
+
+fn move_lines(text: &mut String, sel: Sel, up: bool) -> Sel {
+    let (first, last) = line_span(text, sel);
+    edit_lines(text, sel, |lines| {
+        if up && first > 0 {
+            let l = lines.remove(first - 1);
+            lines.insert(last, l);
+            Box::new(|line, col| (line - 1, col))
+        } else if !up && last + 1 < lines.len() {
+            let l = lines.remove(last + 1);
+            lines.insert(first, l);
+            Box::new(|line, col| (line + 1, col))
+        } else {
+            Box::new(|line, col| (line, col))
+        }
+    })
+}
+
+/// Chars `lo..hi` of `text`.
+fn char_slice(text: &str, lo: usize, hi: usize) -> String {
+    text.chars().skip(lo).take(hi.saturating_sub(lo)).collect()
+}
+
+// ---------------------------------------------------------------- find
+
+/// Char ranges of the non-overlapping matches of `query`.
+fn find_all(text: &str, query: &str, match_case: bool) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let fold = |c: char| if match_case { c } else { c.to_lowercase().next().unwrap_or(c) };
+    let hay: Vec<char> = text.chars().map(fold).collect();
+    let needle: Vec<char> = query.chars().map(fold).collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == needle[..] {
+            found.push((i, i + needle.len()));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+/// Applies a find action given the current selection `lo..hi`; returns the
+/// selection to show.
+fn find_step(text: &mut String, query: &str, replace: &str, match_case: bool, (lo, hi): (usize, usize), action: FindAction) -> Option<Sel> {
+    let matches = find_all(text, query, match_case);
+    let on_match = matches.contains(&(lo, hi));
+    let next_from = |matches: &[(usize, usize)], from: usize| matches.iter().find(|m| m.0 >= from).or(matches.first()).copied();
+    match action {
+        FindAction::Search => next_from(&matches, lo),
+        FindAction::Next => next_from(&matches, if on_match { hi } else { lo }),
+        FindAction::Prev => matches.iter().rev().find(|m| m.0 < lo).or(matches.last()).copied(),
+        FindAction::Replace if on_match => {
+            let end = replace_chars(text, lo, hi, replace);
+            next_from(&find_all(text, query, match_case), end)
+        }
+        FindAction::Replace => next_from(&matches, lo),
+        FindAction::ReplaceAll => {
+            for &(a, b) in matches.iter().rev() {
+                replace_chars(text, a, b, replace);
+            }
+            let at = lo.min(text.chars().count());
+            Some((at, at))
+        }
+        FindAction::Close => None,
+    }
+}
+
+// ---------------------------------------------------------------- definitions
+
+/// The line (0-based) defining the table or `table.column` at char `index`.
+fn definition(text: &str, index: usize) -> Option<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let word = |c: char| is_ident(c) || c == '.';
+    let mut lo = index.min(chars.len());
+    while lo > 0 && word(chars[lo - 1]) {
+        lo -= 1;
+    }
+    let mut hi = index.min(chars.len());
+    while hi < chars.len() && word(chars[hi]) {
+        hi += 1;
+    }
+    let target: String = chars[lo..hi].iter().collect();
+    let target = target.trim_matches('.');
+    if target.is_empty() {
+        return None;
+    }
+    let outline = parser::outline(text);
+    // A column's own name, on its own definition line, goes nowhere.
+    let line = parser::locate(&outline, target)?;
+    (line - 1 != line_col(text, index).0).then_some(line - 1)
+}
+
 // ---------------------------------------------------------------- autocomplete
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -547,6 +1155,7 @@ enum Kind {
     Table,
     Keyword,
     Type,
+    Snippet,
 }
 
 impl Kind {
@@ -556,6 +1165,7 @@ impl Kind {
             Kind::Table => "table",
             Kind::Keyword => "keyword",
             Kind::Type => "type",
+            Kind::Snippet => "snippet",
         }
     }
 }
@@ -564,6 +1174,24 @@ impl Kind {
 struct Candidate {
     text: String,
     kind: Kind,
+    /// Inserted instead of `text`, with the char range to select afterwards.
+    snippet: Option<(&'static str, usize, usize)>,
+}
+
+const TABLE_SNIPPET: (&str, usize, usize) = ("table name {\n  id  int  pk autoincrement\n}", 6, 10);
+
+/// Inserts `c` over chars `start..at`; returns the selection after it.
+fn accept(text: &mut String, start: usize, at: usize, c: &Candidate) -> Sel {
+    match c.snippet {
+        Some((s, lo, hi)) => {
+            replace_chars(text, start, at, s);
+            (start + lo, start + hi)
+        }
+        None => {
+            let end = replace_chars(text, start, at, &c.text);
+            (end, end)
+        }
+    }
 }
 
 fn is_ident(c: char) -> bool {
@@ -584,7 +1212,7 @@ fn completions(text: &str, cursor: usize, lang: Lang, vocab: &Vocabulary) -> (us
     }
 
     let mut pool: Vec<Candidate> = Vec::new();
-    let mut add = |names: &mut dyn Iterator<Item = String>, kind| pool.extend(names.map(|text| Candidate { text, kind }));
+    let mut add = |names: &mut dyn Iterator<Item = String>, kind| pool.extend(names.map(|text| Candidate { text, kind, snippet: None }));
     if start > 0 && chars[start - 1] == '.' {
         let mut q = start - 1;
         while q > 0 && is_ident(chars[q - 1]) {
@@ -601,23 +1229,18 @@ fn completions(text: &str, cursor: usize, lang: Lang, vocab: &Vocabulary) -> (us
         if let Some(cols) = vocab.columns_of(&table) {
             add(&mut cols.iter().cloned(), Kind::Column);
         }
+    } else if lang == Lang::Dbs {
+        pool = dbs_candidates(&chars[..start], vocab);
     } else {
-        let before: String = chars[..start].iter().collect();
-        let after_arrow = lang == Lang::Dbs && before.trim_end().ends_with("->");
         let upper = prefix.starts_with(|c: char| c.is_uppercase());
         let case = |w: &&str| if upper { w.to_uppercase() } else { w.to_string() };
         add(&mut vocab.tables.iter().map(|(t, _)| t.clone()), Kind::Table);
-        if !after_arrow {
-            if lang == Lang::Sql {
-                let mut cols: Vec<String> = vocab.tables.iter().flat_map(|(_, c)| c.iter().cloned()).collect();
-                cols.sort();
-                cols.dedup();
-                add(&mut cols.into_iter(), Kind::Column);
-            }
-            let keywords = if lang == Lang::Sql { SQL_KEYWORDS } else { DBS_KEYWORDS };
-            add(&mut keywords.iter().map(case), Kind::Keyword);
-            add(&mut DBS_TYPES.iter().map(case), Kind::Type);
-        }
+        let mut cols: Vec<String> = vocab.tables.iter().flat_map(|(_, c)| c.iter().cloned()).collect();
+        cols.sort();
+        cols.dedup();
+        add(&mut cols.into_iter(), Kind::Column);
+        add(&mut SQL_KEYWORDS.iter().map(case), Kind::Keyword);
+        add(&mut DBS_TYPES.iter().map(case), Kind::Type);
     }
 
     // A word that is already complete gets no popup, so Enter still breaks the line.
@@ -629,6 +1252,114 @@ fn completions(text: &str, cursor: usize, lang: Lang, vocab: &Vocabulary) -> (us
     pool.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.text.len().cmp(&b.text.len())).then_with(|| a.text.cmp(&b.text)));
     pool.dedup_by(|a, b| a.text.eq_ignore_ascii_case(&b.text));
     (start, pool)
+}
+
+/// What fits at the end of `before` in the DSL: a table snippet between
+/// tables; in a table, table-level keywords first, then types, then the
+/// modifiers that can follow what is already on the line.
+fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
+    let words = |list: &[&str], kind| list.iter().map(|w| Candidate { text: w.to_string(), kind, snippet: None }).collect::<Vec<_>>();
+
+    // Brace depth, skipping comments and strings.
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut comment = false;
+    for (i, &c) in before.iter().enumerate() {
+        match (comment, quote, c) {
+            (true, _, '\n') => comment = false,
+            (true, ..) => {}
+            (_, Some(q), c) if c == q => quote = None,
+            (_, Some(_), _) => {}
+            (_, None, '\'' | '"') => quote = Some(c),
+            (_, None, '#') => comment = true,
+            (_, None, '/') if before.get(i + 1) == Some(&'/') => comment = true,
+            (_, None, '{') => depth += 1,
+            (_, None, '}') => depth -= 1,
+            _ => {}
+        }
+    }
+
+    // The statement so far: back to a line break, `,`, `;` or brace outside parentheses.
+    let mut parens = 0;
+    let mut i = before.len();
+    while i > 0 {
+        let c = before[i - 1];
+        match c {
+            ')' => parens += 1,
+            '(' if parens == 0 => {
+                // Inside `index (…)`, `pk (…)` or `check (…)`: this table's columns.
+                let text: String = before.iter().collect();
+                let table = parser::outline(&text).pop().filter(|_| depth > 0);
+                let cols = table.and_then(|t| vocab.columns_of(&t.name).map(<[String]>::to_vec)).unwrap_or_default();
+                return cols.into_iter().map(|text| Candidate { text, kind: Kind::Column, snippet: None }).collect();
+            }
+            '(' => parens -= 1,
+            '\n' | ',' | ';' | '{' | '}' if parens == 0 => break,
+            _ => {}
+        }
+        i -= 1;
+    }
+    let stmt: String = before[i..].iter().collect();
+    let stmt = stmt.replace("->", " -> ");
+    let lower: Vec<String> = stmt.split_whitespace().map(str::to_lowercase).collect();
+    let has = |w: &str| lower.iter().any(|x| x == w || x.starts_with(&format!("{w}(")));
+
+    if depth <= 0 {
+        return if lower.is_empty() { vec![Candidate { text: "table".into(), kind: Kind::Snippet, snippet: Some(TABLE_SNIPPET) }] } else { vec![] };
+    }
+    let first = lower.first().map(String::as_str);
+    let table_level = match first {
+        Some("unique" | "pk" | "primary") => true,
+        // `index name (…)`, not a column called "index".
+        Some("index") => lower.get(1).is_some_and(|w| !DBS_TYPES.contains(&w.split('(').next().unwrap_or_default())),
+        _ => false,
+    };
+    if table_level {
+        return match (first, lower.len()) {
+            (Some("unique"), 1) => words(&["index"], Kind::Keyword),
+            (Some("primary"), 1) => words(&["key"], Kind::Keyword),
+            _ => vec![],
+        };
+    }
+    match lower.len() {
+        0 => return words(&["index", "unique index", "pk"], Kind::Keyword),
+        1 => return words(DBS_TYPES, Kind::Type),
+        _ => {}
+    }
+    let last = lower.last().map(String::as_str).unwrap_or_default();
+    let prev = lower.len().checked_sub(2).map(|n| lower[n].as_str());
+    match last {
+        "->" | "references" | "ref" => vocab
+            .tables
+            .iter()
+            .flat_map(|(t, cols)| cols.iter().map(move |c| Candidate { text: format!("{t}.{c}"), kind: Kind::Column, snippet: None }))
+            .collect(),
+        "on" => words(&["delete", "update"], Kind::Keyword),
+        "delete" | "update" if prev == Some("on") => words(&["cascade", "set_null", "set_default", "restrict", "no_action"], Kind::Keyword),
+        "default" => words(&["now", "true", "false", "null"], Kind::Keyword),
+        "not" => words(&["null"], Kind::Keyword),
+        "check" | "set" | "no" => vec![],
+        _ => {
+            let has_ref = has("->") || has("references") || has("ref");
+            let mut list = Vec::new();
+            for (word, used) in [
+                ("pk", has("pk") || has("primary")),
+                ("autoincrement", has("autoincrement")),
+                ("unique", has("unique")),
+                ("not null", has("not") || has("null")),
+                ("null", has("not") || has("null")),
+                ("default", has("default")),
+                ("check", has("check")),
+                ("on delete", !has_ref || has("delete")),
+                ("on update", !has_ref || has("update")),
+            ] {
+                if !used {
+                    list.push(word);
+                }
+            }
+            words(&list, Kind::Keyword)
+        }
+    }
 }
 
 /// Whether the end of `before` is inside a comment or a string literal on its line.
@@ -804,15 +1535,109 @@ bx");
     #[test]
     fn dsl_completion() {
         let v = vocab();
-        let (_, c) = completions("  author_id int -> p", 20, Lang::Dbs, &v);
-        assert_eq!(names(&c), vec!["posts"]);
-        let (_, c) = completions("  x times", 9, Lang::Dbs, &v);
-        assert_eq!(names(&c), vec!["timestamp"]);
-        let (_, c) = completions("  x time", 8, Lang::Dbs, &v);
-        assert!(c.is_empty(), "a complete word keeps Enter for newlines");
-        let (_, c) = completions("  # a comment ti", 16, Lang::Dbs, &v);
-        assert!(c.is_empty());
-        let (_, c) = completions("  x text default 'ti", 20, Lang::Dbs, &v);
-        assert!(c.is_empty());
+        let at = |t: &str| completions(t, t.chars().count(), Lang::Dbs, &v).1;
+        assert_eq!(names(&at("table x {\n  author_id int -> p")), vec!["posts.id", "posts.title", "posts.author_id"]);
+        assert_eq!(names(&at("table x {\n  author_id int -> posts.ti")), vec!["title"]);
+        assert_eq!(names(&at("table x {\n  x times")), vec!["timestamp"]);
+        assert!(at("table x {\n  x time").is_empty(), "a complete word keeps Enter for newlines");
+        assert!(at("table x {\n  # a comment ti").is_empty());
+        assert!(at("table x {\n  x text default 'ti").is_empty());
+        // Modifiers that fit, and not twice.
+        assert_eq!(names(&at("table x {\n  x int not null u")), vec!["unique"]);
+        assert_eq!(names(&at("table x {\n  x int not null n")), Vec::<&str>::new());
+        assert_eq!(names(&at("table x {\n  x int -> users.id o")), vec!["on delete", "on update"]);
+        assert_eq!(names(&at("table x {\n  x int o")), Vec::<&str>::new(), "no reference, no on delete");
+        assert_eq!(names(&at("table x {\n  x int -> users.id on delete c")), vec!["cascade"]);
+        assert_eq!(names(&at("table x {\n  x int default n")), vec!["now", "null"]);
+        // Statement starts: table-level keywords; between tables: the snippet.
+        assert_eq!(names(&at("table x {\n  un")), vec!["unique index"]);
+        assert_eq!(names(&at("table users {\n  id int\n  index (")), vec!["id", "name", "email"], "for Ctrl+Space");
+        assert_eq!(names(&at("table users {\n  id int\n  index (na")), vec!["name"]);
+        let c = at("table x {\n}\ntab");
+        assert_eq!((names(&c), c[0].kind), (vec!["table"], Kind::Snippet));
+        let mut text = "tab".to_string();
+        let sel = accept(&mut text, 0, 3, &c[0]);
+        assert_eq!(char_slice(&text, sel.0, sel.1), "name");
+        assert!(at("table x {\n}\ntable y").is_empty());
+    }
+
+    fn press(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    /// Runs a command on `text` with the caret (or selection) marked by `|`.
+    fn run(text: &str, event: Event, lang: Lang) -> String {
+        let marks: Vec<usize> = text.chars().enumerate().filter(|(_, c)| *c == '|').map(|(i, _)| i).collect();
+        let (anchor, head) = match marks[..] {
+            [a] => (a, a),
+            [a, h] => (a, h - 1),
+            _ => panic!("one or two carets"),
+        };
+        let mut t = text.replace('|', "");
+        let (a, h) = command(&mut t, (anchor, head), &event, lang).expect("handled");
+        let (lo, hi) = (a.min(h), a.max(h));
+        let mut out: Vec<char> = t.chars().collect();
+        if lo != hi {
+            out.insert(hi, '|');
+        }
+        out.insert(lo, '|');
+        out.into_iter().collect()
+    }
+
+    #[test]
+    fn enter_indents() {
+        let enter = || press(Key::Enter, Modifiers::NONE);
+        assert_eq!(run("table x {|", enter(), Lang::Dbs), "table x {\n  |\n}");
+        assert_eq!(run("table x {|}", enter(), Lang::Dbs), "table x {\n  |\n}");
+        assert_eq!(run("table x {|\n}", enter(), Lang::Dbs), "table x {\n  |\n}");
+        assert_eq!(run("  id int|", enter(), Lang::Dbs), "  id int\n  |");
+        assert_eq!(run("  |", enter(), Lang::Dbs), "\n  |");
+        assert_eq!(run("select (|)", enter(), Lang::Sql), "select (\n  |\n)");
+    }
+
+    #[test]
+    fn line_commands() {
+        let none = Modifiers::NONE;
+        assert_eq!(run("a\n|b\nc|", press(Key::Tab, none), Lang::Dbs), "a\n  |b\n  c|");
+        assert_eq!(run("  a\n |b", press(Key::Tab, Modifiers::SHIFT), Lang::Dbs), "  a\n|b");
+        assert_eq!(run("a|b", press(Key::Tab, none), Lang::Dbs), "a |b");
+        assert_eq!(run("  |a\n\n  b|", press(Key::Slash, Modifiers::COMMAND), Lang::Dbs), "  # |a\n\n  # b|");
+        assert_eq!(run("  # a|\n  // b", press(Key::Slash, Modifiers::COMMAND), Lang::Dbs), "  a|\n  // b");
+        assert_eq!(run("  # |a\n  # b|", press(Key::Slash, Modifiers::COMMAND), Lang::Dbs), "  |a\n  b|");
+        assert_eq!(run("sel|ect", press(Key::Slash, Modifiers::COMMAND), Lang::Sql), "-- sel|ect");
+        assert_eq!(run("a|\nb", press(Key::D, Modifiers::COMMAND), Lang::Dbs), "a\na|\nb");
+        assert_eq!(run("a\nb|\nc", press(Key::ArrowUp, Modifiers::ALT), Lang::Dbs), "b|\na\nc");
+        assert_eq!(run("a\nb|\nc", press(Key::ArrowDown, Modifiers::ALT), Lang::Dbs), "a\nc\nb|");
+        assert_eq!(run("|a\nb", press(Key::ArrowUp, Modifiers::ALT), Lang::Dbs), "|a\nb");
+        assert_eq!(run("a\nb|b\nc", press(Key::K, Modifiers::COMMAND | Modifiers::SHIFT), Lang::Dbs), "a\nc|");
+        assert_eq!(run("  x\n  |", Event::Text("}".into()), Lang::Dbs), "  x\n}|");
+        let mut t = "a".to_string();
+        assert_eq!(command(&mut t, (0, 0), &press(Key::K, Modifiers::COMMAND), Lang::Dbs), None, "Ctrl+K is the app's");
+    }
+
+    #[test]
+    fn find_and_replace() {
+        assert_eq!(find_all("Id id ID", "id", false), vec![(0, 2), (3, 5), (6, 8)]);
+        assert_eq!(find_all("Id id ID", "id", true), vec![(3, 5)]);
+        assert_eq!(find_all("aaa", "aa", false), vec![(0, 2)]);
+        let mut t = "x y x y x".to_string();
+        assert_eq!(find_step(&mut t, "x", "", false, (1, 1), FindAction::Search), Some((4, 5)));
+        assert_eq!(find_step(&mut t, "x", "", false, (4, 5), FindAction::Next), Some((8, 9)));
+        assert_eq!(find_step(&mut t, "x", "", false, (8, 9), FindAction::Next), Some((0, 1)), "wraps");
+        assert_eq!(find_step(&mut t, "x", "", false, (0, 1), FindAction::Prev), Some((8, 9)));
+        assert_eq!(find_step(&mut t, "x", "zz", false, (4, 5), FindAction::Replace), Some((9, 10)));
+        assert_eq!(t, "x y zz y x");
+        find_step(&mut t, "x", "w", false, (0, 0), FindAction::ReplaceAll);
+        assert_eq!(t, "w y zz y w");
+    }
+
+    #[test]
+    fn go_to_definition() {
+        let text = "table users {\n  id int pk\n}\ntable posts {\n  author int -> users.id\n}";
+        let at = |needle: &str| text.find(needle).map(|b| text[..b].chars().count() + 1).unwrap();
+        assert_eq!(definition(text, at("users.id")), Some(1), "column");
+        assert_eq!(definition(text, at("users.id") + 7), Some(1), "anywhere in the word");
+        assert_eq!(definition(text, at("users {")), None, "its own definition");
+        assert_eq!(definition(text, at("int ->")), None);
     }
 }

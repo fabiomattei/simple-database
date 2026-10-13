@@ -534,6 +534,152 @@ pub fn parse(src: &str) -> Result<Schema, ParseError> {
     Parser { toks, pos: 0 }.parse_schema()
 }
 
+/// Where a table and its columns are in the source. Lines are 1-based.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineTable {
+    pub name: String,
+    pub line: usize,
+    /// Line of the closing `}` (the last line when it is missing).
+    pub end_line: usize,
+    pub columns: Vec<OutlineColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineColumn {
+    pub name: String,
+    pub data_type: String,
+    pub line: usize,
+}
+
+/// The tables and columns of `src`, found by a lenient scan that keeps
+/// working while the text doesn't parse (for editors).
+pub fn outline(src: &str) -> Vec<OutlineTable> {
+    // (token, line); `None` ends a statement.
+    let mut toks: Vec<(Option<String>, usize)> = Vec::new();
+    let chars: Vec<char> = src.chars().collect();
+    let (mut i, mut line) = (0, 1);
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\n' | ',' | ';' => {
+                toks.push((None, line));
+                line += usize::from(c == '\n');
+                i += 1;
+            }
+            '#' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '{' | '}' => {
+                toks.push((None, line));
+                toks.push((Some(c.to_string()), line));
+                toks.push((None, line));
+                i += 1;
+            }
+            // Strings and groups never span lines here, so a missing quote or
+            // `)` only spoils its own line.
+            '\'' | '"' | '(' => {
+                let start = i;
+                let mut depth = 0;
+                let mut quote = None;
+                while i < chars.len() && chars[i] != '\n' {
+                    let ch = chars[i];
+                    i += 1;
+                    match (quote, ch) {
+                        (Some(q), ch) if ch == q => quote = None,
+                        (Some(_), _) => {}
+                        (None, '\'' | '"') => quote = Some(ch),
+                        (None, '(') => depth += 1,
+                        (None, ')') => depth -= 1,
+                        _ => {}
+                    }
+                    if quote.is_none() && depth <= 0 {
+                        break;
+                    }
+                }
+                let text: String = chars[start..i].iter().collect();
+                // A type's arguments belong to it: `varchar(255)`, `decimal (10, 2)`.
+                if c == '('
+                    && let Some((Some(prev), _)) = toks.last_mut()
+                    && prev != "{"
+                    && prev != "}"
+                {
+                    prev.push_str(&text);
+                } else {
+                    toks.push((Some(text), line));
+                }
+            }
+            c if c.is_whitespace() => i += 1,
+            _ => {
+                let start = i;
+                while i < chars.len() && !chars[i].is_whitespace() && !"#,;{}()'\"".contains(chars[i]) {
+                    i += 1;
+                }
+                toks.push((Some(chars[start..i].iter().collect()), line));
+            }
+        }
+    }
+
+    let mut tables: Vec<OutlineTable> = Vec::new();
+    let mut open = false;
+    for stmt in toks.split(|(t, _)| t.is_none()) {
+        let words: Vec<(&str, usize)> = stmt.iter().filter_map(|(t, l)| t.as_deref().map(|t| (t, *l))).collect();
+        let Some(&(first, first_line)) = words.first() else { continue };
+        match first {
+            "{" => {}
+            "}" => {
+                if open && let Some(t) = tables.last_mut() {
+                    t.end_line = first_line;
+                }
+                open = false;
+            }
+            _ if first.eq_ignore_ascii_case("table") => {
+                if let Some(&(name, _)) = words.get(1) {
+                    tables.push(OutlineTable { name: name.to_string(), line: first_line, end_line: line, columns: vec![] });
+                    open = true;
+                }
+            }
+            _ if open => {
+                // Table-level constraints, told apart from columns named like them as `parse_table_item` does.
+                let lower = first.to_ascii_lowercase();
+                let second = words.get(1).map_or(String::new(), |(w, _)| w.to_ascii_lowercase());
+                let constraint = lower.starts_with("index(")
+                    || lower.starts_with("unique(")
+                    || lower.starts_with("pk(")
+                    || (lower == "unique" && second.starts_with("index"))
+                    || (lower == "primary" && second.starts_with("key("))
+                    || (lower == "index"
+                        && second.split_once('(').is_some_and(|(ty, _)| matches!(DataType::parse(ty), DataType::Custom(_))));
+                if !constraint && !first.starts_with(['(', '\'', '"']) && let Some(t) = tables.last_mut() {
+                    t.columns.push(OutlineColumn {
+                        name: first.to_string(),
+                        data_type: words.get(1).map_or(String::new(), |(w, _)| w.to_string()),
+                        line: first_line,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    tables
+}
+
+/// The line of a `table` or `table.column` location, as `validate` reports them.
+pub fn locate(outline: &[OutlineTable], location: &str) -> Option<usize> {
+    let (table, column) = match location.split_once('.') {
+        Some((t, c)) => (t, Some(c)),
+        None => (location, None),
+    };
+    let t = outline.iter().find(|t| t.name.eq_ignore_ascii_case(table))?;
+    Some(column.and_then(|c| t.columns.iter().find(|x| x.name.eq_ignore_ascii_case(c))).map_or(t.line, |c| c.line))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,4 +748,22 @@ mod tests {
         let e = parse("table t { a int\n a text }").unwrap_err();
         assert!(e.message.contains("defined twice"));
     }
+
+    #[test]
+    fn outline_survives_broken_text() {
+        let src = "table users {\n  id int pk\n  name varchar (40) # who\n  index name_idx (name)\n  index varchar(10)\n}\n\ntable posts {\n  author -> users.id, title text\n  body 'unterminated\n  pk (author, title)\n";
+        let o = outline(src);
+        assert_eq!(o.len(), 2);
+        assert_eq!((o[0].name.as_str(), o[0].line, o[0].end_line), ("users", 1, 6));
+        let cols: Vec<(&str, &str, usize)> = o[0].columns.iter().map(|c| (c.name.as_str(), c.data_type.as_str(), c.line)).collect();
+        assert_eq!(cols, vec![("id", "int", 2), ("name", "varchar(40)", 3), ("index", "varchar(10)", 5)]);
+        let cols: Vec<&str> = o[1].columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, vec!["author", "title", "body"]);
+        assert_eq!(o[1].end_line, 12, "unclosed table runs to the end");
+        assert_eq!(locate(&o, "users.name"), Some(3));
+        assert_eq!(locate(&o, "posts"), Some(8));
+        assert_eq!(locate(&o, "posts.nope"), Some(8));
+        assert_eq!(locate(&o, "nope"), None);
+    }
 }
+
