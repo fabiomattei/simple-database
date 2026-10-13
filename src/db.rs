@@ -398,6 +398,53 @@ impl Cell {
     }
 }
 
+/// Reads a schema from SQLite `CREATE TABLE` / `CREATE INDEX` statements by
+/// running them in a scratch in-memory database and introspecting it. The
+/// error carries the 1-based line where the failing statement starts.
+pub fn schema_from_sqlite_ddl(sql: &str) -> std::result::Result<Schema, crate::parser::ParseError> {
+    let fail = |line: usize, message: String| crate::parser::ParseError { line, message };
+    let conn = rusqlite::Connection::open_in_memory().map_err(|e| fail(1, e.to_string()))?;
+    let mut from = 0;
+    for stmt in split_statements(sql) {
+        // Where the statement's code starts, for the error line.
+        let code = strip_sql_comments(&stmt);
+        let at = sql[from..].find(code.trim()).map_or(from, |i| from + i);
+        let line = sql[..at].matches('\n').count() + 1;
+        from = at;
+        let words: Vec<String> = code.split_whitespace().take(3).map(str::to_ascii_lowercase).collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        if !matches!(words[..], ["create", "table", ..] | ["create", "index", ..] | ["create", "unique", "index"]) {
+            return Err(fail(line, "only CREATE TABLE and CREATE INDEX statements can be edited here".into()));
+        }
+        conn.execute_batch(&stmt).map_err(|e| fail(line, e.to_string()))?;
+    }
+    sqlite::introspect(&conn).map_err(|e| fail(1, format!("{e:#}")))
+}
+
+/// `stmt` without `--` and `/* */` comments (statements from `split_statements`).
+fn strip_sql_comments(stmt: &str) -> String {
+    let mut out = String::new();
+    let mut rest = stmt;
+    loop {
+        let line = rest.find("--");
+        let block = rest.find("/*");
+        match (line, block) {
+            (Some(l), b) if b.is_none_or(|b| l < b) => {
+                out.push_str(&rest[..l]);
+                rest = rest[l..].find('\n').map_or("", |n| &rest[l + n..]);
+            }
+            (_, Some(b)) => {
+                out.push_str(&rest[..b]);
+                rest = rest[b..].find("*/").map_or("", |n| &rest[b + n + 2..]);
+            }
+            _ => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- SQL text helpers
 
 /// Split a script into statements on `;`, ignoring semicolons inside quotes,
@@ -640,4 +687,30 @@ mod tests {
             Err(_) => eprintln!("SDB_TEST_MYSQL not set; skipped"),
         }
     }
+
+    #[test]
+    fn schema_from_generated_sqlite_ddl() {
+        let schema = crate::parser::parse(crate::STARTER_SCHEMA).unwrap();
+        let sql = ddl::schema_sql(&schema, Dialect::Sqlite);
+        assert!(schema_from_sqlite_ddl(&sql).unwrap().same_tables(&schema));
+        let err = schema_from_sqlite_ddl("-- a\nCREATE TABLE a (x INT);\n\nCREATE TABLE b (y INT,);").unwrap_err();
+        assert_eq!(err.line, 4, "{}", err.message);
+        let err = schema_from_sqlite_ddl("CREATE TABLE a (x INT);\n/* hi */ DROP TABLE a;").unwrap_err();
+        assert_eq!(err.line, 2);
+        assert!(err.message.contains("only CREATE"));
+    }
+
+    #[test]
+    fn edited_sqlite_ddl_patches_the_schema_text() {
+        let dsl = crate::STARTER_SCHEMA;
+        let schema = crate::parser::parse(dsl).unwrap();
+        let sql = ddl::schema_sql(&schema, Dialect::Sqlite).replace("name TEXT NOT NULL UNIQUE", "name TEXT NOT NULL UNIQUE,\n    color VARCHAR(7)");
+        let edited = schema_from_sqlite_ddl(&sql).unwrap();
+        let patched = crate::format::patch(dsl, &edited);
+        assert!(crate::parser::parse(&patched).unwrap().same_tables(&edited));
+        assert!(patched.contains("color  varchar(7)"), "{patched}");
+        assert!(patched.starts_with("# sdb schema file."), "comments outside the changed table stay");
+        assert_eq!(patched.lines().count(), dsl.lines().count() + 1, "only the new column line is added");
+    }
 }
+

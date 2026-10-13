@@ -241,6 +241,11 @@ impl Schema {
         self.tables.iter().find(|t| t.name == name)
     }
 
+    /// Equal apart from the order of the tables.
+    pub fn same_tables(&self, other: &Schema) -> bool {
+        self.tables.len() == other.tables.len() && self.tables.iter().all(|t| other.table(&t.name) == Some(t))
+    }
+
     /// Tables ordered so that referenced tables come before the tables that
     /// reference them. Cycles are broken by falling back to declaration order.
     pub fn tables_in_dependency_order(&self) -> Vec<&Table> {

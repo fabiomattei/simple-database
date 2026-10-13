@@ -35,13 +35,13 @@ Core library (`src/`, exported from `lib.rs`):
 |---|---|
 | `lib.rs` | Module list plus `STARTER_SCHEMA` (`include_str!` of `examples/blog.dbs`) |
 | `parser.rs` | `.dbs` DSL → `Schema`. Hand-written tokenizer: `(...)` groups become one raw `Paren` token, and newline, `,` and `;` all end a statement. `outline` / `locate`: lenient table/column → line scan for the editor, works on text that doesn't parse |
-| `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Pull). `align` re-aligns columns in place keeping comments (GUI Format); it returns `None` unless the result parses to the same schema |
+| `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Pull). `align` re-aligns columns in place keeping comments (GUI Format); it returns `None` unless the result parses to the same schema. `patch` rewrites only the changed tables of a text (SQL tab → schema sync) |
 | `validate.rs` | Errors (unusable schema) and warnings (design lint); `print_issues` is the CLI's ANSI printer |
 | `ddl.rs` | `Dialect` enum and all CREATE/DROP SQL; `quote()` quotes only when needed; `canonical()` = the schema as a dialect reports it back |
 | `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change |
 | `diagram.rs` | Text diagrams: Mermaid / Graphviz DOT (the GUI canvas is separate, in `gui/er.rs`) |
 | `connections.rs` | Saved connections (`Store`: `connections.json` + 0600 `secrets.json` in `config_dir()`). `Connection::from_target` / `target` convert to and from URLs. `resolve("@name")` is called by `Database::open` |
-| `db.rs` | `Database`: one live connection (SQLite path or `postgres://` / `mysql://` URL). `introspect`, `run` / `run_limited`, `row_counts`, `migration`, `apply_migration`, `normalize_checks`. Also `Cell` / `QueryResult` and `split_statements` |
+| `db.rs` | `Database`: one live connection (SQLite path or `postgres://` / `mysql://` URL). `introspect`, `run` / `run_limited`, `row_counts`, `migration`, `apply_migration`, `normalize_checks`. Also `Cell` / `QueryResult`, `split_statements` and `schema_from_sqlite_ddl` (DDL → `Schema` via an in-memory SQLite; the GUI's editable SQL tab) |
 | `sqlite.rs` | SQLite introspection, `run_limited` (multi-statement via `rusqlite::Batch`), `apply_migration` |
 | `pg.rs` | Postgres via the `postgres` crate (NoTls): catalog introspection; queries are prepared for column types, then run with the simple protocol so every value arrives as text |
 | `mysqldb.rs` | MySQL via the `mysql` crate (pure Rust, no TLS): `information_schema` introspection; checks are parsed from `SHOW CREATE TABLE` |

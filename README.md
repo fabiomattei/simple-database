@@ -17,7 +17,7 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 |---|---|
 | **Schema** | Edit the `.dbs` file with syntax highlighting and line numbers. Errors and design warnings update as you type |
 | **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file or the live database. **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
-| **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save |
+| **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save. In SQLite it is editable and kept in sync with the schema (see below) |
 | **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **Pull** replaces the editor with the database's schema |
 | **Query** | Run SQL (Ctrl+Enter) and see the results in a grid. Shows up to 10,000 rows per result. **Explain** shows each statement's query plan: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept |
 | **Data** | Browse any table, 200 rows per page |
@@ -49,7 +49,15 @@ as does clicking a table in the sidebar while the Schema tab is open. **Preview*
 generated SQL next to the editor, in the dialect you pick. **Format** (Ctrl+Shift+F) aligns the
 columns of every table and keeps comments and blank lines.
 
-Both editors (Schema and Query) have line numbers, editing commands, find/replace,
+The **SQL** tab edits the same schema as SQL. With the SQLite dialect selected, changing the
+`CREATE TABLE` / `CREATE INDEX` statements updates the schema text, and editing the schema
+updates the SQL. The SQL is checked by running it in a scratch in-memory SQLite database, so
+errors are SQLite's, shown on the statement's line. Only tables you change are rewritten in the
+schema text, so comments elsewhere are kept. Comments inside a rewritten table are lost. SQL
+edits don't apply while the schema text has a syntax error. **Regenerate** discards SQL edits
+that didn't apply. PostgreSQL and MySQL output is read-only.
+
+All three editors (Schema, SQL and Query) have line numbers, editing commands, find/replace,
 TextMate-style column selection and autocomplete:
 
 | Keys | Effect |

@@ -119,6 +119,44 @@ pub fn align(src: &str) -> Option<String> {
     (parse(&text).ok()? == before).then_some(text)
 }
 
+/// `src` changed so that it describes `new`, rewriting only the tables that
+/// differ: changed tables are reprinted in place, new ones appended, dropped
+/// ones removed. Comments in untouched tables survive. Falls back to
+/// `format_schema(new)` when `src` doesn't parse or its layout defeats this.
+pub fn patch(src: &str, new: &Schema) -> String {
+    let Ok(old) = parse(src) else { return format_schema(new) };
+    let outline = crate::parser::outline(src);
+    let mut lines: Vec<String> = src.split('\n').map(String::from).collect();
+    // Bottom-up, so earlier line numbers stay valid.
+    let mut blocks: Vec<&crate::parser::OutlineTable> = outline.iter().collect();
+    blocks.sort_by_key(|t| std::cmp::Reverse(t.line));
+    for t in blocks {
+        let (lo, hi) = (t.line - 1, t.end_line.min(lines.len()) - 1);
+        match new.table(&t.name) {
+            Some(nt) if old.table(&t.name) == Some(nt) => {}
+            Some(nt) => {
+                let printed = format_table(nt);
+                lines.splice(lo..=hi, printed.trim_end().split('\n').map(String::from));
+            }
+            None => {
+                let blank_after = lines.get(hi + 1).is_some_and(|l| l.trim().is_empty());
+                lines.drain(lo..=hi + usize::from(blank_after));
+            }
+        }
+    }
+    let mut text = lines.join("\n");
+    for t in new.tables.iter().filter(|t| old.table(&t.name).is_none()) {
+        if !text.is_empty() && !text.ends_with("\n\n") {
+            text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+        }
+        text.push_str(&format_table(t));
+    }
+    match parse(&text) {
+        Ok(s) if s.same_tables(new) => text,
+        _ => format_schema(new),
+    }
+}
+
 /// `line` up to its comment; `None` if it holds more than one statement or
 /// leaves a quote or parenthesis open.
 fn code_part(line: &str) -> Option<&str> {
@@ -215,4 +253,18 @@ mod tests {
         let printed = format_schema(&schema);
         assert_eq!(align(&printed).as_deref(), Some(printed.as_str()));
     }
+
+    #[test]
+    fn patch_rewrites_only_changed_tables() {
+        let src = "# header\ntable a { # keep me\n  x  int  pk\n}\n\ntable b {\n  y int\n}\n\ntable c {\n  z int\n}\n";
+        let mut new = parse(src).unwrap();
+        new.tables[1].columns[0].nullable = false; // b changes
+        new.tables.remove(2); // c goes
+        new.tables.push(parse("table d {\n  w text\n}").unwrap().tables.remove(0));
+        let out = patch(src, &new);
+        assert_eq!(out, "# header\ntable a { # keep me\n  x  int  pk\n}\n\ntable b {\n  y  int  not null\n}\n\ntable d {\n  w  text\n}\n");
+        assert!(parse(&out).unwrap().same_tables(&new));
+        assert_eq!(patch(src, &parse(src).unwrap()), src, "nothing to do");
+    }
 }
+
