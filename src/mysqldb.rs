@@ -8,17 +8,21 @@ use crate::schema::*;
 use anyhow::{Context, Result};
 use mysql::consts::ColumnType;
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, Value};
+use crate::tls::{self, SslMode};
+use mysql::{ClientIdentity, Conn, DriverError, Opts, OptsBuilder, SslOpts, Value};
 
 /// Character set number MySQL reports for binary data.
 const BINARY_CHARSET: u16 = 63;
 
 /// Connect to a `mysql://` (or `mariadb://`) URL that names a database.
-/// Without a password in the URL, `MYSQL_PWD` is used.
+/// Without a password in the URL, `MYSQL_PWD` is used. TLS is set by the
+/// `crate::tls` URL parameters.
 pub fn connect(url: &str) -> Result<Conn> {
+    let label = crate::db::redact(url);
+    let (url, tls) = tls::split_url(url)?;
     let url = match url.split_once("://") {
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case("mariadb") => format!("mysql://{rest}"),
-        _ => url.to_string(),
+        _ => url,
     };
     let opts = Opts::from_url(&url).context("invalid MySQL URL")?;
     anyhow::ensure!(
@@ -31,7 +35,27 @@ pub fn connect(url: &str) -> Result<Conn> {
     {
         builder = builder.pass(Some(pw));
     }
-    Conn::new(builder).with_context(|| format!("connecting to {}", crate::db::redact(&url)))
+    let mode = tls.mode();
+    let conn = if mode == SslMode::Disable {
+        Conn::new(builder)
+    } else {
+        tls.check_files()?;
+        tls::provider();
+        let mut ssl = SslOpts::default()
+            .with_root_cert_path(tls.root_cert.clone())
+            .with_danger_accept_invalid_certs(matches!(mode, SslMode::Prefer | SslMode::Require))
+            .with_danger_skip_domain_validation(mode == SslMode::VerifyCa);
+        if let Some((cert, key)) = tls.client_identity()? {
+            ssl = ssl.with_client_identity(Some(ClientIdentity::new(cert.to_path_buf(), key.to_path_buf())));
+        }
+        match Conn::new(builder.clone().ssl_opts(ssl)) {
+            Err(mysql::Error::DriverError(DriverError::TlsNotSupported)) if mode == SslMode::Prefer => {
+                Conn::new(builder.ssl_opts(None))
+            }
+            result => result,
+        }
+    };
+    conn.with_context(|| format!("connecting to {label}"))
 }
 
 // ---------------------------------------------------------------- introspection

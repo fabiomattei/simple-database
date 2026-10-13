@@ -1209,7 +1209,8 @@ impl App {
                     ui.label(
                         RichText::new(
                             "MySQL: mysql://user:password@localhost:3306/app. Without a password in the URL, \
-                             PGPASSWORD or MYSQL_PWD is used. Passwords are not saved.",
+                             PGPASSWORD or MYSQL_PWD is used. Passwords are not saved. TLS: add \
+                             ?sslmode=verify-full&sslrootcert=ca.pem&sslcert=client.pem&sslkey=client.key",
                         )
                         .small()
                         .weak(),

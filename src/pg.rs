@@ -5,21 +5,32 @@
 use crate::db::{Cell, QueryResult, split_statements, strip_outer_parens};
 use crate::schema::*;
 use anyhow::{Context, Result};
+use crate::tls::{self, SslMode};
+use postgres::config::SslMode as PgSslMode;
 use postgres::{Client, NoTls, SimpleQueryMessage, types::Type};
+use tokio_postgres_rustls::MakeRustlsConnect;
 use std::str::FromStr;
 
 /// Connect to a `postgres://` URL. Without a password in the URL,
-/// `PGPASSWORD` is used.
+/// `PGPASSWORD` is used. TLS is set by the `crate::tls` URL parameters.
 pub fn connect(url: &str) -> Result<Client> {
-    let mut config = postgres::Config::from_str(url).context("invalid PostgreSQL URL")?;
+    let label = crate::db::redact(url);
+    let (url, tls) = tls::split_url(url)?;
+    let mut config = postgres::Config::from_str(&url).context("invalid PostgreSQL URL")?;
     if config.get_password().is_none()
         && let Ok(pw) = std::env::var("PGPASSWORD")
     {
         config.password(pw);
     }
-    config
-        .connect(NoTls)
-        .with_context(|| format!("connecting to {}", crate::db::redact(url)))
+    let mode = tls.mode();
+    let client = match mode {
+        SslMode::Disable => config.ssl_mode(PgSslMode::Disable).connect(NoTls),
+        _ => {
+            config.ssl_mode(if mode == SslMode::Prefer { PgSslMode::Prefer } else { PgSslMode::Require });
+            config.connect(MakeRustlsConnect::new(tls::client_config(&tls, mode)?))
+        }
+    };
+    client.with_context(|| format!("connecting to {label}"))
 }
 
 // ---------------------------------------------------------------- introspection

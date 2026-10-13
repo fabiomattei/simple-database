@@ -101,8 +101,27 @@ Any `SCHEMA` argument may be a `.dbs` file, **a SQLite database file or a databa
 ```
 
 Without a password in the URL, `PGPASSWORD` or `MYSQL_PWD` is used. PostgreSQL works on the
-current schema (normally `public`). MySQL needs 8.0.16 or newer for check constraints. Connections
-are unencrypted (no TLS), which suits local and private-network servers.
+current schema (normally `public`). MySQL needs 8.0.16 or newer for check constraints.
+
+TLS uses the same libpq-style URL parameters for both servers:
+
+| Parameter | Meaning |
+|---|---|
+| `sslmode=disable` | Plain TCP |
+| `sslmode=prefer` | TLS if the server offers it, certificate not verified (the default) |
+| `sslmode=require` | TLS required, certificate not verified |
+| `sslmode=verify-ca` | TLS, server certificate signed by a trusted CA |
+| `sslmode=verify-full` | As `verify-ca`, and the certificate must match the host name |
+| `sslrootcert=ca.pem` | CA to verify the server with (default: the Mozilla root store) |
+| `sslcert=client.pem`, `sslkey=client.key` | Client certificate authentication (PEM; both are needed) |
+
+Giving certificate files without `sslmode` makes TLS required, and `require` with `sslrootcert`
+verifies the CA, as libpq does:
+
+```sh
+--db "postgres://app@db.example.com/app?sslmode=verify-full&sslrootcert=ca.pem&sslcert=client.pem&sslkey=client.key"
+--db "mysql://app@db.example.com/app?sslmode=verify-ca&sslrootcert=ca.pem"
+```
 
 | Command | What it does |
 |---|---|

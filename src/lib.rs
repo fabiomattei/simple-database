@@ -15,6 +15,7 @@ pub mod schema;
 pub mod seed;
 pub mod shell;
 pub mod sqlite;
+pub mod tls;
 pub mod validate;
 
 /// The example schema written by `sdb init` and the GUI's "New schema".
