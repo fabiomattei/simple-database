@@ -1,0 +1,469 @@
+//! Modal dialogs: confirmations, import, restore, scripts, help and the like.
+
+use crate::{App, Dialog, OpenFrom, QueryOutput, Tab, Write, error_color, ok_color, warn_color, conns, grid, highlight::{self, Lang}, table_edit};
+use eframe::egui::{self, RichText};
+use simple_database::ddl::Dialect;
+use simple_database::connections::SafeMode;
+use simple_database::db::{Database, QueryResult};
+use simple_database::dump;
+use simple_database::import;
+use simple_database::STARTER_SCHEMA;
+use std::sync::atomic::Ordering;
+
+impl App {
+    pub(crate) fn dialogs(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &self.dialog else { return };
+        let close = match dialog {
+            Dialog::Unsaved(action) => {
+                let action = *action;
+                let resp = egui::Modal::new(egui::Id::new("unsaved")).show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.heading("Unsaved changes");
+                    ui.label(format!("Save changes to {} first?", self.file_label().trim_end_matches(" •")));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() && self.save_schema(false) {
+                            self.dialog = None;
+                            self.perform(action, ctx);
+                        }
+                        if ui.button("Don't save").clicked() {
+                            self.dialog = None;
+                            self.perform(action, ctx);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.dialog = None;
+                        }
+                    });
+                });
+                resp.should_close()
+            }
+            Dialog::ConfirmPush => {
+                let resp = egui::Modal::new(egui::Id::new("push")).show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.heading("Apply migration?");
+                    let warnings = self.desired_schema().and_then(|s| self.migration_for(&s)).map(|m| m.warnings).unwrap_or_default();
+                    let dialect = self.dialect_of_db();
+                    if dialect == Dialect::Mysql {
+                        ui.colored_label(
+                            warn_color(ui),
+                            "⚠ MySQL cannot roll back schema changes: if a statement fails, the ones before it stay applied.",
+                        );
+                    } else if warnings.is_empty() {
+                        ui.label("The changes run inside a transaction and are rolled back if anything fails.");
+                    }
+                    if !warnings.is_empty() {
+                        for w in &warnings {
+                            ui.colored_label(warn_color(ui), format!("⚠ {w}"));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Apply").strong()).clicked() {
+                            self.dialog = None;
+                            self.push_now();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.dialog = None;
+                        }
+                    });
+                });
+                resp.should_close()
+            }
+            Dialog::Connections(_) => {
+                let Some(Dialog::Connections(mut m)) = self.dialog.take() else { unreachable!() };
+                let mut action = None;
+                let resp = egui::Modal::new(egui::Id::new("connections")).show(ctx, |ui| {
+                    action = m.show(ui, &mut self.conns);
+                });
+                match action {
+                    Some(conns::Action::Connect { target, label, safe_mode }) => {
+                        m.message = Some((format!("Connecting to {label}…"), false));
+                        self.start_open(format!("Connecting to {label}"), OpenFrom::Dialog, move || {
+                            Database::open_labeled(&target, label).and_then(|mut d| d.set_safe_mode(safe_mode).map(|()| d))
+                        });
+                    }
+                    Some(conns::Action::Close) => return,
+                    None => {}
+                }
+                self.dialog = Some(Dialog::Connections(m));
+                resp.should_close()
+            }
+            Dialog::Table(_) => {
+                let Some(Dialog::Table(mut editor)) = self.dialog.take() else { unreachable!() };
+                let schema = self.analysis.last_good.clone();
+                let mut outcome = None;
+                let resp = egui::Modal::new(egui::Id::new("table_edit")).show(ctx, |ui| {
+                    outcome = editor.show(ui, &schema);
+                });
+                match outcome {
+                    Some(table_edit::Outcome::Apply { schema: new, table, renamed }) => {
+                        if let Some(pos) = editor.place {
+                            self.er.place(&table, pos);
+                        }
+                        self.er.selected = Some(table);
+                        self.apply_diagram_edit(&new, renamed);
+                        return;
+                    }
+                    Some(table_edit::Outcome::Cancel) => return,
+                    None => {}
+                }
+                self.dialog = Some(Dialog::Table(editor));
+                resp.should_close()
+            }
+            Dialog::ConfirmWrite(_) => {
+                let Some(Dialog::ConfirmWrite(c)) = self.dialog.take() else { unreachable!() };
+                let mut answer = None;
+                let label = self.db.as_ref().map(|d| d.label.to_string()).unwrap_or_default();
+                let resp = egui::Modal::new(egui::Id::new("confirm_write")).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(format!("Change {label}?"));
+                    ui.label(RichText::new("Safe mode asks before these statements run.").weak());
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        for (stmt, why) in &c.statements {
+                            highlight::code_view(ui, stmt, Lang::Sql);
+                            if let Some(why) = why {
+                                ui.colored_label(error_color(ui), format!("⚠ {why}"));
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Run").strong()).clicked() {
+                            answer = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+                match answer {
+                    Some(true) => match c.write {
+                        Write::Query => self.run_query(),
+                        Write::SaveRows(changes) => self.save_rows(changes),
+                        Write::Seed => self.seed_now(),
+                    },
+                    Some(false) => {}
+                    None if resp.should_close() => {}
+                    None => self.dialog = Some(Dialog::ConfirmWrite(c)),
+                }
+                return;
+            }
+            Dialog::Import(_) => {
+                let Some(Dialog::Import(mut st)) = self.dialog.take() else { unreachable!() };
+                let mut answer = None;
+                let (tables, read_only, confirm) = match &self.db {
+                    Some(d) => (
+                        d.schema.tables.clone(),
+                        d.safe_mode == SafeMode::ReadOnly,
+                        (d.safe_mode == SafeMode::Confirm),
+                    ),
+                    None => (vec![], true, false),
+                };
+                let resp = egui::Modal::new(egui::Id::new("import")).show(ctx, |ui| {
+                    ui.set_width(640.0);
+                    ui.heading("Import rows");
+                    ui.label(RichText::new(st.path.display().to_string()).monospace().small().weak());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Into table");
+                        egui::ComboBox::from_id_salt("import_table").selected_text(&st.table).show_ui(ui, |ui| {
+                            for t in &tables {
+                                ui.selectable_value(&mut st.table, t.name.clone(), &t.name);
+                            }
+                        });
+                        ui.label(RichText::new(format!("{} row(s) in the file", st.rows.rows.len())).weak());
+                    });
+                    let table = tables.iter().find(|t| t.name == st.table);
+                    if let Some(t) = table {
+                        let plan = import::plan(t, &st.rows);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Columns:");
+                            for (_, c) in &plan.mapping {
+                                ui.colored_label(ok_color(ui), format!("✔ {c}"));
+                            }
+                            for c in &plan.skipped {
+                                ui.label(RichText::new(format!("✖ {c}")).weak()).on_hover_text("Not in the table, or empty and filled by the database: skipped");
+                            }
+                        });
+                        if !plan.missing.is_empty() {
+                            ui.colored_label(
+                                warn_color(ui),
+                                format!("⚠ {} need a value, but the file has no such column", plan.missing.join(", ")),
+                            );
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Preview").small().strong());
+                    let preview = QueryResult {
+                        columns: st.rows.columns.clone(),
+                        rows: st.rows.rows.iter().take(8).cloned().collect(),
+                        changes: None,
+                        truncated: false,
+                    };
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 200.0), |ui| {
+                        grid::result_grid(ui, egui::Id::new("import_preview"), &preview);
+                    });
+                    ui.label(RichText::new("All rows go in one transaction: if one fails, nothing is imported.").small().weak());
+                    if confirm {
+                        ui.colored_label(warn_color(ui), "Safe mode: importing writes to the database.");
+                    }
+                    if let Some(e) = &st.error {
+                        ui.colored_label(error_color(ui), format!("✖ {e}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ok = table.is_some() && !read_only && !st.rows.rows.is_empty() && !st.busy;
+                        let button = egui::Button::new(RichText::new(format!("Import {} row(s)", st.rows.rows.len())).strong());
+                        if ui.add_enabled(ok, button).on_disabled_hover_text(if read_only { "The connection is read-only" } else { "Choose a table" }).clicked() {
+                            answer = Some(true);
+                        }
+                        if st.busy {
+                            ui.spinner();
+                        } else if ui.button("Cancel").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+                match answer {
+                    Some(true) => {
+                        if let Some(t) = tables.iter().find(|t| t.name == st.table).cloned() {
+                            st.busy = true;
+                            st.error = None;
+                            let rows = st.rows.clone();
+                            self.db_run(
+                                "Importing rows",
+                                move |conn| (import::import(conn, &t, &rows).map_err(|e| format!("{e:#}")), t.name),
+                                |app, (res, table)| match res {
+                                    Ok(n) => {
+                                        if matches!(app.dialog, Some(Dialog::Import(_))) {
+                                            app.dialog = None;
+                                        }
+                                        app.set_status(format!("Imported {n} row(s) into {table}"), false);
+                                        app.refresh_db();
+                                        app.data.open(Some(table));
+                                        app.data_loading = None;
+                                        app.tab = Tab::Data;
+                                    }
+                                    Err(e) => match &mut app.dialog {
+                                        Some(Dialog::Import(st)) => {
+                                            st.busy = false;
+                                            st.error = Some(e);
+                                        }
+                                        _ => app.set_status(format!("Import failed: {e}"), true),
+                                    },
+                                },
+                            );
+                        }
+                        self.dialog = Some(Dialog::Import(st));
+                    }
+                    Some(false) => {}
+                    None if resp.should_close() && !st.busy => {}
+                    None => self.dialog = Some(Dialog::Import(st)),
+                }
+                return;
+            }
+            Dialog::Restore(_) => {
+                let Some(Dialog::Restore(mut st)) = self.dialog.take() else { unreachable!() };
+                let mut answer = None;
+                let (label, dialect) = match &self.db {
+                    Some(d) => (d.label.to_string(), d.dialect),
+                    None => (String::new(), Dialect::Sqlite),
+                };
+                let resp = egui::Modal::new(egui::Id::new("restore")).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(format!("Restore into {label}?"));
+                    ui.label(RichText::new(st.path.display().to_string()).monospace().small().weak());
+                    ui.add_space(6.0);
+                    let r = &st.restore;
+                    ui.label(format!("{} statement(s): {} table(s) to create, {} INSERT(s).", r.statements.len(), r.creates.len(), r.inserts()));
+                    if !r.creates.is_empty() {
+                        ui.label(RichText::new(r.creates.join(", ")).weak());
+                    }
+                    if !r.existing.is_empty() {
+                        ui.add_space(4.0);
+                        ui.colored_label(warn_color(ui), format!("⚠ The database already has {}.", r.existing.join(", ")));
+                        ui.checkbox(&mut st.clean, "Drop these tables first (their rows are lost)");
+                    }
+                    ui.add_space(4.0);
+                    if dialect == Dialect::Mysql {
+                        ui.colored_label(warn_color(ui), "⚠ MySQL commits each CREATE and DROP: if a statement fails, the ones before it stay applied.");
+                    } else {
+                        ui.label(RichText::new("Everything runs in one transaction: if a statement fails, nothing is changed.").small().weak());
+                    }
+                    if let Some(e) = &st.error {
+                        ui.colored_label(error_color(ui), format!("✖ {e}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ok = (r.existing.is_empty() || st.clean) && !st.busy;
+                        if ui.add_enabled(ok, egui::Button::new(RichText::new("Restore").strong())).on_disabled_hover_text("Tick the box to drop the existing tables").clicked() {
+                            answer = Some(true);
+                        }
+                        if st.busy {
+                            ui.spinner();
+                        } else if ui.button("Cancel").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+                match answer {
+                    Some(true) => {
+                        st.busy = true;
+                        st.error = None;
+                        let (restore, clean, path) = (st.restore.clone(), st.clean, st.path.clone());
+                        self.db_run(
+                            "Restoring the dump",
+                            move |conn| (dump::restore(conn, &restore, clean).map_err(|e| format!("{e:#}")), path),
+                            |app, (res, path)| {
+                                app.refresh_db();
+                                match res {
+                                    Ok(n) => {
+                                        if matches!(app.dialog, Some(Dialog::Restore(_))) {
+                                            app.dialog = None;
+                                        }
+                                        app.set_status(format!("Restored {}: {n} row(s)", path.display()), false);
+                                    }
+                                    Err(e) => match &mut app.dialog {
+                                        Some(Dialog::Restore(st)) => {
+                                            st.busy = false;
+                                            st.error = Some(e);
+                                        }
+                                        _ => app.set_status(format!("Restore failed: {e}"), true),
+                                    },
+                                }
+                            },
+                        );
+                        self.dialog = Some(Dialog::Restore(st));
+                    }
+                    Some(false) => {}
+                    None if resp.should_close() && !st.busy => {}
+                    None => self.dialog = Some(Dialog::Restore(st)),
+                }
+                return;
+            }
+            Dialog::RunScript(_) => {
+                let Some(Dialog::RunScript(mut st)) = self.dialog.take() else { unreachable!() };
+                let mut run = false;
+                let mut show_results = false;
+                let mut close = false;
+                let (label, dialect) = match &self.db {
+                    Some(d) => (d.label.to_string(), d.dialect),
+                    None => (String::new(), Dialect::Sqlite),
+                };
+                let resp = egui::Modal::new(egui::Id::new("run_script")).show(ctx, |ui| {
+                    ui.set_width(560.0);
+                    ui.heading(format!("Run SQL file on {label}"));
+                    ui.label(RichText::new(st.path.display().to_string()).monospace().small().weak());
+                    ui.add_space(6.0);
+                    match (&st.outcome, &st.progress) {
+                        (None, Some(progress)) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Running statement {} of {}…", progress.load(Ordering::Relaxed) + 1, st.statements));
+                            });
+                            ui.add_space(8.0);
+                            self.cancel_button(ui);
+                        }
+                        (None, None) => {
+                            ui.label(format!("{} statement(s).", st.statements));
+                            ui.checkbox(&mut st.transaction, "Run in one transaction (roll back everything if a statement fails)");
+                            if st.transaction && dialect == Dialect::Mysql {
+                                ui.colored_label(warn_color(ui), "⚠ MySQL commits CREATE, ALTER and DROP immediately, even inside a transaction.");
+                            }
+                            ui.add_enabled_ui(!st.transaction, |ui| {
+                                ui.checkbox(&mut st.keep_going, "Continue after a failed statement");
+                            });
+                            if !st.asks.is_empty() {
+                                ui.add_space(4.0);
+                                ui.colored_label(warn_color(ui), format!("Safe mode: {} statement(s) change the database, for example:", st.asks.len()));
+                                for (stmt, why) in st.asks.iter().take(5) {
+                                    let first = stmt.lines().next().unwrap_or_default();
+                                    match why {
+                                        Some(why) => ui.colored_label(error_color(ui), format!("{first}  ({why})")),
+                                        None => ui.label(RichText::new(first).monospace()),
+                                    };
+                                }
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                run = ui.button(RichText::new("▶ Run").strong()).clicked();
+                                close = ui.button("Cancel").clicked();
+                            });
+                        }
+                        (Some(out), _) => {
+                            let r = &out.report;
+                            let summary = format!(
+                                "Ran {} of {} statement(s) in {:.2?}: {} row(s) changed.",
+                                r.run, r.statements, out.elapsed, r.changed
+                            );
+                            if out.stopped.is_none() && out.errors.is_empty() {
+                                ui.colored_label(ok_color(ui), format!("✔ {summary}"));
+                            } else {
+                                ui.label(summary);
+                            }
+                            if let Some(e) = &out.stopped {
+                                ui.colored_label(error_color(ui), format!("✖ Stopped at {e}"));
+                            } else if !out.errors.is_empty() {
+                                ui.colored_label(error_color(ui), format!("✖ {} statement(s) failed:", out.errors.len()));
+                                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                    for (line, e) in &out.errors {
+                                        ui.label(RichText::new(format!("line {line}: {e}")).monospace().small());
+                                    }
+                                });
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if !out.results.is_empty() {
+                                    show_results = ui.button(format!("Show {} result(s)", out.results.len())).clicked();
+                                }
+                                close = ui.button("Close").clicked();
+                            });
+                        }
+                    }
+                });
+                if run {
+                    self.run_script(&mut st);
+                }
+                let running = st.progress.is_some();
+                if show_results && let Some(out) = st.outcome.take() {
+                    let selected = out.results.len() - 1;
+                    self.query_out = Some(QueryOutput { results: Ok(out.results), elapsed: out.elapsed, selected });
+                    self.tab = Tab::Query;
+                } else if running || !(close || resp.should_close()) {
+                    self.dialog = Some(Dialog::RunScript(st));
+                }
+                return;
+            }
+            Dialog::Syntax => {
+                let resp = egui::Modal::new(egui::Id::new("syntax")).show(ctx, |ui| {
+                    ui.set_width(620.0);
+                    ui.heading("Schema syntax");
+                    let help: String = STARTER_SCHEMA
+                        .lines()
+                        .take_while(|l| l.starts_with('#'))
+                        .map(|l| l.trim_start_matches('#').strip_prefix(' ').unwrap_or(l.trim_start_matches('#')))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.label(RichText::new(help).monospace());
+                    ui.add_space(6.0);
+                    ui.label("Example:");
+                    highlight::code_view(
+                        ui,
+                        "table posts {\n  id         int   pk autoincrement\n  author_id  int   not null -> users.id on delete cascade\n  title      text  not null default ''\n  index (author_id)\n}",
+                        Lang::Dbs,
+                    );
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        self.dialog = None;
+                    }
+                });
+                resp.should_close()
+            }
+        };
+        if close {
+            self.dialog = None;
+        }
+    }
+}
