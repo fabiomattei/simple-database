@@ -26,7 +26,8 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 The **Data** tab edits rows in place. Each table opens in its own tab (click it in the sidebar,
 use **➕** next to the tabs, or **Browse data** in the Diagram), and every tab keeps its page,
 filters and unsaved changes while you look at another; a tab with changes waiting is marked •
-and can't be closed until they're saved or discarded. Click a column header to sort (again to reverse, a third
+and can't be closed until they're saved or discarded. The open tabs are remembered per database and come
+back the next time you open it. Click a column header to sort (again to reverse, a third
 time to clear). **Filter** adds conditions per column (=, ≠, <, >, contains, starts with, in, is
 NULL…) and an optional SQL `WHERE` condition; **Apply** or Enter runs them. Double-click a cell
 to edit it (Enter or clicking elsewhere keeps the value, Esc cancels), right-click for **Set

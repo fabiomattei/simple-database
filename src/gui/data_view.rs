@@ -10,6 +10,7 @@ use simple_database::db::{Cell, QueryResult};
 use simple_database::ddl::Dialect;
 use simple_database::output::ExportFormat;
 use simple_database::schema::{Schema, Table};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PAGE_SIZE: usize = 200;
@@ -78,6 +79,24 @@ pub enum DataAction {
     Export(ExportFormat),
 }
 
+/// The tables open in the Data tab for one database, kept between sessions.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SavedTabs {
+    /// The database's label: a file path, a URL without password, or `@name`.
+    pub db: String,
+    pub tables: Vec<String>,
+    pub active: usize,
+}
+
+/// Remember `s`, most recent first, for the last `MAX_SAVED_TABS` databases.
+pub fn remember(list: &mut Vec<SavedTabs>, s: SavedTabs) {
+    list.retain(|o| o.db != s.db);
+    list.insert(0, s);
+    list.truncate(MAX_SAVED_TABS);
+}
+
+const MAX_SAVED_TABS: usize = 20;
+
 /// The Data tab's open tables, one `DataView` each, so every table keeps its
 /// page, filters and staged changes while another one is shown.
 #[derive(Default)]
@@ -122,6 +141,25 @@ impl DataTabs {
         *self = DataTabs::default();
         if let Some(t) = table {
             self.show(t);
+        }
+    }
+
+    /// The open tables of database `db`, to restore next time.
+    pub fn saved(&self, db: &str) -> SavedTabs {
+        SavedTabs { db: db.to_owned(), tables: self.views.iter().filter_map(|v| v.table.clone()).collect(), active: self.active }
+    }
+
+    /// Open the saved tables that still exist; without any, the first table.
+    pub fn restore(&mut self, saved: Option<&SavedTabs>, schema: &Schema) {
+        *self = DataTabs::default();
+        let Some(s) = saved else { return self.refresh(schema) };
+        let shown = s.tables.get(s.active);
+        for t in s.tables.iter().filter(|t| schema.table(t).is_some()) {
+            self.show(t.clone());
+        }
+        self.active = shown.and_then(|t| self.views.iter().position(|v| v.table.as_ref() == Some(t))).unwrap_or(0);
+        if self.views.is_empty() {
+            self.refresh(schema);
         }
     }
 
@@ -810,6 +848,34 @@ mod tests {
         assert_eq!(tabs.table(), None);
         tabs.refresh(&schema);
         assert_eq!(tabs.table(), Some("a"));
+    }
+
+    #[test]
+    fn tabs_are_saved_and_restored() {
+        let schema = parse("table a { id int pk }\ntable b { id int pk }\ntable c { id int pk }").unwrap();
+        let mut tabs = DataTabs::default();
+        tabs.restore(None, &schema);
+        assert_eq!(tabs.table(), Some("a"));
+        tabs.show("c".into());
+        tabs.show("b".into());
+        let saved = tabs.saved("app.db");
+        assert_eq!((saved.tables.clone(), saved.active), (vec!["a".to_string(), "c".into(), "b".into()], 2));
+
+        // A table dropped since: its tab is gone, the shown one stays shown.
+        let fewer = parse("table a { id int pk }\ntable b { id int pk }").unwrap();
+        tabs.restore(Some(&saved), &fewer);
+        assert_eq!((tabs.views.len(), tabs.table()), (2, Some("b")));
+        tabs.restore(Some(&SavedTabs { db: "x".into(), tables: vec!["gone".into()], active: 0 }), &fewer);
+        assert_eq!((tabs.views.len(), tabs.table()), (1, Some("a")));
+
+        let mut list = Vec::new();
+        for i in 0..=MAX_SAVED_TABS {
+            remember(&mut list, SavedTabs { db: i.to_string(), tables: vec![], active: 0 });
+        }
+        remember(&mut list, SavedTabs { db: "5".into(), tables: vec!["a".into()], active: 0 });
+        assert_eq!(list.len(), MAX_SAVED_TABS);
+        assert_eq!((list[0].db.as_str(), list[0].tables.len()), ("5", 1));
+        assert_eq!(list.iter().filter(|s| s.db == "5").count(), 1);
     }
 
     #[test]

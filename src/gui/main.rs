@@ -68,6 +68,8 @@ struct Settings {
     hide_outline: bool,
     show_preview: bool,
     hide_history: bool,
+    /// The Data tab's open tables, per database, most recent first.
+    data_tabs: Vec<data_view::SavedTabs>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -306,6 +308,8 @@ struct App {
     /// Name being typed for "Save query", while the field is open.
     save_name: Option<String>,
     data: data_view::DataTabs,
+    /// Open Data tabs of the databases used before, restored on connecting.
+    saved_tabs: Vec<data_view::SavedTabs>,
     /// The count and page queries of the Data tab load on their way.
     data_loading: Option<(String, String)>,
     migrate_source: MigrateSource,
@@ -356,6 +360,7 @@ impl App {
             history_search: String::new(),
             save_name: None,
             data: data_view::DataTabs::default(),
+            saved_tabs: settings.data_tabs.clone(),
             data_loading: None,
             migrate_source: MigrateSource::SchemaFile,
             migrate_reading: None,
@@ -585,6 +590,13 @@ impl App {
         }
     }
 
+    /// Keep the open database's Data tabs, to restore when it is opened again.
+    pub(crate) fn remember_data_tabs(&mut self) {
+        if let Some(db) = &self.db {
+            data_view::remember(&mut self.saved_tabs, self.data.saved(&db.label));
+        }
+    }
+
     /// Make a newly opened database the current one.
     fn attach_db(&mut self, opened: Opened) {
         let Opened { conn, schema, skipped, counts } = opened;
@@ -605,7 +617,8 @@ impl App {
         if [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql].iter().any(|d| self.query == default_query(*d)) {
             self.query = default_query(dialect).into();
         }
-        self.data.start(schema.tables.first().map(|t| t.name.clone()));
+        self.remember_data_tabs();
+        self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
         self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None });
@@ -811,6 +824,7 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.remember_data_tabs();
         let settings = Settings {
             schema_path: self.schema_path.clone(),
             db_target: match (&self.db, &self.opening) {
@@ -830,6 +844,7 @@ impl eframe::App for App {
             hide_outline: !self.show_outline,
             show_preview: self.show_preview,
             hide_history: !self.show_history,
+            data_tabs: self.saved_tabs.clone(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
     }

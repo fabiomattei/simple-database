@@ -61,6 +61,7 @@ impl App {
                 }
                 ui.separator();
                 if ui.add_enabled(self.db.is_some(), egui::Button::new("Close database")).clicked() {
+                    self.remember_data_tabs();
                     self.db = None;
                     self.set_status("Database closed", false);
                 }
