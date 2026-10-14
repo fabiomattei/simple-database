@@ -204,6 +204,7 @@ verifies the CA, as libpq does:
 | `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database |
 | `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42] [-y]` | Fill tables with realistic fake data (see below) |
 | `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown] [-y]` | Run SQL, print results. `-y` skips safe mode's question |
+| `sdb exec FILE --db app.db [-1] [--continue] [-v] [-f FORMAT] [-y]` | Run a SQL file statement by statement (see below) |
 | `sdb import --db app.db FILE [-t TABLE] [-f csv\|tsv\|json\|jsonl] [-y]` | Insert rows from a file (see below) |
 | `sdb dump --db app.db [-o dump.sql] [-t a,b] [--schema-only\|--data-only] [-d DIALECT]` | Write the schema and rows as a SQL script (see below) |
 | `sdb restore FILE --db app.db [--clean] [-y]` | Run a dump against a database in one transaction (see below) |
@@ -266,6 +267,19 @@ TSV an empty field is NULL and `""` is an empty string. NULL in a NOT NULL colum
 gets the default, and a column that is empty in every row and filled by the database
 (auto-increment or default) is left out. Values are checked against the column types, and all
 rows go in one transaction, so a bad row means nothing is inserted.
+
+### Running SQL files
+
+`sdb exec script.sql --db app.db` runs a file one statement at a time and prints the results of
+queries (`-f` picks the format, `-` reads the script from stdin). It stops at the first failing
+statement and names its line; the statements before it stay applied. `-1` (`--transaction`)
+runs the whole file in one transaction that a failure rolls back (the file must then not use
+BEGIN / COMMIT itself; MySQL still commits CREATE, ALTER and DROP immediately). `--continue`
+runs every statement and reports each failure instead. `-v` prints each statement's line and
+the rows it changed. Statements may contain `;` inside strings, comments, Postgres `$$` bodies
+and `CREATE TRIGGER … BEGIN … END`. Safe mode asks before the writes, as for `sdb query`. In the
+app: **File → Run SQL file…** (same options; **Show results** opens the queries' results in the
+Query tab), or **Open…** in the Query tab to load a file into the editor.
 
 ### Dump and restore
 

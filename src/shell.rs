@@ -214,7 +214,11 @@ pub fn confirm(question: &str) -> Result<bool> {
 /// List the statements safe mode wants confirmed and ask.
 pub fn confirm_statements(stmts: &[(String, Kind)], database: &str) -> Result<bool> {
     eprintln!("\x1b[33mSafe mode:\x1b[0m {} statement(s) change {database}:", stmts.len());
-    for (s, k) in stmts {
+    const SHOWN: usize = 20;
+    if stmts.len() > SHOWN {
+        eprintln!("  … the first {SHOWN}:");
+    }
+    for (s, k) in stmts.iter().take(SHOWN) {
         let first = s.lines().next().unwrap_or_default();
         match k {
             Kind::Dangerous(why) => eprintln!("  \x1b[31m{first}\x1b[0m  ({why})"),

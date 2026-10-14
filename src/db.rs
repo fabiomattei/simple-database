@@ -371,6 +371,52 @@ impl Database {
         self.query_value(sql)
     }
 
+    /// Run a script one statement at a time, calling `on_step` after each.
+    /// Stops at the first error (returned with its line) unless
+    /// `opts.keep_going`. With `opts.transaction` everything runs in one
+    /// transaction that a failure rolls back; the script must then not use
+    /// BEGIN / COMMIT itself.
+    pub fn run_script(&mut self, sql: &str, opts: &ScriptOptions, on_step: &mut dyn FnMut(Step)) -> Result<ScriptReport> {
+        let statements = statements_with_lines(sql);
+        if statements.is_empty() {
+            bail!("no SQL statements to run");
+        }
+        let mysql = self.dialect() == Dialect::Mysql;
+        if opts.transaction {
+            if let Some((line, _)) = statements.iter().find(|(_, s)| is_transaction_control(s)) {
+                bail!("line {line} controls transactions itself; run the script without a single transaction");
+            }
+            self.execute(if mysql { "START TRANSACTION" } else { "BEGIN" })?;
+        }
+        let mut report = ScriptReport { statements: statements.len(), ..Default::default() };
+        for (line, stmt) in &statements {
+            let started = std::time::Instant::now();
+            let result = self.run_limited(stmt, opts.max_rows);
+            if let Ok(rs) = &result {
+                report.changed += rs.iter().filter_map(|r| r.changes).sum::<u64>();
+            }
+            report.run += 1;
+            on_step(Step { line: *line, sql: stmt, result: &result, elapsed: started.elapsed() });
+            let Err(e) = result else { continue };
+            report.failed += 1;
+            if opts.keep_going && !opts.transaction {
+                continue;
+            }
+            let first = stmt.lines().next().unwrap_or_default();
+            let what = if opts.transaction {
+                let _ = self.execute("ROLLBACK");
+                "the transaction was rolled back".to_string()
+            } else {
+                format!("the {} statement(s) before it were applied", report.run - 1)
+            };
+            bail!("line {line}: {first}\n{e:#}\n({what})");
+        }
+        if opts.transaction {
+            self.execute("COMMIT")?;
+        }
+        Ok(report)
+    }
+
     /// The query plan of each statement in `sql`, as one `QUERY PLAN` text column.
     /// SQLite only plans (`EXPLAIN QUERY PLAN`). Postgres and MySQL run the
     /// statement with `EXPLAIN ANALYZE` inside a transaction that is rolled
@@ -403,6 +449,44 @@ impl Database {
         let result = self.run(stmt);
         self.execute("ROLLBACK")?;
         Ok(result?.pop())
+    }
+}
+
+pub struct ScriptOptions {
+    /// Run everything in one transaction, rolled back on failure.
+    pub transaction: bool,
+    /// Go on after a failed statement (ignored with `transaction`).
+    pub keep_going: bool,
+    /// Rows kept per result.
+    pub max_rows: usize,
+}
+
+/// One statement of [`Database::run_script`], just run.
+pub struct Step<'a> {
+    pub line: usize,
+    pub sql: &'a str,
+    pub result: &'a Result<Vec<QueryResult>>,
+    pub elapsed: std::time::Duration,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ScriptReport {
+    /// Statements in the script.
+    pub statements: usize,
+    /// Statements run, including failed ones.
+    pub run: usize,
+    pub failed: usize,
+    /// Rows changed.
+    pub changed: u64,
+}
+
+/// BEGIN, COMMIT, ROLLBACK, START TRANSACTION, END.
+pub fn is_transaction_control(stmt: &str) -> bool {
+    let w = safety::words(stmt);
+    match w.first().map(String::as_str) {
+        Some("begin" | "commit" | "rollback" | "end") => !w.iter().any(|x| x == "trigger"),
+        Some("start") => w.get(1).is_some_and(|x| x == "transaction"),
+        _ => false,
     }
 }
 
@@ -523,13 +607,8 @@ impl Cell {
 pub fn schema_from_sqlite_ddl(sql: &str) -> std::result::Result<Schema, crate::parser::ParseError> {
     let fail = |line: usize, message: String| crate::parser::ParseError { line, message };
     let conn = rusqlite::Connection::open_in_memory().map_err(|e| fail(1, e.to_string()))?;
-    let mut from = 0;
-    for stmt in split_statements(sql) {
-        // Where the statement's code starts, for the error line.
+    for (line, stmt) in statements_with_lines(sql) {
         let code = strip_sql_comments(&stmt);
-        let at = sql[from..].find(code.trim()).map_or(from, |i| from + i);
-        let line = sql[..at].matches('\n').count() + 1;
-        from = at;
         let words: Vec<String> = code.split_whitespace().take(3).map(str::to_ascii_lowercase).collect();
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
         if !matches!(words[..], ["create", "table", ..] | ["create", "index", ..] | ["create", "unique", "index"]) {
@@ -634,6 +713,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                     continue;
                 }
             }
+            ';' if in_trigger_body(&cur) => {}
             ';' => {
                 if has_code {
                     out.push(cur.trim().to_string());
@@ -655,6 +735,39 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         out.push(cur.trim().to_string());
     }
     out
+}
+
+/// True while `stmt` is a `CREATE TRIGGER` whose `BEGIN … END` body is not
+/// closed yet, so a `;` belongs to the body.
+fn in_trigger_body(stmt: &str) -> bool {
+    let w = safety::words(stmt);
+    w.first().is_some_and(|f| f == "create")
+        && w.iter().skip(1).take(4).any(|x| x == "trigger")
+        && w.iter().any(|x| x == "begin")
+        && w.last().is_none_or(|x| x != "end")
+}
+
+/// The statements of a script, each with the 1-based line its code starts on.
+/// Comment lines before a statement's code are left out.
+pub fn statements_with_lines(sql: &str) -> Vec<(usize, String)> {
+    let mut from = 0;
+    let mut line = 1;
+    split_statements(sql)
+        .into_iter()
+        .map(|stmt| {
+            // Statements are verbatim slices of the script, so they are found in order.
+            if let Some(i) = sql[from..].find(&stmt) {
+                line += sql[from..from + i].matches('\n').count();
+                from += i;
+            }
+            let comments = stmt.lines().take_while(|l| l.trim().is_empty() || l.trim_start().starts_with("--")).count();
+            let at = line + comments;
+            line += sql[from..from + stmt.len().min(sql.len() - from)].matches('\n').count();
+            from = (from + stmt.len()).min(sql.len());
+            let code = if comments == 0 { stmt } else { stmt.lines().skip(comments).collect::<Vec<_>>().join("\n") };
+            (at, code)
+        })
+        .collect()
 }
 
 /// Remove parentheses that wrap the whole expression: `((a > 1))` → `a > 1`.
@@ -692,6 +805,36 @@ pub fn strip_outer_parens(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::parser::parse;
+
+    #[test]
+    fn splits_triggers_and_counts_lines() {
+        let sql = "-- setup\nCREATE TABLE t (id int);\n\nCREATE TRIGGER tr AFTER INSERT ON t BEGIN\n  DELETE FROM t WHERE id < 0;\n  SELECT 1;\nEND;\n\
+                   /* x */ INSERT INTO t VALUES (1); SELECT\n2;";
+        let s = statements_with_lines(sql);
+        let lines: Vec<usize> = s.iter().map(|(l, _)| *l).collect();
+        assert_eq!(lines, [2, 4, 8, 8]);
+        assert!(s[1].1.ends_with("END"));
+    }
+
+    #[test]
+    fn runs_scripts() {
+        let mut db = Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t");
+        let opts = |transaction, keep_going| ScriptOptions { transaction, keep_going, max_rows: 100 };
+        let mut lines = Vec::new();
+        let script = "CREATE TABLE t (id int unique);\nINSERT INTO t VALUES (1), (2);\nSELECT count(*) FROM t;";
+        let r = db.run_script(script, &opts(false, false), &mut |s| lines.push(s.line)).unwrap();
+        assert_eq!((r.run, r.failed, r.changed, lines), (3, 0, 2, vec![1, 2, 3]));
+
+        // In one transaction, a failure undoes the statements before it.
+        let err = db.run_script("INSERT INTO t VALUES (3);\nINSERT INTO t VALUES (1);", &opts(true, false), &mut |_| {}).unwrap_err();
+        assert!(format!("{err:#}").starts_with("line 2: INSERT INTO t VALUES (1)\nUNIQUE"));
+        assert!(format!("{err:#}").ends_with("(the transaction was rolled back)"));
+        assert_eq!(db.query_value("SELECT count(*) FROM t").unwrap(), Cell::Int(2));
+        // Without, they stay; with keep_going, so do the ones after it.
+        let r = db.run_script("INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (4);", &opts(false, true), &mut |_| {}).unwrap();
+        assert_eq!((r.run, r.failed, r.changed), (2, 1, 1));
+        assert!(db.run_script("BEGIN; SELECT 1; COMMIT;", &opts(true, false), &mut |_| {}).is_err());
+    }
 
     #[test]
     fn splits_statements() {

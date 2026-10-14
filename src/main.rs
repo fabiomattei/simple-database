@@ -97,6 +97,30 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Run a SQL file against a database, one statement at a time
+    ///
+    /// Stops at the first failing statement and reports its line. Results of
+    /// queries are printed. Pass `-` to read the script from stdin.
+    Exec {
+        file: PathBuf,
+        /// SQLite file (created if missing) or postgres:// / mysql:// URL
+        #[arg(long)]
+        db: String,
+        /// Run everything in one transaction, rolled back if a statement fails
+        #[arg(short = '1', long, conflicts_with = "keep_going")]
+        transaction: bool,
+        /// Go on after a failed statement
+        #[arg(short, long = "continue")]
+        keep_going: bool,
+        /// Print each statement's line and outcome
+        #[arg(short, long)]
+        verbose: bool,
+        #[arg(short, long, value_enum, default_value = "table")]
+        format: OutputFormat,
+        /// Run without asking, even if the connection's safe mode would ask
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Insert rows from a CSV, TSV, JSON or JSON Lines file into a table
     ///
     /// File columns are matched to table columns by name (any case); others are
@@ -324,6 +348,48 @@ fn run(cli: Cli) -> Result<()> {
             }
             for r in db.run(&sql)? {
                 println!("{}", output::render(&r, format));
+            }
+        }
+        Command::Exec { file, db, transaction, keep_going, verbose, format, yes } => {
+            let sql = if file.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?
+            };
+            let mut db = db::Database::open(&db)?;
+            let asks = db.needs_confirmation(&sql);
+            if !asks.is_empty() && !yes && !shell::confirm_statements(&asks, db.label())? {
+                bail!("not run");
+            }
+            let started = std::time::Instant::now();
+            let opts = db::ScriptOptions { transaction, keep_going, max_rows: usize::MAX };
+            let report = db.run_script(&sql, &opts, &mut |step| {
+                let first = step.sql.lines().next().unwrap_or_default();
+                match step.result {
+                    Ok(results) => {
+                        if verbose {
+                            let changed: u64 = results.iter().filter_map(|r| r.changes).sum();
+                            let what = if results.iter().any(|r| r.changes.is_none()) { String::new() } else { format!("  ({changed} row(s))") };
+                            eprintln!("\x1b[2mline {}:\x1b[0m {first}{what}", step.line);
+                        }
+                        for r in results.iter().filter(|r| r.changes.is_none()) {
+                            println!("{}", output::render(r, format));
+                        }
+                    }
+                    Err(e) if keep_going => eprintln!("\x1b[31merror\x1b[0m at line {}: {first}\n  {e:#}", step.line),
+                    Err(_) => {}
+                }
+            })?;
+            let failed = if report.failed > 0 { format!(", \x1b[31m{} failed\x1b[0m", report.failed) } else { String::new() };
+            eprintln!(
+                "Ran {} statement(s) on {} in {:.2?}: {} row(s) changed{failed}",
+                report.run,
+                db.label(),
+                started.elapsed(),
+                report.changed
+            );
+            if report.failed > 0 {
+                std::process::exit(1);
             }
         }
         Command::Import { db, file, table, format, yes } => {

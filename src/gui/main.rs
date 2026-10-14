@@ -114,6 +114,7 @@ enum Dialog {
     ConfirmWrite(Box<ConfirmWrite>),
     Import(Box<ImportState>),
     Restore(Box<RestoreState>),
+    RunScript(Box<ScriptState>),
 }
 
 /// A write held back until the user confirms it.
@@ -144,6 +145,32 @@ struct RestoreState {
     clean: bool,
     error: Option<String>,
 }
+
+/// The Run SQL file dialog: a script waiting to run, then its outcome.
+struct ScriptState {
+    path: PathBuf,
+    sql: String,
+    statements: usize,
+    /// Statements the safe mode asks about.
+    asks: Vec<(String, Option<String>)>,
+    transaction: bool,
+    keep_going: bool,
+    outcome: Option<ScriptOutcome>,
+}
+
+struct ScriptOutcome {
+    report: db::ScriptReport,
+    /// Line and message of each failed statement.
+    errors: Vec<(usize, String)>,
+    /// The error that stopped the script.
+    stopped: Option<String>,
+    elapsed: Duration,
+    /// Row-returning results, shown in the Query tab.
+    results: Vec<QueryResult>,
+}
+
+/// Results of a script kept for the Query tab.
+const MAX_SCRIPT_RESULTS: usize = 20;
 
 /// What the Migrate tab makes the open database look like.
 enum MigrateSource {
@@ -587,6 +614,9 @@ impl App {
                 ui.separator();
                 if ui.add_enabled(self.db.is_some(), egui::Button::new("Dump database…")).on_hover_text("Save the schema and all rows as a SQL file").clicked() {
                     self.dump_db();
+                }
+                if ui.add_enabled(self.db.is_some(), egui::Button::new("Run SQL file…")).on_hover_text("Run a .sql script against the open database").clicked() {
+                    self.pick_script();
                 }
                 let writable = self.db.as_ref().is_some_and(|d| d.conn.safe_mode() != SafeMode::ReadOnly);
                 if ui.add_enabled(writable, egui::Button::new("Restore dump…")).on_hover_text("Run a SQL dump file against the open database").clicked() {
@@ -1412,6 +1442,12 @@ impl App {
             };
             explain = ui.button("Explain").on_hover_text(explain_hint).clicked();
             ui.separator();
+            if ui.button("📂 Open…").on_hover_text("Load a .sql file into the editor").clicked()
+                && let Some((path, sql)) = Self::pick_sql_file()
+            {
+                self.query = sql;
+                self.set_status(format!("Loaded {}", path.display()), false);
+            }
             ui.toggle_value(&mut self.show_history, "🕘 History").on_hover_text("Past queries and saved queries");
             if ui.button("💾 Save query…").clicked() {
                 self.save_name = Some(String::new());
@@ -1839,6 +1875,65 @@ impl App {
         }
     }
 
+    fn pick_sql_file() -> Option<(PathBuf, String)> {
+        let path = rfd::FileDialog::new().add_filter("SQL", &["sql"]).add_filter("All files", &["*"]).pick_file()?;
+        let sql = std::fs::read_to_string(&path).ok()?;
+        Some((path, sql))
+    }
+
+    /// Choose a SQL file and open the Run SQL file dialog for it.
+    fn pick_script(&mut self) {
+        let Some((path, sql)) = Self::pick_sql_file() else { return };
+        let Some(db) = &self.db else { return };
+        let statements = db::split_statements(&sql).len();
+        if statements == 0 {
+            self.set_status(format!("{} has no SQL statements", path.display()), true);
+            return;
+        }
+        let asks = db.conn.needs_confirmation(&sql).into_iter().map(|(s, k)| (s, if let simple_database::safety::Kind::Dangerous(why) = k { Some(why) } else { None }))
+            .collect();
+        self.dialog = Some(Dialog::RunScript(Box::new(ScriptState {
+            path,
+            sql,
+            statements,
+            asks,
+            transaction: false,
+            keep_going: false,
+            outcome: None,
+        })));
+    }
+
+    fn run_script(&mut self, st: &ScriptState) -> ScriptOutcome {
+        let started = Instant::now();
+        let opts = db::ScriptOptions { transaction: st.transaction, keep_going: st.keep_going, max_rows: MAX_QUERY_ROWS };
+        let mut errors = Vec::new();
+        let mut results = Vec::new();
+        // What ran, also when the script stops with an error.
+        let mut done = db::ScriptReport { statements: st.statements, ..Default::default() };
+        let res = match &mut self.db {
+            Some(db) => db.conn.run_script(&st.sql, &opts, &mut |step| {
+                done.run += 1;
+                match step.result {
+                    Ok(rs) => {
+                        done.changed += rs.iter().filter_map(|r| r.changes).sum::<u64>();
+                        results.extend(rs.iter().filter(|r| r.changes.is_none()).cloned());
+                    }
+                    Err(e) => errors.push((step.line, format!("{}\n  {e:#}", step.sql.lines().next().unwrap_or_default()))),
+                }
+            }),
+            None => Err(anyhow::anyhow!("no database open")),
+        };
+        if results.len() > MAX_SCRIPT_RESULTS {
+            results.drain(..results.len() - MAX_SCRIPT_RESULTS);
+        }
+        let (report, stopped) = match res {
+            Ok(r) => (r, None),
+            Err(e) => (done, Some(format!("{e:#}"))),
+        };
+        self.refresh_db();
+        ScriptOutcome { report, errors, stopped, elapsed: started.elapsed(), results }
+    }
+
     fn tab_seed(&mut self, ui: &mut egui::Ui) {
         let Some(db) = &self.db else {
             empty_state(ui, "No database open", "Open a SQLite database or connect to a server to fill it with fake data.");
@@ -2252,6 +2347,93 @@ impl App {
                     Some(false) => {}
                     None if resp.should_close() => {}
                     None => self.dialog = Some(Dialog::Restore(st)),
+                }
+                return;
+            }
+            Dialog::RunScript(_) => {
+                let Some(Dialog::RunScript(mut st)) = self.dialog.take() else { unreachable!() };
+                let mut run = false;
+                let mut show_results = false;
+                let mut close = false;
+                let (label, dialect) = match &self.db {
+                    Some(d) => (d.conn.label().to_string(), d.conn.dialect()),
+                    None => (String::new(), Dialect::Sqlite),
+                };
+                let resp = egui::Modal::new(egui::Id::new("run_script")).show(ctx, |ui| {
+                    ui.set_width(560.0);
+                    ui.heading(format!("Run SQL file on {label}"));
+                    ui.label(RichText::new(st.path.display().to_string()).monospace().small().weak());
+                    ui.add_space(6.0);
+                    match &st.outcome {
+                        None => {
+                            ui.label(format!("{} statement(s).", st.statements));
+                            ui.checkbox(&mut st.transaction, "Run in one transaction (roll back everything if a statement fails)");
+                            if st.transaction && dialect == Dialect::Mysql {
+                                ui.colored_label(warn_color(ui), "⚠ MySQL commits CREATE, ALTER and DROP immediately, even inside a transaction.");
+                            }
+                            ui.add_enabled_ui(!st.transaction, |ui| {
+                                ui.checkbox(&mut st.keep_going, "Continue after a failed statement");
+                            });
+                            if !st.asks.is_empty() {
+                                ui.add_space(4.0);
+                                ui.colored_label(warn_color(ui), format!("Safe mode: {} statement(s) change the database, for example:", st.asks.len()));
+                                for (stmt, why) in st.asks.iter().take(5) {
+                                    let first = stmt.lines().next().unwrap_or_default();
+                                    match why {
+                                        Some(why) => ui.colored_label(error_color(ui), format!("{first}  ({why})")),
+                                        None => ui.label(RichText::new(first).monospace()),
+                                    };
+                                }
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                run = ui.button(RichText::new("▶ Run").strong()).clicked();
+                                close = ui.button("Cancel").clicked();
+                            });
+                        }
+                        Some(out) => {
+                            let r = &out.report;
+                            let summary = format!(
+                                "Ran {} of {} statement(s) in {:.2?}: {} row(s) changed.",
+                                r.run, r.statements, out.elapsed, r.changed
+                            );
+                            if out.stopped.is_none() && out.errors.is_empty() {
+                                ui.colored_label(ok_color(ui), format!("✔ {summary}"));
+                            } else {
+                                ui.label(summary);
+                            }
+                            if let Some(e) = &out.stopped {
+                                ui.colored_label(error_color(ui), format!("✖ Stopped at {e}"));
+                            } else if !out.errors.is_empty() {
+                                ui.colored_label(error_color(ui), format!("✖ {} statement(s) failed:", out.errors.len()));
+                                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                    for (line, e) in &out.errors {
+                                        ui.label(RichText::new(format!("line {line}: {e}")).monospace().small());
+                                    }
+                                });
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if !out.results.is_empty() {
+                                    show_results = ui.button(format!("Show {} result(s)", out.results.len())).clicked();
+                                }
+                                close = ui.button("Close").clicked();
+                            });
+                        }
+                    }
+                });
+                if run {
+                    st.outcome = Some(self.run_script(&st));
+                    let out = st.outcome.as_ref().unwrap();
+                    let failed = out.stopped.is_some() || !out.errors.is_empty();
+                    self.set_status(format!("Ran {} on {label}{}", st.path.display(), if failed { " with errors" } else { "" }), failed);
+                }
+                if show_results && let Some(out) = st.outcome.take() {
+                    let selected = out.results.len() - 1;
+                    self.query_out = Some(QueryOutput { results: Ok(out.results), elapsed: out.elapsed, selected });
+                    self.tab = Tab::Query;
+                } else if run || !(close || resp.should_close()) {
+                    self.dialog = Some(Dialog::RunScript(st));
                 }
                 return;
             }

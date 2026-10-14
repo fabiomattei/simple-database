@@ -7,7 +7,7 @@
 //! transaction, and other tools (`sqlite3`, `psql`, `mysql`) can run it as is.
 
 use crate::data::literal;
-use crate::db::{Database, split_statements, strip_sql_comments};
+use crate::db::{Database, is_transaction_control, statements_with_lines, strip_sql_comments};
 use crate::ddl::{self, Dialect, quote};
 use crate::schema::*;
 use anyhow::{Context, Result, bail};
@@ -144,18 +144,11 @@ impl Restore {
 /// (as in `sqlite3 .dump` output) are dropped, since [`restore`] runs
 /// everything in its own transaction.
 pub fn prepare(db: &mut Database, sql: &str) -> Result<Restore> {
-    let statements: Vec<String> = split_statements(sql)
+    // Without leading comments (the dump header, table notes), which only clutter error messages.
+    let statements: Vec<String> = statements_with_lines(sql)
         .into_iter()
-        .filter(|s| {
-            let w = first_words(s, 2);
-            let w: Vec<&str> = w.iter().map(String::as_str).collect();
-            !matches!(w[..], [] | ["begin" | "commit" | "end" | "rollback", ..] | ["start", "transaction"])
-        })
-        // Leading comment lines (the dump header, table notes) only clutter error messages.
-        .map(|s| {
-            let code = s.lines().skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with("--"));
-            code.collect::<Vec<_>>().join("\n")
-        })
+        .map(|(_, s)| s)
+        .filter(|s| !is_transaction_control(s))
         .collect();
     if statements.is_empty() {
         bail!("the file has no SQL statements");
@@ -348,6 +341,14 @@ mod tests {
         assert_eq!(r.statements.len(), 3);
         assert_eq!(r.creates, ["Items"]);
         assert_eq!(restore(&mut dst, &r, false).unwrap(), 1);
+
+        let text = "CREATE TABLE t (id int);\nCREATE TABLE log (msg text);\n\
+                    CREATE TRIGGER tr AFTER INSERT ON t BEGIN\n  INSERT INTO log VALUES ('a');\n  INSERT INTO log VALUES ('b');\nEND;\n\
+                    INSERT INTO t VALUES (1);";
+        let r = prepare(&mut dst, text).unwrap();
+        assert_eq!(r.statements.len(), 4);
+        restore(&mut dst, &r, false).unwrap();
+        assert_eq!(rows(&mut dst, "SELECT count(*) FROM log"), [[Cell::Int(2)]]);
     }
 
     #[test]

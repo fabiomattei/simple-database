@@ -101,7 +101,7 @@ pub fn classify_all(sql: &str) -> Vec<(String, Kind)> {
 }
 
 /// Lowercased words outside comments, quoted strings and quoted identifiers.
-fn words(stmt: &str) -> Vec<String> {
+pub(crate) fn words(stmt: &str) -> Vec<String> {
     let chars: Vec<char> = stmt.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
