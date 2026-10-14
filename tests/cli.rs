@@ -416,3 +416,26 @@ fn check_finds_orphaned_rows() {
     let out = s.fails(&["check", "schema.dbs", "--db", "app.db", "--sample", "0"]);
     assert!(out.contains("4 tables") && out.contains("1 with problems") && !out.contains("999"), "{out}");
 }
+
+#[test]
+fn colors_only_on_a_terminal_or_when_forced() {
+    let s = Scratch::new("colors");
+    // A warning (stdout, from check) and the changes of a dry run (stderr).
+    std::fs::write(s.path("schema.dbs"), "table a { id int pk }\ntable b { id int pk\n a_id int -> a.id }\n").unwrap();
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sdb"));
+        cmd.args(args).current_dir(&s.0).env("SDB_CONFIG_DIR", s.0.join("config")).env_remove("NO_COLOR").env_remove("CLICOLOR_FORCE");
+        let out = cmd.envs(env.iter().copied()).output().unwrap();
+        (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let escape = |(out, err): &(String, String)| (out.contains('\x1b'), err.contains('\x1b'));
+    for args in [&["check", "schema.dbs"][..], &["push", "schema.dbs", "--db", "app.db", "--dry-run"]] {
+        let stream = if args[0] == "check" { 0 } else { 1 };
+        let pick = |c: (bool, bool)| if stream == 0 { c.0 } else { c.1 };
+        let piped = run(args, &[]);
+        assert!(piped.0.contains("warning") || piped.1.contains("+ table a"), "{piped:?}");
+        assert!(!pick(escape(&piped)), "piped output has no colors: {piped:?}");
+        assert!(pick(escape(&run(args, &[("CLICOLOR_FORCE", "1")]))), "CLICOLOR_FORCE colors it");
+        assert!(!pick(escape(&run(args, &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")]))), "NO_COLOR wins");
+    }
+}

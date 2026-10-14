@@ -1,7 +1,7 @@
 //! Interactive SQL shell.
 
 use crate::diagram::{self, DiagramFormat};
-use crate::output::{self, OutputFormat};
+use crate::output::{self, OutputFormat, Paint};
 use crate::db::Database;
 use crate::safety::{Kind, SafeMode};
 use crate::{ddl, format, validate};
@@ -229,7 +229,7 @@ pub fn confirm(question: &str) -> Result<bool> {
 
 /// List the statements safe mode wants confirmed and ask.
 pub fn confirm_statements(stmts: &[(String, Kind)], database: &str) -> Result<bool> {
-    eprintln!("\x1b[33mSafe mode:\x1b[0m {} statement(s) change {database}:", stmts.len());
+    eprintln!("{} {} statement(s) change {database}:", Paint::Yellow.err("Safe mode:"), stmts.len());
     const SHOWN: usize = 20;
     if stmts.len() > SHOWN {
         eprintln!("  … the first {SHOWN}:");
@@ -237,7 +237,7 @@ pub fn confirm_statements(stmts: &[(String, Kind)], database: &str) -> Result<bo
     for (s, k) in stmts.iter().take(SHOWN) {
         let first = s.lines().next().unwrap_or_default();
         match k {
-            Kind::Dangerous(why) => eprintln!("  \x1b[31m{first}\x1b[0m  ({why})"),
+            Kind::Dangerous(why) => eprintln!("  {}  ({why})", Paint::Red.err(first)),
             _ => eprintln!("  {first}"),
         }
     }

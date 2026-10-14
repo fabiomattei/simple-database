@@ -262,6 +262,9 @@ certificate comes from a private CA, pass it with `sslrootcert`:
 | `sdb conn remove NAME` | Delete a saved connection |
 | `sdb conn test NAME` | Connect and report how many tables there are |
 
+Output is colored only on a terminal: piped or redirected output is plain text. `NO_COLOR=1`
+turns colors off everywhere, `CLICOLOR_FORCE=1` keeps them when piped.
+
 ### Saved connections
 
 Connections saved in the app or with `sdb conn add` are shared by both, and `@name` works

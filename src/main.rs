@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use simple_database::ddl::Dialect;
 use simple_database::diagram::DiagramFormat;
-use simple_database::output::OutputFormat;
+use simple_database::output::{OutputFormat, Paint};
 use simple_database::schema::Schema;
 use simple_database::*;
 use std::path::{Path, PathBuf};
@@ -282,7 +282,7 @@ use simple_database::STARTER_SCHEMA as STARTER;
 
 fn main() {
     if let Err(e) = run(Cli::parse()) {
-        eprintln!("error: {e:#}");
+        eprintln!("{} {e:#}", Paint::Red.err("error:"));
         std::process::exit(1);
     }
 }
@@ -398,7 +398,7 @@ fn run(cli: Cli) -> Result<()> {
             print_changes(&m);
             let problems = db.preflight(&m);
             for p in &problems {
-                eprintln!("\x1b[31merror:\x1b[0m {p}");
+                eprintln!("{} {p}", Paint::Red.err("error:"));
             }
             if dry_run {
                 print!("\n{}", m.script());
@@ -417,7 +417,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Pull { db, output } => {
             let (s, skipped) = open_existing(&db)?.introspect_with_skipped()?;
             if !skipped.is_empty() {
-                eprintln!("\x1b[33mwarning:\x1b[0m {} object(s) not pulled; they are listed at the top of the schema", skipped.len());
+                eprintln!("{} {} object(s) not pulled; they are listed at the top of the schema", Paint::Yellow.err("warning:"), skipped.len());
             }
             emit(output.as_deref(), &format::note_skipped(&format::format_schema(&s), &skipped))?;
         }
@@ -451,17 +451,17 @@ fn run(cli: Cli) -> Result<()> {
                         if verbose {
                             let changed: u64 = results.iter().filter_map(|r| r.changes).sum();
                             let what = if results.iter().any(|r| r.changes.is_none()) { String::new() } else { format!("  ({changed} row(s))") };
-                            eprintln!("\x1b[2mline {}:\x1b[0m {first}{what}", step.line);
+                            eprintln!("{} {first}{what}", Paint::Dim.err(format!("line {}:", step.line)));
                         }
                         for r in results.iter().filter(|r| r.changes.is_none()) {
                             println!("{}", output::render(r, format));
                         }
                     }
-                    Err(e) if keep_going => eprintln!("\x1b[31merror\x1b[0m at line {}: {first}\n  {e:#}", step.line),
+                    Err(e) if keep_going => eprintln!("{} at line {}: {first}\n  {e:#}", Paint::Red.err("error"), step.line),
                     Err(_) => {}
                 }
             })?;
-            let failed = if report.failed > 0 { format!(", \x1b[31m{} failed\x1b[0m", report.failed) } else { String::new() };
+            let failed = if report.failed > 0 { format!(", {}", Paint::Red.err(format!("{} failed", report.failed))) } else { String::new() };
             eprintln!(
                 "Ran {} statement(s) on {} in {:.2?}: {} row(s) changed{failed}",
                 report.run,
@@ -487,10 +487,10 @@ fn run(cli: Cli) -> Result<()> {
             let cols: Vec<&str> = plan.mapping.iter().map(|(_, c)| c.as_str()).collect();
             eprintln!("{} row(s) into {table} ({})", rows.rows.len(), cols.join(", "));
             if !plan.skipped.is_empty() {
-                eprintln!("\x1b[33mskipped:\x1b[0m {} (not in {table})", plan.skipped.join(", "));
+                eprintln!("{} {} (not in {table})", Paint::Yellow.err("skipped:"), plan.skipped.join(", "));
             }
             if !plan.missing.is_empty() {
-                eprintln!("\x1b[33mwarning:\x1b[0m {} need a value but the file has no such column", plan.missing.join(", "));
+                eprintln!("{} {} need a value but the file has no such column", Paint::Yellow.err("warning:"), plan.missing.join(", "));
             }
             if db.confirms_writes() && !yes && !confirm(&format!("Import into {}?", db.label()))? {
                 bail!("not imported");
@@ -539,10 +539,10 @@ fn run(cli: Cli) -> Result<()> {
                 if !clean {
                     bail!("{} already has {}; use --clean to drop them first", db.label(), r.existing.join(", "));
                 }
-                eprintln!("\x1b[31mwill drop:\x1b[0m {}", r.existing.join(", "));
+                eprintln!("{} {}", Paint::Red.err("will drop:"), r.existing.join(", "));
             }
             if db.dialect() == Dialect::Mysql {
-                eprintln!("\x1b[33mwarning:\x1b[0m MySQL commits each CREATE/DROP, so a failure leaves earlier statements applied");
+                eprintln!("{} MySQL commits each CREATE/DROP, so a failure leaves earlier statements applied", Paint::Yellow.err("warning:"));
             }
             let asks = (clean && !r.existing.is_empty()) || db.confirms_writes();
             if asks && !yes && !confirm(&format!("Restore {} into {}?", file.display(), db.label()))? {
@@ -632,7 +632,7 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
             for f in &found {
                 let known = store.connections.iter().any(|c| db::redact(&c.target(None)) == db::redact(&f.target));
                 let note = if known { "  (already saved)" } else { "" };
-                println!("{:<24} {}  \x1b[2m{}\x1b[0m{note}", f.name, db::redact(&f.target), f.source);
+                println!("{:<24} {}  {}{note}", f.name, db::redact(&f.target), Paint::Dim.out(&f.source));
                 if save && !known {
                     let (mut conn, _) = connections::Connection::from_target(&store.unique_name(&f.name), &f.target)?;
                     conn.group = dir.canonicalize()?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -702,7 +702,7 @@ fn open_existing(target: &str) -> Result<db::Database> {
 fn open_db(target: &str) -> Result<db::Database> {
     let db = db::Database::open(target)?;
     if let Some(w) = db.tls_warning() {
-        eprintln!("\x1b[33mwarning:\x1b[0m {w}");
+        eprintln!("{} {w}", Paint::Yellow.err("warning:"));
     }
     Ok(db)
 }
@@ -728,13 +728,13 @@ fn emit(output: Option<&Path>, text: &str) -> Result<()> {
 fn print_integrity(r: &integrity::Report) {
     for o in &r.problems {
         match &o.error {
-            Some(e) => println!("\x1b[31merror\x1b[0m {}: {e}", o.describe()),
-            None => println!("\x1b[31m{} orphaned row(s)\x1b[0m in {}", o.count, o.describe()),
+            Some(e) => println!("{} {}: {e}", Paint::Red.out("error"), o.describe()),
+            None => println!("{} in {}", Paint::Red.out(format!("{} orphaned row(s)", o.count)), o.describe()),
         }
         if let Some(sample) = &o.sample {
             println!("{}", output::render(sample, OutputFormat::Table));
             if o.count > sample.rows.len() as i64 {
-                println!("\x1b[2m… and {} more\x1b[0m", o.count - sample.rows.len() as i64);
+                println!("{}", Paint::Dim.out(format!("… and {} more", o.count - sample.rows.len() as i64)));
             }
         }
     }
@@ -777,15 +777,15 @@ fn write_framework_migration(g: framework::Generated, output: Option<&Path>) -> 
 
 fn print_changes(m: &diff::Migration) {
     for c in &m.changes {
-        let color = match c.chars().next() {
-            Some('+') => "32",
-            Some('-') => "31",
-            _ => "33",
+        let paint = match c.chars().next() {
+            Some('+') => Paint::Green,
+            Some('-') => Paint::Red,
+            _ => Paint::Yellow,
         };
-        eprintln!("\x1b[{color}m{c}\x1b[0m");
+        eprintln!("{}", paint.err(c));
     }
     for w in &m.warnings {
-        eprintln!("\x1b[33mwarning:\x1b[0m {w}");
+        eprintln!("{} {w}", Paint::Yellow.err("warning:"));
     }
 }
 

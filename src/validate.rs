@@ -1,5 +1,6 @@
 //! Semantic checks: errors make the schema unusable, warnings flag questionable design.
 
+use crate::output::Paint;
 use crate::schema::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,13 +181,13 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
 
 pub fn print_issues(issues: &[Issue]) {
     if issues.is_empty() {
-        println!("\x1b[32m✓ no issues found\x1b[0m");
+        println!("{}", Paint::Green.out("✓ no issues found"));
         return;
     }
     for i in issues {
         let label = match i.severity {
-            Severity::Error => "\x1b[31merror\x1b[0m",
-            Severity::Warning => "\x1b[33mwarning\x1b[0m",
+            Severity::Error => Paint::Red.out("error"),
+            Severity::Warning => Paint::Yellow.out("warning"),
         };
         println!("{label} [{}]: {}", i.location, i.message);
     }

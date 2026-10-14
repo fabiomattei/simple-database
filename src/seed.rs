@@ -7,6 +7,7 @@
 
 use crate::db::{Cell as Value, Database};
 use crate::ddl::{Dialect, quote};
+use crate::output::Paint;
 use crate::schema::*;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -37,7 +38,7 @@ pub fn print_reports(reports: &[TableReport]) {
         println!("(no tables)");
     }
     for r in reports {
-        let note = r.note.as_deref().map_or(String::new(), |n| format!("  \x1b[33m{n}\x1b[0m"));
+        let note = r.note.as_deref().map_or(String::new(), |n| format!("  {}", Paint::Yellow.out(n)));
         println!("{:<30} {:>6} / {:<6}{note}", r.table, r.inserted, r.requested);
     }
 }

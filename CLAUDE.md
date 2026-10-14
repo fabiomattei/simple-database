@@ -67,7 +67,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `tls.rs` | TLS for both servers from libpq-style URL parameters (`sslmode`, default `prefer`; `sslrootcert`, `sslcert`, `sslkey`). `split_url` strips them before the URL reaches the driver; `client_config` builds the rustls config. `warning` flags remote hosts whose certificate isn't verified (`Database::tls_warning`; the CLI prints it, the GUI status bar shows it); `explain` adds advice to certificate errors |
 | `seed.rs` | Fake data. Seedable SplitMix64 RNG (no `rand` crate), heuristics based on column names. Multi-row INSERTs of `BATCH` rows (in a savepoint on Postgres); a rejected batch is retried row by row, keeping the rows that fit. Self-referencing tables go row by row |
 | `shell.rs` | CLI REPL (rustyline) and its `.meta` commands; line history in `config_dir()/shell_history`, 0600 on Unix |
-| `output.rs` | CLI table / csv / json / markdown rendering (comfy-table 8: `load_style`, not `load_preset`); `export` to files (adds TSV, JSONL, HTML, SQL INSERTs) |
+| `output.rs` | `Paint`: CLI colors, only on a terminal. CLI table / csv / json / markdown rendering (comfy-table 8: `load_style`, not `load_preset`); `export` to files (adds TSV, JSONL, HTML, SQL INSERTs) |
 
 Binaries:
 
@@ -215,7 +215,9 @@ code portable by construction, and let CI confirm it:
   Ctrl elsewhere), not `ctrl`, unless the key really is Ctrl on every platform.
 - **No external programs**: don't shell out to `sh`, `which`, `open`, `xdg-open` and the like.
   Use crates that cover all three (e.g. `rfd` for file dialogs).
-- **Terminal output** uses ANSI colors, which Windows 10+ terminals render. Don't rely on a Unix
+- **Terminal output** uses ANSI colors, which Windows 10+ terminals render, always through
+  `output::Paint` (`.out` / `.err` for the stream it goes to): plain when piped, `NO_COLOR` /
+  `CLICOLOR_FORCE` honored. Never write `\x1b[` codes directly. Don't rely on a Unix
   terminal for anything else (signals, `isatty` tricks, raw mode outside rustyline).
 - **Tests** follow the same rules: build paths with `join` and `temp_dir()`, wrap Unix-only
   assertions (file modes) in `#[cfg(unix)]`. `tests/cli.rs` sets `HOME` and `SDB_CONFIG_DIR` to
