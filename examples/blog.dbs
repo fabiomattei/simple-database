@@ -2,23 +2,25 @@
 #
 # column syntax:  name  type  [modifiers...]
 #   types:      int bigint smallint real decimal(p,s) bool text varchar(n)
-#               date time timestamp blob uuid json
+#               date time timestamp blob uuid json enum('a', 'b')
 #               others as written, quoted if several words: "int unsigned"
 #   modifiers:  pk  autoincrement  unique  not null  default <value>
 #               check (<expr>)  -> table.column  on delete|update <action>
 #               was <old_name>  (renamed: migrations rename instead of drop + add)
+#               comment 'text'
 #   actions:    cascade  set_null  set_default  restrict  no_action
 #   defaults:   'text'  42  true  null  now  (any sql expression)
 #
 # table-level:  index (a, b)   unique index name (a, b)   pk (a, b)
-# renamed table:  table new_name was old_name { ... }
+#               fk (a, b) -> table (x, y)  on delete|update <action>
+# table:        table name was old_name comment 'text' { ... }  (was, comment optional)
 
-table users {
-  id          int           pk autoincrement
-  email       varchar(255)  unique not null
-  name        text          not null
-  role        text          not null default 'author' check (role in ('author', 'editor', 'admin'))
-  created_at  timestamp     not null default now
+table users comment 'People who can sign in' {
+  id          int                                pk autoincrement
+  email       varchar(255)                       unique not null
+  name        text                               not null
+  role        enum('author', 'editor', 'admin')  not null default 'author'
+  created_at  timestamp                          not null default now comment 'When the account was made'
 }
 
 table posts {

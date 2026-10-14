@@ -1287,10 +1287,17 @@ fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
         match c {
             ')' => parens += 1,
             '(' if parens == 0 => {
-                // Inside `index (…)`, `pk (…)` or `check (…)`: this table's columns.
+                // Inside `-> posts (…)`: that table's columns. Inside `index (…)`,
+                // `pk (…)`, `fk (…)` or `check (…)`: this table's.
                 let text: String = before.iter().collect();
-                let table = parser::outline(&text).pop().filter(|_| depth > 0);
-                let cols = table.and_then(|t| vocab.columns_of(&t.name).map(<[String]>::to_vec)).unwrap_or_default();
+                let head: String = before[..i - 1].iter().collect();
+                let mut back = head.split_whitespace().rev();
+                let target = match (back.next(), back.next()) {
+                    (Some(t), Some(w)) if w.ends_with("->") || w.eq_ignore_ascii_case("references") => Some(t.to_string()),
+                    _ => None,
+                };
+                let table = target.or_else(|| parser::outline(&text).pop().map(|t| t.name)).filter(|_| depth > 0);
+                let cols = table.and_then(|t| vocab.columns_of(&t).map(<[String]>::to_vec)).unwrap_or_default();
                 return cols.into_iter().map(|text| Candidate { text, kind: Kind::Column, snippet: None }).collect();
             }
             '(' => parens -= 1,
@@ -1309,20 +1316,33 @@ fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
     }
     let first = lower.first().map(String::as_str);
     let table_level = match first {
-        Some("unique" | "pk" | "primary") => true,
+        Some("unique" | "pk" | "primary" | "fk" | "foreign") => true,
         // `index name (…)`, not a column called "index".
         Some("index") => lower.get(1).is_some_and(|w| !DBS_TYPES.contains(&w.split('(').next().unwrap_or_default())),
         _ => false,
     };
     if table_level {
+        let last = lower.last().map_or("", String::as_str);
+        let has_ref = has("->") || has("references");
         return match (first, lower.len()) {
             (Some("unique"), 1) => words(&["index"], Kind::Keyword),
-            (Some("primary"), 1) => words(&["key"], Kind::Keyword),
+            (Some("primary" | "foreign"), 1) => words(&["key"], Kind::Keyword),
+            // `fk (a, b) -> table (x, y) on delete …`
+            (Some("fk" | "foreign"), _) => match last {
+                "->" | "references" => vocab.tables.iter().map(|(t, _)| Candidate { text: t.clone(), kind: Kind::Table, snippet: None }).collect(),
+                "on" => words(&["delete", "update"], Kind::Keyword),
+                "delete" | "update" => words(&["cascade", "set_null", "set_default", "restrict", "no_action"], Kind::Keyword),
+                _ if has_ref && last.ends_with(')') => {
+                    let list: Vec<&str> = [("on delete", has("delete")), ("on update", has("update"))].into_iter().filter(|(_, used)| !used).map(|(w, _)| w).collect();
+                    words(&list, Kind::Keyword)
+                }
+                _ => vec![],
+            },
             _ => vec![],
         };
     }
     match lower.len() {
-        0 => return words(&["index", "unique index", "pk"], Kind::Keyword),
+        0 => return words(&["index", "unique index", "pk", "fk"], Kind::Keyword),
         1 => return words(DBS_TYPES, Kind::Type),
         _ => {}
     }
@@ -1338,7 +1358,7 @@ fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
         "delete" | "update" if prev == Some("on") => words(&["cascade", "set_null", "set_default", "restrict", "no_action"], Kind::Keyword),
         "default" => words(&["now", "true", "false", "null"], Kind::Keyword),
         "not" => words(&["null"], Kind::Keyword),
-        "check" | "set" | "no" | "was" => vec![],
+        "check" | "set" | "no" | "was" | "comment" => vec![],
         _ => {
             let has_ref = has("->") || has("references") || has("ref");
             let mut list = Vec::new();
@@ -1351,6 +1371,7 @@ fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
                 ("default", has("default")),
                 ("check", has("check")),
                 ("was", has("was")),
+                ("comment", has("comment")),
                 ("on delete", !has_ref || has("delete")),
                 ("on update", !has_ref || has("update")),
             ] {
@@ -1560,6 +1581,11 @@ bx");
         let sel = accept(&mut text, 0, 3, &c[0]);
         assert_eq!(char_slice(&text, sel.0, sel.1), "name");
         assert!(at("table x {\n}\ntable y").is_empty());
+        // Multi-column foreign keys: the referenced table's columns in its list.
+        assert_eq!(names(&at("table x {\n  a int\n  fk (a) -> po")), vec!["posts"]);
+        assert_eq!(names(&at("table x {\n  a int\n  fk (a) -> posts (ti")), vec!["title"]);
+        assert_eq!(names(&at("table x {\n  a int\n  fk (a) -> posts (id) o")), vec!["on delete", "on update"]);
+        assert_eq!(names(&at("table x {\n  x int not null com")), vec!["comment"]);
     }
 
     fn press(key: Key, modifiers: Modifiers) -> Event {

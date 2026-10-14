@@ -18,6 +18,9 @@ pub enum DataType {
     Blob,
     Uuid,
     Json,
+    /// One of a fixed list of strings: `enum('a', 'b')`. A native type on
+    /// Postgres and MySQL, a checked TEXT on SQLite.
+    Enum(Vec<String>),
     /// A type we don't know about; passed through verbatim.
     Custom(String),
 }
@@ -58,6 +61,11 @@ impl DataType {
             "blob" | "bytes" | "bytea" | "binary" => DataType::Blob,
             "uuid" => DataType::Uuid,
             "json" | "jsonb" => DataType::Json,
+            // The values keep their case: `lower` is only for the name.
+            "enum" => match lower.find('(').and_then(|i| enum_values(&s.trim()[i + 1..lower.len() - 1])) {
+                Some(values) => DataType::Enum(values),
+                None => DataType::Custom(s.trim().to_string()),
+            },
             _ => DataType::Custom(s.trim().to_string()),
         }
     }
@@ -85,9 +93,49 @@ impl fmt::Display for DataType {
             DataType::Blob => write!(f, "blob"),
             DataType::Uuid => write!(f, "uuid"),
             DataType::Json => write!(f, "json"),
+            DataType::Enum(values) => write!(f, "enum({})", string_list(values)),
             DataType::Custom(s) => write!(f, "{s}"),
         }
     }
+}
+
+/// The values of `enum(...)`: quoted strings (`''` escapes a quote) or bare
+/// words, separated by commas. `None` if empty or malformed.
+fn enum_values(list: &str) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    let mut chars = list.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut v = String::new();
+        if chars.next_if_eq(&'\'').is_some() {
+            loop {
+                match chars.next()? {
+                    '\'' if chars.next_if_eq(&'\'').is_some() => v.push('\''),
+                    '\'' => break,
+                    c => v.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.') {
+                v.push(c);
+            }
+            if v.is_empty() {
+                return None;
+            }
+        }
+        values.push(v);
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => return Some(values),
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
+}
+
+/// `'a', 'b'`: strings as SQL literals, comma separated.
+pub fn string_list(values: &[String]) -> String {
+    values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +229,8 @@ pub struct Column {
     /// Earlier names (`was old_name`), oldest first: hints that let a
     /// migration rename the column instead of dropping it.
     pub was: Vec<String>,
+    /// `comment '...'`; never empty.
+    pub comment: Option<String>,
 }
 
 impl Column {
@@ -196,7 +246,33 @@ impl Column {
             references: None,
             check: None,
             was: vec![],
+            comment: None,
         }
+    }
+}
+
+/// A foreign key over several columns: `fk (a, b) -> t (x, y)`. One over a
+/// single column is always kept as that column's `references`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableForeignKey {
+    pub columns: Vec<String>,
+    pub table: String,
+    pub ref_columns: Vec<String>,
+    pub on_delete: RefAction,
+    pub on_update: RefAction,
+}
+
+impl TableForeignKey {
+    /// A column's single-column foreign key in the same shape.
+    pub fn of_column(c: &Column) -> Option<TableForeignKey> {
+        let fk = c.references.as_ref()?;
+        Some(TableForeignKey {
+            columns: vec![c.name.clone()],
+            table: fk.table.clone(),
+            ref_columns: vec![fk.column.clone()],
+            on_delete: fk.on_delete,
+            on_update: fk.on_update,
+        })
     }
 }
 
@@ -215,8 +291,12 @@ pub struct Table {
     /// declared inline on a single column.
     pub composite_pk: Vec<String>,
     pub indexes: Vec<Index>,
+    /// Multi-column foreign keys.
+    pub foreign_keys: Vec<TableForeignKey>,
     /// Earlier names of the table, like `Column::was`.
     pub was: Vec<String>,
+    /// `comment '...'`; never empty.
+    pub comment: Option<String>,
 }
 
 /// Records a rename from `old` to `new` in a list of earlier names.
@@ -228,8 +308,22 @@ pub fn note_rename(was: &mut Vec<String>, old: &str, new: &str) {
 }
 
 impl Table {
+    pub fn new(name: impl Into<String>) -> Self {
+        Table { name: name.into(), columns: vec![], composite_pk: vec![], indexes: vec![], foreign_keys: vec![], was: vec![], comment: None }
+    }
+
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// Every foreign key: the columns' own, then the multi-column ones.
+    pub fn all_foreign_keys(&self) -> Vec<TableForeignKey> {
+        self.columns.iter().filter_map(TableForeignKey::of_column).chain(self.foreign_keys.iter().cloned()).collect()
+    }
+
+    /// Whether `column` is part of any foreign key.
+    pub fn is_foreign_key(&self, column: &str) -> bool {
+        self.column(column).is_some_and(|c| c.references.is_some()) || self.foreign_keys.iter().any(|fk| fk.columns.iter().any(|c| c == column))
     }
 
     /// All primary key column names, whether declared inline or composite.
@@ -271,9 +365,12 @@ impl Schema {
         for fk in self.foreign_keys_mut().filter(|fk| fk.table == old) {
             fk.table = new.to_string();
         }
+        for fk in self.tables.iter_mut().flat_map(|t| &mut t.foreign_keys).filter(|fk| fk.table == old) {
+            fk.table = new.to_string();
+        }
     }
 
-    /// Drops a table; columns that referenced it lose their foreign key.
+    /// Drops a table; foreign keys that referenced it go too.
     pub fn drop_table(&mut self, name: &str) {
         self.tables.retain(|t| t.name != name);
         for c in self.tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
@@ -281,32 +378,49 @@ impl Schema {
                 c.references = None;
             }
         }
+        for t in &mut self.tables {
+            t.foreign_keys.retain(|fk| fk.table != name);
+        }
     }
 
     /// Renames a column, in its table's key and indexes and in the foreign keys
     /// that point at it.
     pub fn rename_column(&mut self, table: &str, old: &str, new: &str) {
         let Some(t) = self.table_mut(table) else { return };
-        let names = t.columns.iter_mut().map(|c| &mut c.name).chain(&mut t.composite_pk).chain(t.indexes.iter_mut().flat_map(|i| i.columns.iter_mut()));
+        let names = t
+            .columns
+            .iter_mut()
+            .map(|c| &mut c.name)
+            .chain(&mut t.composite_pk)
+            .chain(t.indexes.iter_mut().flat_map(|i| i.columns.iter_mut()))
+            .chain(t.foreign_keys.iter_mut().flat_map(|fk| fk.columns.iter_mut()));
         for n in names.filter(|n| *n == old) {
             *n = new.to_string();
         }
         for fk in self.foreign_keys_mut().filter(|fk| fk.table == table && fk.column == old) {
             fk.column = new.to_string();
         }
+        let targets = self.tables.iter_mut().flat_map(|t| &mut t.foreign_keys).filter(|fk| fk.table == table);
+        for n in targets.flat_map(|fk| fk.ref_columns.iter_mut()).filter(|n| *n == old) {
+            *n = new.to_string();
+        }
     }
 
-    /// Drops a column with the indexes that use it. It leaves the composite
-    /// key, and columns that referenced it lose their foreign key.
+    /// Drops a column with the indexes and foreign keys that use it. It
+    /// leaves the composite key, and foreign keys that referenced it go too.
     pub fn drop_column(&mut self, table: &str, column: &str) {
         let Some(t) = self.table_mut(table) else { return };
         t.columns.retain(|c| c.name != column);
         t.composite_pk.retain(|c| c != column);
         t.indexes.retain(|i| !i.columns.iter().any(|c| c == column));
+        t.foreign_keys.retain(|fk| !fk.columns.iter().any(|c| c == column));
         for c in self.tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
             if c.references.as_ref().is_some_and(|fk| fk.table == table && fk.column == column) {
                 c.references = None;
             }
+        }
+        for t in &mut self.tables {
+            t.foreign_keys.retain(|fk| !(fk.table == table && fk.ref_columns.iter().any(|c| c == column)));
         }
     }
 
@@ -330,9 +444,8 @@ impl Schema {
                 return;
             }
             visiting.push(t.name.clone());
-            for c in &t.columns {
-                if let Some(fk) = &c.references
-                    && fk.table != t.name
+            for fk in t.all_foreign_keys() {
+                if fk.table != t.name
                     && let Some(dep) = schema.table(&fk.table)
                 {
                     visit(schema, dep, out, visiting);

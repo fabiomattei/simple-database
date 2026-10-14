@@ -154,10 +154,15 @@ impl ErView {
     /// Show only `table` and the tables it references or is referenced by.
     pub fn show_related(&mut self, schema: &Schema, table: &str) {
         let Some(t) = schema.table(table) else { return };
-        let mut keep: HashSet<&str> = t.columns.iter().filter_map(|c| c.references.as_ref()).map(|fk| fk.table.as_str()).collect();
+        let mut keep: HashSet<&str> = HashSet::new();
+        for fk in t.all_foreign_keys() {
+            if let Some(parent) = schema.table(&fk.table) {
+                keep.insert(&parent.name);
+            }
+        }
         keep.insert(table);
         for other in &schema.tables {
-            if other.columns.iter().any(|c| c.references.as_ref().is_some_and(|fk| fk.table == table)) {
+            if other.all_foreign_keys().iter().any(|fk| fk.table == table) {
                 keep.insert(&other.name);
             }
         }
@@ -339,6 +344,14 @@ impl ErView {
         if let Some(a) = self.context_menu(&response, full, editable) {
             action = Some(a);
         }
+        // Comments show on hover: a column's on its row, the table's elsewhere on the box.
+        let comment = hovered_table.as_ref().and_then(|t| full.table(t)).and_then(|t| match &hovered_column {
+            Some(c) => t.column(c).and_then(|c| c.comment.clone()),
+            None => t.comment.clone(),
+        });
+        if let Some(comment) = comment.filter(|_| !capturing && self.dragging.is_none() && self.linking.is_none()) {
+            response.clone().on_hover_text(comment);
+        }
         let focus = if capturing {
             self.selected.clone()
         } else {
@@ -427,7 +440,7 @@ impl ErView {
             let pk = t.primary_key();
             for c in &t.columns {
                 let y = to_screen(pos2(0.0, layout.rows[&c.name])).y;
-                let tag = column_tag(&pk, c);
+                let tag = column_tag(t, &pk, c);
                 let tag_color = match tag {
                     "PK" => PK_COLOR,
                     "FK" => accent,
@@ -634,7 +647,7 @@ impl ErView {
             for c in &t.columns {
                 let y = p(pos2(0.0, layout.rows[&c.name])).y;
                 let x0 = min.x + PAD_X;
-                let tag = column_tag(&pk, c);
+                let tag = column_tag(t, &pk, c);
                 let tag_color = match tag {
                     "PK" => "#c98a10",
                     "FK" => "#3b6fd8",
@@ -681,9 +694,8 @@ impl ErView {
             }
             stack.push(&t.name);
             let d = t
-                .columns
+                .all_foreign_keys()
                 .iter()
-                .filter_map(|c| c.references.as_ref())
                 .filter(|fk| fk.table != t.name)
                 .filter_map(|fk| s.table(&fk.table))
                 .map(|p| depth_of(s, p, memo, stack) + 1)
@@ -733,10 +745,10 @@ impl ErView {
 
 const PK_COLOR: Color32 = Color32::from_rgb(0xe0, 0xa0, 0x20);
 
-fn column_tag(pk: &[String], c: &simple_database::schema::Column) -> &'static str {
+fn column_tag(t: &Table, pk: &[String], c: &simple_database::schema::Column) -> &'static str {
     if pk.contains(&c.name) {
         "PK"
-    } else if c.references.is_some() {
+    } else if t.is_foreign_key(&c.name) {
         "FK"
     } else if c.unique {
         "UQ"
@@ -758,10 +770,11 @@ fn row_at(layout: &BoxLayout, world: Pos2) -> Option<String> {
 fn edges(schema: &Schema, layouts: &HashMap<String, BoxLayout>) -> Vec<Edge> {
     let mut out = Vec::new();
     for t in &schema.tables {
-        for c in &t.columns {
-            let Some(fk) = &c.references else { continue };
+        // A multi-column key is drawn between its first columns.
+        for fk in t.all_foreign_keys() {
+            let nullable = fk.columns.iter().any(|c| t.column(c).is_some_and(|c| c.nullable));
             let (Some(child), Some(parent)) = (layouts.get(&t.name), layouts.get(&fk.table)) else { continue };
-            let (Some(&cy), Some(&py)) = (child.rows.get(&c.name), parent.rows.get(&fk.column)) else { continue };
+            let (Some(&cy), Some(&py)) = (child.rows.get(&fk.columns[0]), parent.rows.get(&fk.ref_columns[0])) else { continue };
             let (child_x, child_dir, parent_x, parent_dir) = if t.name == fk.table {
                 // Self reference: loop out of the right edge.
                 (child.rect.max.x, 1.0, parent.rect.max.x, 1.0)
@@ -777,7 +790,7 @@ fn edges(schema: &Schema, layouts: &HashMap<String, BoxLayout>) -> Vec<Edge> {
                 points: [a, a + vec2(child_dir * bend, 0.0), b + vec2(parent_dir * bend, 0.0), b],
                 child_dir,
                 parent_dir,
-                nullable: c.nullable,
+                nullable,
                 child: t.name.clone(),
                 parent: fk.table.clone(),
             });

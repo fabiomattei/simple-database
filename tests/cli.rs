@@ -131,8 +131,8 @@ fn sqlite_migrations_keep_data() {
     s.ok(&["seed", "--db", "app.db", "-n", "10", "--seed", "1", "-y"]);
 
     // A new column, a renamed table and a renamed column.
-    s.edit("schema.dbs", "table users {", "table people was users {");
-    s.edit("schema.dbs", "  email       varchar(255)  unique not null", "  mail varchar(255) unique not null was email");
+    s.edit("schema.dbs", "table users comment", "table people was users comment");
+    s.edit("schema.dbs", "  email       varchar(255)                       unique not null", "  mail varchar(255) unique not null was email");
     s.edit("schema.dbs", "-> users.id", "-> people.id");
     s.edit("schema.dbs", "  title       text       not null", "  title text not null\n  subtitle text");
     let plan = s.ok(&["push", "schema.dbs", "--db", "app.db", "--dry-run"]);

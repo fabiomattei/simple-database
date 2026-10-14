@@ -111,6 +111,17 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
         }
         parents.insert(c.name.clone(), values);
     }
+    // Whole parent rows for each multi-column foreign key.
+    let mut parent_rows: Vec<(&TableForeignKey, Vec<Vec<Value>>)> = Vec::new();
+    for fk in &t.foreign_keys {
+        let rows = existing_rows(db, &fk.table, &fk.ref_columns)?;
+        let nullable = fk.columns.iter().any(|c| t.column(c).is_some_and(|c| c.nullable));
+        if rows.is_empty() && !nullable && fk.table != t.name {
+            report.note = Some(format!("skipped: referenced table '{}' has no rows", fk.table));
+            return Ok(report);
+        }
+        parent_rows.push((fk, rows));
+    }
 
     // Single-column integer keys without autoincrement continue from the current max.
     let pk = t.primary_key();
@@ -133,9 +144,19 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
     let mut failures = 0;
     while report.inserted < requested {
         g.person = (g.rng.pick(FIRST), g.rng.pick(LAST));
+        let mut chosen: HashMap<&str, Value> = HashMap::new();
+        for (fk, rows) in &parent_rows {
+            let row = if rows.is_empty() { None } else { Some(g.rng.pick(rows)) };
+            for (i, c) in fk.columns.iter().enumerate() {
+                chosen.insert(c, row.map_or(Value::Null, |r| r[i].clone()));
+            }
+        }
         let values: Vec<Value> = columns
             .iter()
             .map(|c| {
+                if let Some(v) = chosen.get(c.name.as_str()) {
+                    return v.clone();
+                }
                 if let Some(candidates) = parents.get(&c.name) {
                     if candidates.is_empty() || (c.nullable && g.rng.chance(0.1)) {
                         return Value::Null;
@@ -188,15 +209,22 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
 }
 
 fn existing_values(db: &mut Database, table: &str, column: &str) -> Result<Vec<Value>> {
+    let rows = existing_rows(db, table, &[column.to_string()])?;
+    Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect())
+}
+
+/// Distinct values of `columns` in `table`, without NULLs.
+fn existing_rows(db: &mut Database, table: &str, columns: &[String]) -> Result<Vec<Vec<Value>>> {
     let d = db.dialect();
+    let cols: Vec<String> = columns.iter().map(|c| quote(c, d)).collect();
     let sql = format!(
-        "SELECT DISTINCT {c} FROM {t} WHERE {c} IS NOT NULL LIMIT 10000",
-        c = quote(column, d),
-        t = quote(table, d)
+        "SELECT DISTINCT {} FROM {} WHERE {} LIMIT 10000",
+        cols.join(", "),
+        quote(table, d),
+        cols.iter().map(|c| format!("{c} IS NOT NULL")).collect::<Vec<_>>().join(" AND ")
     );
     let mut results = db.run(&sql)?;
-    let rows = results.pop().map_or(vec![], |r| r.rows);
-    Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect())
+    Ok(results.pop().map_or(vec![], |r| r.rows))
 }
 
 /// `v` as a SQL literal for a column of type `ty`.
@@ -368,6 +396,14 @@ impl Generator {
         if !hint.choices.is_empty() {
             return self.rng.pick(&hint.choices).clone();
         }
+        if let DataType::Enum(values) = &c.data_type
+            && !values.is_empty()
+        {
+            if c.nullable && c.default.is_none() && self.rng.chance(0.1) {
+                return Value::Null;
+            }
+            return Value::Text(self.rng.pick(values).clone());
+        }
         let must_be_unique = c.unique
             || part_of_pk
             || t.indexes.iter().any(|i| i.unique && i.columns.contains(&c.name));
@@ -440,7 +476,7 @@ impl Generator {
                 self.rng.pick(WORDS)
             )),
             DataType::Blob => Value::Blob((0..16).map(|_| self.rng.next_u64() as u8).collect()),
-            DataType::Text | DataType::Varchar(_) | DataType::Custom(_) => {
+            DataType::Text | DataType::Varchar(_) | DataType::Custom(_) | DataType::Enum(_) => {
                 let mut s = self.text(t, &words);
                 if must_be_unique && !has(&["email", "username", "login", "handle", "slug"]) {
                     s = format!("{s} {}", self.counter);
@@ -652,6 +688,21 @@ mod tests {
         assert_eq!(count(&mut db, "SELECT count(*) FROM users WHERE email NOT LIKE '%@%'"), 0);
         assert!(count(&mut db, "SELECT max(length(title)) FROM posts") <= 20);
         assert!(count(&mut db, "SELECT count(*) FROM users WHERE boss_id IS NOT NULL") > 0);
+    }
+
+    #[test]
+    fn multi_column_keys_get_whole_parent_rows() {
+        let src = "table pairs { a int not null\n b int not null\n mood enum('ok', 'it''s') not null\n pk (a, b) }\n\
+                   table links { id int pk\n x int not null\n y int not null\n fk (x, y) -> pairs (a, b) }";
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(&schema_sql(&parse(src).unwrap(), Dialect::Sqlite)).unwrap();
+        let mut db = Database::from_sqlite(conn, "test");
+        for r in seed(&mut db, &opts(20, 3)).unwrap() {
+            assert_eq!(r.inserted, 20, "{}: {:?}", r.table, r.note);
+        }
+        assert_eq!(count(&mut db, "SELECT count(*) FROM links JOIN pairs ON a = x AND b = y"), 20);
+        assert_eq!(count(&mut db, "SELECT count(DISTINCT mood) FROM pairs"), 2);
     }
 
     #[test]

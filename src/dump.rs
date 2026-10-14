@@ -190,6 +190,12 @@ pub fn restore(db: &mut Database, r: &Restore, clean: bool) -> Result<u64> {
             if r.existing.contains(&t.name) {
                 let cascade = if d == Dialect::Postgres { " CASCADE" } else { "" };
                 stmts.push((format!("DROP TABLE {}{cascade}", quote(&t.name, d)), false));
+                // The dump creates the types of enum columns again.
+                if d == Dialect::Postgres {
+                    for c in t.columns.iter().filter(|c| matches!(c.data_type, DataType::Enum(_))) {
+                        stmts.push((format!("DROP TYPE IF EXISTS {}", quote(&ddl::enum_type_name(&t.name, &c.name), d)), false));
+                    }
+                }
             }
         }
     }

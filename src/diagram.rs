@@ -37,7 +37,7 @@ fn mermaid(schema: &Schema) -> String {
             if pk.contains(&c.name) {
                 keys.push("PK");
             }
-            if c.references.is_some() {
+            if t.is_foreign_key(&c.name) {
                 keys.push("FK");
             }
             if c.unique {
@@ -55,16 +55,18 @@ fn mermaid(schema: &Schema) -> String {
         out.push_str("    }\n");
     }
     for t in &schema.tables {
-        for c in &t.columns {
-            let Some(fk) = &c.references else { continue };
+        for fk in t.all_foreign_keys() {
             if schema.table(&fk.table).is_none() {
                 continue;
             }
-            let parent = if c.nullable { "|o" } else { "||" };
-            let child = if c.unique { "o|" } else { "o{" };
+            let cols: Vec<&Column> = fk.columns.iter().filter_map(|c| t.column(c)).collect();
+            let parent = if cols.iter().any(|c| c.nullable) { "|o" } else { "||" };
+            let child = if matches!(cols.as_slice(), [c] if c.unique) { "o|" } else { "o{" };
             out.push_str(&format!(
                 "    {} {parent}--{child} {} : \"{}\"\n",
-                fk.table, t.name, c.name
+                fk.table,
+                t.name,
+                fk.columns.join(", ")
             ));
         }
     }
@@ -104,13 +106,12 @@ fn dot(schema: &Schema) -> String {
     }
     out.push('\n');
     for t in &schema.tables {
-        for c in &t.columns {
-            if let Some(fk) = &c.references
-                && schema.table(&fk.table).is_some()
-            {
+        // A multi-column key is drawn between its first columns.
+        for fk in t.all_foreign_keys() {
+            if schema.table(&fk.table).is_some() {
                 out.push_str(&format!(
                     "    \"{}\":\"{}\" -> \"{}\":\"{}\";\n",
-                    fk.table, fk.column, t.name, c.name
+                    fk.table, fk.ref_columns[0], t.name, fk.columns[0]
                 ));
             }
         }

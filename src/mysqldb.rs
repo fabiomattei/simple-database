@@ -68,13 +68,15 @@ pub fn cancel(url: &str, id: u32) -> Result<()> {
 /// The tables of the database. What a schema can't hold (views, triggers,
 /// routines, events, some keys, checks and indexes) is described in `skipped`.
 pub fn introspect(conn: &mut Conn, skipped: &mut Vec<String>) -> Result<Schema> {
-    let names: Vec<String> = conn.query(
-        "SELECT TABLE_NAME FROM information_schema.TABLES \
+    let names: Vec<(String, String)> = conn.query(
+        "SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY CREATE_TIME, TABLE_NAME",
     )?;
     let mut schema = Schema::default();
-    for name in names {
-        schema.tables.push(introspect_table(conn, name, skipped)?);
+    for (name, comment) in names {
+        let mut t = introspect_table(conn, name, skipped)?;
+        t.comment = Some(comment).filter(|c| !c.is_empty());
+        schema.tables.push(t);
     }
     let others: Vec<(String, String)> = conn.query(
         "SELECT 'view', TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE() \
@@ -89,20 +91,24 @@ pub fn introspect(conn: &mut Conn, skipped: &mut Vec<String>) -> Result<Schema> 
 }
 
 fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) -> Result<Table> {
-    type ColumnRow = (String, String, String, Option<String>, String);
+    type ColumnRow = (String, String, String, Option<String>, String, String);
     let rows: Vec<ColumnRow> = conn.exec(
-        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS \
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT FROM information_schema.COLUMNS \
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
         (&name,),
     )?;
     let mut columns = Vec::new();
     let mut generated = Vec::new();
-    for (cname, ctype, nullable, default, extra) in rows {
+    for (cname, ctype, nullable, default, extra, comment) in rows {
         // How `ddl::type_sql` spells BOOLEAN and UUID for MySQL.
         let data_type = match ctype.as_str() {
             "tinyint(1)" => DataType::Bool,
             "char(36)" => DataType::Uuid,
-            t => DataType::parse(t),
+            t => match DataType::parse(t) {
+                // COLUMN_TYPE escapes backslashes in the values.
+                DataType::Enum(values) => DataType::Enum(values.into_iter().map(|v| v.replace("\\\\", "\\")).collect()),
+                other => other,
+            },
         };
         if extra.contains("auto_increment") {
             generated.push(cname.clone());
@@ -110,6 +116,7 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
         let mut col = Column::new(cname, data_type);
         col.nullable = nullable == "YES";
         col.default = default.map(|d| parse_default(&d, &extra, &col.data_type));
+        col.comment = Some(comment).filter(|c| !c.is_empty());
         columns.push(col);
     }
 
@@ -125,11 +132,20 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
         (&name,),
     )?;
     let fk_names: Vec<&String> = fks.iter().map(|f| &f.0).collect();
-    for (cname, col, rtable, rcol, on_update, on_delete) in &fks {
+    let mut foreign_keys: Vec<TableForeignKey> = Vec::new();
+    for (i, (cname, col, rtable, rcol, on_update, on_delete)) in fks.iter().enumerate() {
         if fk_names.iter().filter(|n| **n == cname).count() > 1 {
-            let note = format!("multi-column foreign key {cname} on {name}");
-            if !skipped.contains(&note) {
-                skipped.push(note);
+            // The rows of one key are adjacent and in column order.
+            if i == 0 || fks[i - 1].0 != *cname {
+                let parts = fks[i..].iter().take_while(|f| f.0 == *cname);
+                let (columns, ref_columns) = parts.map(|f| (f.1.clone(), f.3.clone())).unzip();
+                foreign_keys.push(TableForeignKey {
+                    columns,
+                    table: rtable.clone(),
+                    ref_columns,
+                    on_delete: RefAction::parse(on_delete).unwrap_or(RefAction::NoAction),
+                    on_update: RefAction::parse(on_update).unwrap_or(RefAction::NoAction),
+                });
             }
             continue;
         }
@@ -209,7 +225,7 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
         }
     }
 
-    Ok(Table { name, columns, composite_pk, indexes, was: vec![] })
+    Ok(Table { columns, composite_pk, indexes, foreign_keys, ..Table::new(name) })
 }
 
 /// Read `COLUMN_DEFAULT`. Literal defaults come unquoted; expression

@@ -1074,7 +1074,72 @@ mod tests {
         drop_all(&mut db);
         live_key_changes(&mut db);
         drop_all(&mut db);
+        live_enums_comments_and_keys(&mut db);
+        drop_all(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
+        if db.dialect() == Dialect::Postgres {
+            let types = db.query_value("SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = current_schema() AND t.typtype = 'e'");
+            assert_eq!(types.unwrap(), Cell::Int(0), "enum types left behind");
+        }
+    }
+
+    /// Enums, comments and multi-column foreign keys are created, changed and
+    /// renamed, keeping the rows, and leave nothing to migrate.
+    fn live_enums_comments_and_keys(db: &mut Database) {
+        let steps = [
+            "table pairs comment 'Pairs, it''s' { a int not null comment 'left'\n b int not null\n \
+             mood enum('ok', 'it''s', 'x\\y') not null default 'ok'\n pk (a, b) }\n\
+             table links { id int pk\n a int\n b int\n kind enum('one', 'two') comment 'what kind'\n \
+             fk (a, b) -> pairs (a, b) on delete cascade\n index (a, b) }",
+            // Values added and removed, an enum becoming text, a new enum column, comments changed, the key's action changed.
+            "table pairs { a int not null comment 'the left one'\n b int not null\n \
+             mood enum('meh', 'ok', 'it''s') not null default 'meh'\n level enum('lo', 'hi') not null default 'lo'\n pk (a, b) }\n\
+             table links comment 'Links' { id int pk\n a int\n b int\n kind text\n \
+             fk (a, b) -> pairs (a, b) on delete restrict\n index (a, b) }",
+            // Renames: the referenced table and column, and a column of the key.
+            "table couples was pairs { left_id int not null was a comment 'the left one'\n b int not null\n \
+             mood enum('meh', 'ok', 'it''s') not null default 'meh'\n level enum('lo', 'hi') not null default 'lo'\n pk (left_id, b) }\n\
+             table links comment 'Links' { id int pk\n x int was a\n b int\n kind text\n \
+             fk (x, b) -> couples (left_id, b) on delete restrict\n index (x, b) }",
+            // The key goes, an enum changes again after the rename, text becomes an enum.
+            "table couples { left_id int not null\n b int not null\n mood enum('ok', 'it''s', 'new') default 'ok'\n \
+             level enum('lo', 'hi') not null default 'lo'\n pk (left_id, b) }\n\
+             table links { id int pk\n x int\n b int\n kind enum('one', 'two', 'three')\n index (x, b) }",
+        ];
+        let count = |db: &mut Database, sql: &str| db.query_value(&format!("SELECT count(*) FROM {sql}")).unwrap();
+        for (i, src) in steps.iter().enumerate() {
+            let desired = parse(src).unwrap();
+            let current = db.introspect().unwrap();
+            let m = db.migration(&current, &desired);
+            db.apply_migration(&m).unwrap_or_else(|e| panic!("step {i}: {e:#}\n{}", m.script()));
+            let current = db.introspect().unwrap();
+            let again = db.migration(&current, &desired);
+            assert!(again.is_empty(), "step {i}: {:?}\n{}", again.changes, again.script());
+            assert!(ddl::canonical(&current, db.dialect()).same_tables(&ddl::canonical(&db.normalize_checks(&desired), db.dialect())), "step {i}");
+            match i {
+                0 => {
+                    db.run("INSERT INTO pairs (a, b, mood) VALUES (1, 1, 'ok'), (1, 2, 'it''s'); INSERT INTO links VALUES (1, 1, 2, 'one')").unwrap();
+                    assert!(db.run("INSERT INTO pairs (a, b, mood) VALUES (2, 2, 'bad')").is_err(), "not one of the values");
+                    assert!(db.run("INSERT INTO links VALUES (2, 9, 9, 'two')").is_err(), "no such pair");
+                }
+                1 => {
+                    assert_eq!(count(db, "pairs WHERE mood = 'it''s' AND level = 'lo'"), Cell::Int(1));
+                    assert!(db.run("DELETE FROM pairs WHERE b = 2").is_err(), "restricted");
+                }
+                2 => assert_eq!(count(db, "links JOIN couples ON couples.left_id = links.x AND couples.b = links.b"), Cell::Int(1)),
+                _ => {
+                    assert_eq!(count(db, "links WHERE kind = 'one'"), Cell::Int(1));
+                    db.run("DELETE FROM couples WHERE b = 2").unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_enums_comments_and_keys() {
+        let mut db = Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t");
+        db.execute("PRAGMA foreign_keys = ON").unwrap();
+        live_enums_comments_and_keys(&mut db);
     }
 
     /// Renames through `was` hints keep the rows, and leave nothing to migrate.
@@ -1088,8 +1153,8 @@ mod tests {
         let (users, posts) = (count(db, "users"), count(db, "posts"));
         let renamed = src
             .replace(" tag int -> tags.id\n", " tag_ref int was tag -> tags.id\n")
-            .replace("table users {", "table people was users {")
-            .replace("  email       varchar(255)  unique not null", "  mail varchar(255) unique not null was email")
+            .replace("table users comment", "table people was users comment")
+            .replace("  email       varchar(255)                       unique not null", "  mail varchar(255) unique not null was email")
             .replace("author_id   int        not null -> users.id", "writer_id int not null was author_id -> people.id")
             .replace("index (author_id)", "index (writer_id)")
             .replace("status text not null default 'new' check (status in", "state text not null default 'new' was status check (state in");

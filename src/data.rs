@@ -188,6 +188,9 @@ pub fn literal(v: &Cell, ty: Option<&DataType>, d: Dialect) -> Result<String> {
             "false" | "f" | "0" | "no" | "n" | "off" => boolean(false),
             _ => bail!("'{s}' is not true or false"),
         },
+        (Cell::Text(s), Some(DataType::Enum(values))) if !values.contains(s) => {
+            bail!("'{s}' is not one of {}", crate::schema::string_list(values))
+        }
         (Cell::Text(s), Some(DataType::Blob)) => match parse_hex(s) {
             Some(b) => blob(&b),
             None => blob(s.as_bytes()),
@@ -328,6 +331,9 @@ mod tests {
         assert_eq!(literal(&text("a\\b"), None, Dialect::Mysql).unwrap(), "'a\\\\b'");
         assert_eq!(literal(&text("x'0aff'"), Some(&DataType::Blob), Dialect::Postgres).unwrap(), "'\\x0aff'::bytea");
         assert!(literal(&text("1.2.3"), Some(&DataType::Decimal(5, 2)), Dialect::Sqlite).is_err());
+        let mood = DataType::Enum(vec!["ok".into(), "it's".into()]);
+        assert_eq!(literal(&text("it's"), Some(&mood), Dialect::Postgres).unwrap(), "'it''s'");
+        assert!(literal(&text("OK"), Some(&mood), Dialect::Postgres).is_err());
     }
 
     #[test]

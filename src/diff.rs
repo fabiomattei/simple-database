@@ -45,7 +45,11 @@ struct TableDiff<'a> {
     dropped_indexes: Vec<&'a Index>,
     /// Same columns, new name: (old, new).
     renamed_indexes: Vec<(&'a Index, &'a Index)>,
+    /// Multi-column foreign keys; a changed one is dropped and added.
+    added_fks: Vec<&'a TableForeignKey>,
+    dropped_fks: Vec<&'a TableForeignKey>,
     pk_changed: bool,
+    comment_changed: bool,
 }
 
 impl<'a> TableDiff<'a> {
@@ -73,7 +77,10 @@ impl<'a> TableDiff<'a> {
             added_indexes,
             dropped_indexes,
             renamed_indexes,
+            added_fks: new.foreign_keys.iter().filter(|f| !old.foreign_keys.contains(f)).collect(),
+            dropped_fks: old.foreign_keys.iter().filter(|f| !new.foreign_keys.contains(f)).collect(),
             pk_changed: old.primary_key() != new.primary_key(),
+            comment_changed: old.comment != new.comment,
         }
     }
 
@@ -84,7 +91,10 @@ impl<'a> TableDiff<'a> {
             && self.added_indexes.is_empty()
             && self.dropped_indexes.is_empty()
             && self.renamed_indexes.is_empty()
+            && self.added_fks.is_empty()
+            && self.dropped_fks.is_empty()
             && !self.pk_changed
+            && !self.comment_changed
     }
 }
 
@@ -112,7 +122,23 @@ fn describe_alter(o: &Column, n: &Column) -> String {
     if o.primary_key != n.primary_key || o.auto_increment != n.auto_increment {
         parts.push("primary key/autoincrement changed".to_string());
     }
+    if o.comment != n.comment {
+        parts.push("comment changed".to_string());
+    }
     parts.join(", ")
+}
+
+fn describe_fk(table: &str, fk: &TableForeignKey) -> String {
+    format!("{} ({}) -> {} ({})", table_fk_name(table, fk), fk.columns.join(", "), fk.table, fk.ref_columns.join(", "))
+}
+
+fn is_enum(t: &DataType) -> bool {
+    matches!(t, DataType::Enum(_))
+}
+
+/// Drops the Postgres type behind an enum column, if it is there.
+fn drop_enum_sql(table: &str, column: &str) -> String {
+    format!("DROP TYPE IF EXISTS {};", quote(&enum_type_name(table, column), Dialect::Postgres))
 }
 
 pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
@@ -126,7 +152,7 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
     for t in new.tables_in_dependency_order() {
         if old.table(&t.name).is_none() {
             m.changes.push(format!("+ table {}", t.name));
-            body.push(create_table_sql(t, d));
+            body.extend(create_table_statements(t, d));
             for idx in &t.indexes {
                 body.push(create_index_sql(&t.name, idx, d));
             }
@@ -167,6 +193,15 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
         for (o, n) in &td.renamed_indexes {
             m.changes.push(format!("~ index {} -> {}", o.name, n.name));
         }
+        for fk in &td.dropped_fks {
+            m.changes.push(format!("- foreign key {}", table_fk_name(&old_t.name, fk)));
+        }
+        for fk in &td.added_fks {
+            m.changes.push(format!("+ foreign key {}", describe_fk(&new_t.name, fk)));
+        }
+        if td.comment_changed {
+            m.changes.push(format!("~ table {}: comment changed", new_t.name));
+        }
         for c in &td.added {
             if !c.nullable && c.default.is_none() && !c.auto_increment {
                 m.warnings.push(format!(
@@ -176,8 +211,9 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
             }
         }
 
-        let referenced = old.tables.iter().flat_map(|t| &t.columns).filter_map(|c| c.references.as_ref());
-        if td.pk_changed && d != Dialect::Sqlite && referenced.into_iter().any(|fk| fk.table == old_t.name && old_t.primary_key().contains(&fk.column)) {
+        let mut referenced = old.tables.iter().flat_map(|t| t.all_foreign_keys());
+        let old_pk = old_t.primary_key();
+        if td.pk_changed && d != Dialect::Sqlite && referenced.any(|fk| fk.table == old_t.name && fk.ref_columns.iter().any(|c| old_pk.contains(c))) {
             m.warnings.push(format!(
                 "foreign keys point at the primary key of {}; the server refuses to change it until they are dropped",
                 old_t.name
@@ -209,6 +245,9 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
         m.changes.push(format!("- table {}", t.name));
         m.warnings.push(format!("dropping table {} deletes all its data", t.name));
         body.push(format!("DROP TABLE {};", quote(&t.name, d)));
+        if d == Dialect::Postgres {
+            body.extend(t.columns.iter().filter(|c| is_enum(&c.data_type)).map(|c| drop_enum_sql(&t.name, &c.name)));
+        }
     }
 
     if body.is_empty() {
@@ -333,10 +372,33 @@ fn pg_constraint_names(c: &Column, table: &str, column: &str) -> Vec<String> {
 }
 
 /// Whether MySQL made an index (named after the constraint) to back the
-/// foreign key on `column`: it does when no other index starts with it.
-fn mysql_implicit_fk_index(t: &Table, column: &str) -> bool {
-    let leads = |cols: &[String]| cols.first().is_some_and(|c| c == column);
-    !(t.column(column).is_some_and(|c| c.unique) || leads(&t.primary_key()) || t.indexes.iter().any(|i| leads(&i.columns)))
+/// foreign key on `columns`: it does when no other index starts with them.
+fn mysql_implicit_fk_index(t: &Table, columns: &[String]) -> bool {
+    let leads = |cols: &[String]| cols.starts_with(columns);
+    let unique = matches!(columns, [one] if t.column(one).is_some_and(|c| c.unique));
+    !(unique || leads(&t.primary_key()) || t.indexes.iter().any(|i| leads(&i.columns)))
+}
+
+/// Renames a Postgres type if it exists: an enum's type may have another
+/// name when the database wasn't made by sdb.
+fn pg_rename_type(from: &str, to: &str) -> String {
+    let d = Dialect::Postgres;
+    let (a, b) = (quote(from, d), quote(to, d));
+    format!("DO $$ BEGIN IF to_regtype('{}') IS NOT NULL THEN ALTER TYPE {a} RENAME TO {b}; END IF; END $$;", a.replace('\'', "''"))
+}
+
+/// The MySQL statements that drop the multi-column foreign key `fk` of `t`,
+/// named after table `from`, and add `new_fk` named after table `to`: MySQL
+/// can't rename a constraint.
+fn mysql_readd_fk(t: &Table, q: &str, (from, fk): (&str, &TableForeignKey), (to, new_fk): (&str, &TableForeignKey)) -> Vec<String> {
+    let d = Dialect::Mysql;
+    let (old_name, new_name) = (table_fk_name(from, fk), table_fk_name(to, new_fk));
+    let mut out = vec![format!("ALTER TABLE {q} DROP FOREIGN KEY {};", quote(&old_name, d))];
+    if mysql_implicit_fk_index(t, &new_fk.columns) {
+        out.push(format!("ALTER TABLE {q} RENAME INDEX {} TO {};", quote(&old_name, d), quote(&new_name, d)));
+    }
+    out.push(format!("ALTER TABLE {q} ADD {};", table_fk_sql(to, new_fk, d)));
+    out
 }
 
 /// Statements that rename table `from` to `t` (as it is after the rename)
@@ -355,8 +417,12 @@ fn rename_table_sql(t: &Table, from: &str, d: Dialect) -> Vec<String> {
             for c in &t.columns {
                 names.extend(pg_constraint_names(c, from, &c.name).into_iter().zip(pg_constraint_names(c, to, &c.name)));
             }
+            names.extend(t.foreign_keys.iter().map(|fk| (table_fk_name(from, fk), table_fk_name(to, fk))));
             for (a, b) in names {
                 out.push(format!("ALTER TABLE {q} RENAME CONSTRAINT {} TO {};", quote(&a, d), quote(&b, d)));
+            }
+            for c in t.columns.iter().filter(|c| is_enum(&c.data_type)) {
+                out.push(pg_rename_type(&enum_type_name(from, &c.name), &enum_type_name(to, &c.name)));
             }
         }
         // MySQL can't rename constraints, so they are dropped and added again.
@@ -364,7 +430,7 @@ fn rename_table_sql(t: &Table, from: &str, d: Dialect) -> Vec<String> {
             for c in &t.columns {
                 if let Some(fk) = &c.references {
                     out.push(format!("ALTER TABLE {q} DROP FOREIGN KEY {};", quote(&fk_name(from, &c.name), d)));
-                    if mysql_implicit_fk_index(t, &c.name) {
+                    if mysql_implicit_fk_index(t, std::slice::from_ref(&c.name)) {
                         out.push(format!(
                             "ALTER TABLE {q} RENAME INDEX {} TO {};",
                             quote(&fk_name(from, &c.name), d),
@@ -378,6 +444,9 @@ fn rename_table_sql(t: &Table, from: &str, d: Dialect) -> Vec<String> {
                     out.push(format!("ALTER TABLE {q} ADD {};", check_sql(to, &c.name, chk, d)));
                 }
             }
+            for fk in &t.foreign_keys {
+                out.extend(mysql_readd_fk(t, &q, (from, fk), (to, fk)));
+            }
         }
     }
     out
@@ -390,12 +459,28 @@ fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dia
     let q = quote(tn, d);
     let c = t.column(to).expect("renamed column");
     let rename = format!("ALTER TABLE {q} RENAME COLUMN {} TO {};", quote(from, d), quote(to, d));
+    // Multi-column foreign keys named after the column: as they were, and are now.
+    let fks: Vec<(TableForeignKey, &TableForeignKey)> = t
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.columns.iter().any(|x| x == to))
+        .map(|fk| {
+            let mut old = fk.clone();
+            old.columns = fk.columns.iter().map(|x| if x == to { from.to_string() } else { x.clone() }).collect();
+            (old, fk)
+        })
+        .collect();
     match d {
         Dialect::Sqlite => vec![rename],
         Dialect::Postgres => {
             let mut out = vec![rename];
-            for (a, b) in pg_constraint_names(c, tn, from).into_iter().zip(pg_constraint_names(c, tn, to)) {
+            let mut names: Vec<(String, String)> = pg_constraint_names(c, tn, from).into_iter().zip(pg_constraint_names(c, tn, to)).collect();
+            names.extend(fks.iter().map(|(old, fk)| (table_fk_name(tn, old), table_fk_name(tn, fk))));
+            for (a, b) in names {
                 out.push(format!("ALTER TABLE {q} RENAME CONSTRAINT {} TO {};", quote(&a, d), quote(&b, d)));
+            }
+            if is_enum(&c.data_type) {
+                out.push(pg_rename_type(&enum_type_name(tn, from), &enum_type_name(tn, to)));
             }
             out
         }
@@ -404,6 +489,9 @@ fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dia
             let mut out = Vec::new();
             if c.references.is_some() {
                 out.push(format!("ALTER TABLE {q} DROP FOREIGN KEY {};", quote(&fk_name(tn, from), d)));
+            }
+            for (old, _) in &fks {
+                out.push(format!("ALTER TABLE {q} DROP FOREIGN KEY {};", quote(&table_fk_name(tn, old), d)));
             }
             for name in touched {
                 let was = if name == to { from } else { name };
@@ -414,7 +502,7 @@ fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dia
                 out.push(format!("ALTER TABLE {q} RENAME INDEX {} TO {};", quote(from, d), quote(to, d)));
             }
             if let Some(fk) = &c.references {
-                if mysql_implicit_fk_index(t, to) {
+                if mysql_implicit_fk_index(t, &[to.to_string()]) {
                     out.push(format!(
                         "ALTER TABLE {q} RENAME INDEX {} TO {};",
                         quote(&fk_name(tn, from), d),
@@ -422,6 +510,16 @@ fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dia
                     ));
                 }
                 out.push(format!("ALTER TABLE {q} ADD {};", fk_sql(tn, c, fk, d)));
+            }
+            for (old, fk) in &fks {
+                if mysql_implicit_fk_index(t, &fk.columns) {
+                    out.push(format!(
+                        "ALTER TABLE {q} RENAME INDEX {} TO {};",
+                        quote(&table_fk_name(tn, old), d),
+                        quote(&table_fk_name(tn, fk), d)
+                    ));
+                }
+                out.push(format!("ALTER TABLE {q} ADD {};", table_fk_sql(tn, fk, d)));
             }
             for name in touched {
                 if let Some(chk) = t.column(name).and_then(|x| x.check.as_ref()) {
@@ -438,9 +536,11 @@ fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dia
 /// SQLite's ALTER TABLE can only add simple columns and drop unconstrained
 /// ones; everything else requires recreating the table.
 fn sqlite_needs_rebuild(td: &TableDiff) -> bool {
+    // ADD COLUMN would not keep a comment where introspection finds it.
     let addable = |c: &Column| {
         !c.primary_key
             && !c.unique
+            && c.comment.is_none()
             && !(c.references.is_some() && c.default.as_ref().is_some_and(|d| *d != DefaultValue::Null))
             && !matches!(c.default, Some(DefaultValue::Now) | Some(DefaultValue::Expr(_)))
             && (c.nullable || c.default.as_ref().is_some_and(|d| *d != DefaultValue::Null))
@@ -453,6 +553,9 @@ fn sqlite_needs_rebuild(td: &TableDiff) -> bool {
     };
     !td.altered.is_empty()
         || td.pk_changed
+        || td.comment_changed
+        || !td.added_fks.is_empty()
+        || !td.dropped_fks.is_empty()
         || !td.added.iter().all(|c| addable(c))
         || !td.dropped.iter().all(|c| droppable(c))
 }
@@ -469,7 +572,7 @@ fn sqlite_simple_alter(td: &TableDiff) -> Vec<String> {
         out.push(format!("ALTER TABLE {t} DROP COLUMN {};", quote(&c.name, d)));
     }
     for c in &td.added {
-        let mut sql = column_sql(c, false, d);
+        let mut sql = column_sql(&td.new.name, c, false, d);
         if let Some(fk) = &c.references {
             sql.push_str(&format!(" REFERENCES {} ({})", quote(&fk.table, d), quote(&fk.column, d)));
             if fk.on_delete != RefAction::NoAction {
@@ -538,6 +641,9 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
     let t = quote(tn, d);
     let mut out = Vec::new();
 
+    for fk in &td.dropped_fks {
+        out.push(format!("ALTER TABLE {t} DROP CONSTRAINT {};", quote(&table_fk_name(tn, fk), d)));
+    }
     for i in &td.dropped_indexes {
         out.push(drop_index_sql(tn, i, d));
     }
@@ -550,12 +656,21 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
     }
     for c in &td.dropped {
         out.push(format!("ALTER TABLE {t} DROP COLUMN {};", quote(&c.name, d)));
+        if is_enum(&c.data_type) {
+            out.push(drop_enum_sql(tn, &c.name));
+        }
     }
     for c in &td.added {
+        if let DataType::Enum(values) = &c.data_type {
+            out.push(create_enum_sql(&enum_type_name(tn, &c.name), values));
+        }
         let identity = if c.auto_increment { " GENERATED BY DEFAULT AS IDENTITY" } else { "" };
-        out.push(format!("ALTER TABLE {t} ADD COLUMN {}{identity};", column_sql(c, false, d)));
+        out.push(format!("ALTER TABLE {t} ADD COLUMN {}{identity};", column_sql(tn, c, false, d)));
         if let Some(fk) = &c.references {
             out.push(format!("ALTER TABLE {t} ADD {};", fk_sql(tn, c, fk, d)));
+        }
+        if c.comment.is_some() {
+            out.push(comment_sql(tn, Some(&c.name), c.comment.as_deref()));
         }
     }
     let mut new_identities = Vec::new();
@@ -566,15 +681,33 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
             out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} DROP IDENTITY IF EXISTS;"));
             out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT;"));
         }
-        if o.data_type != n.data_type {
+        // A default typed as the old enum can't be cast to the new type.
+        let enum_change = o.data_type != n.data_type && (is_enum(&o.data_type) || is_enum(&n.data_type));
+        if enum_change && o.default.is_some() {
+            out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT;"));
+        }
+        if let (true, DataType::Enum(values)) = (o.data_type != n.data_type, &n.data_type) {
+            // Through a new type, which works whatever the old one was.
+            let name = enum_type_name(tn, &n.name);
+            let new = format!("{name}_new");
+            let (qname, qnew) = (quote(&name, d), quote(&new, d));
+            out.push(create_enum_sql(&new, values));
+            out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} TYPE {qnew} USING {col}::text::{qnew};"));
+            out.push(format!("DROP TYPE IF EXISTS {qname};"));
+            out.push(format!("ALTER TYPE {qnew} RENAME TO {qname};"));
+        } else if o.data_type != n.data_type {
             let ty = type_sql(&n.data_type, d);
-            out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} TYPE {ty} USING {col}::{ty};"));
+            let via = if is_enum(&o.data_type) { "::text" } else { "" };
+            out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} TYPE {ty} USING {col}{via}::{ty};"));
+            if is_enum(&o.data_type) {
+                out.push(drop_enum_sql(tn, &n.name));
+            }
         }
         if o.nullable != n.nullable {
             let verb = if n.nullable { "DROP" } else { "SET" };
             out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} {verb} NOT NULL;"));
         }
-        if o.default != n.default {
+        if o.default != n.default || (enum_change && n.default.is_some()) {
             match &n.default {
                 Some(def) => out.push(format!(
                     "ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT {};",
@@ -614,9 +747,18 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
             out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} ADD GENERATED BY DEFAULT AS IDENTITY;"));
             new_identities.push(n);
         }
+        if o.comment != n.comment {
+            out.push(comment_sql(tn, Some(&n.name), n.comment.as_deref()));
+        }
     }
     if td.pk_changed && !td.new.primary_key().is_empty() {
         out.push(format!("ALTER TABLE {t} ADD PRIMARY KEY ({});", quote_list(&td.new.primary_key(), d)));
+    }
+    for fk in &td.added_fks {
+        out.push(format!("ALTER TABLE {t} ADD {};", table_fk_sql(tn, fk, d)));
+    }
+    if td.comment_changed {
+        out.push(comment_sql(tn, None, td.new.comment.as_deref()));
     }
     // A new identity counts on from the ids already there.
     for c in new_identities {
@@ -641,7 +783,8 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
 fn mysql_column(old: Option<&Column>, c: &Column) -> String {
     let mut def = c.clone();
     def.unique = c.unique && !old.is_some_and(|o| o.unique);
-    let sql = column_sql(&def, false, Dialect::Mysql);
+    // The table name only matters for Postgres enums.
+    let sql = column_sql("", &def, false, Dialect::Mysql);
     if c.auto_increment { sql + " AUTO_INCREMENT" } else { sql }
 }
 
@@ -666,6 +809,15 @@ fn mysql_alter(td: &TableDiff) -> Vec<String> {
     let changed_fks = td.altered.iter().filter(|(o, n)| o.references.is_some() && o.references != n.references);
     for col in dropped_fks.chain(changed_fks.map(|(_, n)| &n.name)) {
         out.push(format!("ALTER TABLE {t} DROP FOREIGN KEY {};", quote(&fk_name(tn, col), d)));
+    }
+    for fk in &td.dropped_fks {
+        let name = quote(&table_fk_name(tn, fk), d);
+        out.push(format!("ALTER TABLE {t} DROP FOREIGN KEY {name};"));
+        // The index MySQL made for it stays behind, unless the key comes back under the same name.
+        let back = td.added_fks.iter().any(|n| n.columns == fk.columns);
+        if !back && mysql_implicit_fk_index(td.old, &fk.columns) {
+            out.push(format!("ALTER TABLE {t} DROP INDEX {name};"));
+        }
     }
     for i in &td.dropped_indexes {
         out.push(drop_index_sql(tn, i, d));
@@ -717,7 +869,8 @@ fn mysql_alter(td: &TableDiff) -> Vec<String> {
         let definition_changed = o.data_type != n.data_type
             || o.nullable != n.nullable
             || o.default != n.default
-            || o.unique != n.unique;
+            || o.unique != n.unique
+            || o.comment != n.comment;
         if definition_changed && !keyed(o, n) {
             out.push(format!("ALTER TABLE {t} MODIFY COLUMN {};", mysql_column(Some(o), n)));
         }
@@ -734,6 +887,12 @@ fn mysql_alter(td: &TableDiff) -> Vec<String> {
     }
     for i in &td.added_indexes {
         out.push(create_index_sql(tn, i, d));
+    }
+    for fk in &td.added_fks {
+        out.push(format!("ALTER TABLE {t} ADD {};", table_fk_sql(tn, fk, d)));
+    }
+    if td.comment_changed {
+        out.push(format!("ALTER TABLE {t} COMMENT = {};", string_sql(td.new.comment.as_deref().unwrap_or(""), d)));
     }
     out
 }
@@ -816,6 +975,64 @@ mod tests {
         }
         let sql = diff(&old, &new, Dialect::Mysql).script();
         assert!(sql.contains("ALTER TABLE a DROP PRIMARY KEY, MODIFY COLUMN id INT, MODIFY COLUMN n INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (n);"), "{sql}");
+    }
+
+    #[test]
+    fn migrates_enums_comments_and_multi_column_keys() {
+        let old = parse(
+            "table pairs { a int not null\n b int not null\n mood enum('ok', 'bad') default 'ok'\n pk (a, b) }\n\
+             table links { id int pk\n x int\n y int\n fk (x, y) -> pairs (a, b) }",
+        )
+        .unwrap();
+        let new = parse(
+            "table pairs comment 'P' { a int not null comment 'left'\n b int not null\n mood enum('ok', 'meh') default 'ok'\n pk (a, b) }\n\
+             table links { id int pk\n x int\n y int\n fk (x, y) -> pairs (a, b) on delete cascade }",
+        )
+        .unwrap();
+        let pg = diff(&old, &new, Dialect::Postgres);
+        let mut changes = pg.changes.clone();
+        changes.sort();
+        assert_eq!(
+            changes,
+            [
+                "+ foreign key fk_links_x_y (x, y) -> pairs (a, b)",
+                "- foreign key fk_links_x_y",
+                "~ column pairs.a: comment changed",
+                "~ column pairs.mood: type enum('ok', 'bad') -> enum('ok', 'meh')",
+                "~ table pairs: comment changed",
+            ]
+        );
+        let sql = pg.script();
+        for stmt in [
+            "ALTER TABLE pairs ALTER COLUMN mood DROP DEFAULT;\nCREATE TYPE pairs_mood_enum_new AS ENUM ('ok', 'meh');\n\
+             ALTER TABLE pairs ALTER COLUMN mood TYPE pairs_mood_enum_new USING mood::text::pairs_mood_enum_new;\n\
+             DROP TYPE IF EXISTS pairs_mood_enum;\nALTER TYPE pairs_mood_enum_new RENAME TO pairs_mood_enum;\n\
+             ALTER TABLE pairs ALTER COLUMN mood SET DEFAULT 'ok';",
+            "COMMENT ON COLUMN pairs.a IS 'left';",
+            "COMMENT ON TABLE pairs IS 'P';",
+            "ALTER TABLE links DROP CONSTRAINT fk_links_x_y;",
+            "ALTER TABLE links ADD CONSTRAINT fk_links_x_y FOREIGN KEY (x, y) REFERENCES pairs (a, b) ON DELETE CASCADE;",
+        ] {
+            assert!(sql.contains(stmt), "{stmt}\nin\n{sql}");
+        }
+        let sql = diff(&old, &new, Dialect::Mysql).script();
+        for stmt in [
+            "ALTER TABLE pairs MODIFY COLUMN mood ENUM('ok', 'meh') DEFAULT 'ok';",
+            "ALTER TABLE pairs MODIFY COLUMN a INT NOT NULL COMMENT 'left';",
+            "ALTER TABLE pairs COMMENT = 'P';",
+            "ALTER TABLE links DROP FOREIGN KEY fk_links_x_y;",
+        ] {
+            assert!(sql.contains(stmt), "{stmt}\nin\n{sql}");
+        }
+        // The key comes back under its name and keeps the index MySQL made for it;
+        // a key that goes for good takes the index along.
+        assert!(!sql.contains("DROP INDEX"), "{sql}");
+        let unlinked = parse("table pairs { a int not null\n b int not null\n mood enum('ok', 'bad') default 'ok'\n pk (a, b) }\ntable links { id int pk\n x int\n y int }");
+        let sql = diff(&old, &unlinked.unwrap(), Dialect::Mysql).script();
+        assert!(sql.contains("ALTER TABLE links DROP FOREIGN KEY fk_links_x_y;\nALTER TABLE links DROP INDEX fk_links_x_y;"), "{sql}");
+        // Dropping the table drops its enum's type.
+        let sql = diff(&old, &parse("table links { id int pk }").unwrap(), Dialect::Postgres).script();
+        assert!(sql.contains("DROP TABLE pairs;\nDROP TYPE IF EXISTS pairs_mood_enum;"), "{sql}");
     }
 
     #[test]

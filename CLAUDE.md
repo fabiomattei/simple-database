@@ -33,6 +33,9 @@ cargo run --bin sdb-gui -- schema.dbs app.db --tab diagram
 
 Everything flows through the dialect-independent model in `src/schema.rs`
 (`Schema` → `Table` → `Column` / `Index`, `DataType`, `DefaultValue`, `ForeignKey`).
+A single-column foreign key is always `Column::references`; only keys over several columns are in
+`Table::foreign_keys` (`TableForeignKey`; the parser moves a one-column `fk (a) -> t (x)` onto the
+column). `Table::all_foreign_keys` gives both in one shape, for code that doesn't care.
 Structural edits go through `Schema::rename_table` / `drop_table` / `rename_column` /
 `drop_column`, which keep composite keys, indexes and foreign keys pointing at the right names.
 
@@ -55,7 +58,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `discover.rs` | Find databases in a project folder: `.env` URLs and Laravel `DB_*`, compose services (lenient line-based YAML scan), Prisma datasource |
 | `connections.rs` | Saved connections (`Store`: `connections.json` + 0600 `secrets.json` in `config_dir()`). `Connection::from_target` / `target` convert to and from URLs. `resolve("@name")` is called by `Database::open` |
 | `db.rs` | `Database`: one live connection (SQLite path or `postgres://` / `mysql://` URL). `introspect` (`introspect_with_skipped` also lists views, triggers, functions, … it can't model; `format::note_skipped` puts them in a pulled schema's header), `run` / `run_limited`, `run_script` (a file statement by statement, with line numbers; optional single transaction), `row_counts`, `migration`, `apply_migration`, `normalize_checks`. Also `Cell` / `QueryResult`, `split_statements` (knows quotes, comments, `$$` bodies and trigger `BEGIN … END`), `statements_with_lines` and `schema_from_sqlite_ddl` (DDL → `Schema` via an in-memory SQLite; the GUI's editable SQL tab) |
-| `sqlite.rs` | SQLite introspection, `run_limited` (multi-statement via `rusqlite::Batch`), `apply_migration` |
+| `sqlite.rs` | SQLite introspection, `run_limited` (multi-statement via `rusqlite::Batch`), `apply_migration`. Checks, enums and comments are read from the stored `CREATE TABLE` text (`table_items` splits it, keeping `--` / `/* */` comments) |
 | `pg.rs` | Postgres via the `postgres` crate (TLS through `tokio-postgres-rustls`): catalog introspection; queries are prepared for column types, then run with the simple protocol so every value arrives as text |
 | `mysqldb.rs` | MySQL via the `mysql` crate (pure Rust, rustls): `information_schema` introspection; checks are parsed from `SHOW CREATE TABLE` |
 | `tls.rs` | TLS for both servers from libpq-style URL parameters (`sslmode`, default `prefer`; `sslrootcert`, `sslcert`, `sslkey`). `split_url` strips them before the URL reaches the driver; `client_config` builds the rustls config |
@@ -105,8 +108,17 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   the `examples/blog.dbs` header. It usually also touches `ddl.rs`, `diff.rs`, `sqlite.rs`
   introspection, the README syntax table and the keyword lists in `gui/highlight.rs` (which also feed autocomplete).
   A new column modifier also needs a field in `gui/table_edit.rs`, which writes DSL lines and parses them.
-- Foreign key constraints are named `fk_<table>_<column>`. Postgres/MySQL migrations rely on
-  that name to drop them.
+- Foreign key constraints are named `fk_<table>_<column>` (`fk_<table>_<a>_<b>` over several
+  columns). Postgres/MySQL migrations rely on that name to drop them.
+- Enums (`DataType::Enum`): MySQL `ENUM(...)`; Postgres a type named `<table>_<column>_enum`
+  (`ddl::enum_type_name`, created before the table by `create_table_statements`, dropped with the
+  column or table, renamed with them, replaced through `<name>_new` when the values change); SQLite
+  `TEXT` plus `CONSTRAINT enum CHECK (col IN (...))`, the name being what introspection looks for.
+  Use `column_type_sql`, not `type_sql`, for a column's type.
+- Comments (`comment '...'` on tables and columns): Postgres `COMMENT ON` (separate statements, so
+  create tables with `create_table_statements`), MySQL `COMMENT`, SQLite a trailing `-- text` on the
+  column's line (the table's on the `CREATE TABLE … (` line), one line only: `canonical` folds
+  whitespace for SQLite. Any comment change rebuilds a SQLite table.
 - Check constraints are named `<table>_<column>_check` (Postgres picks this name; MySQL DDL
   sets it as a table constraint), and diffs rely on it.
 - `Database::apply_migration` is the only way migrations are executed (CLI `push` and the GUI's

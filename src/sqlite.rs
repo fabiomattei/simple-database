@@ -1,6 +1,7 @@
 //! Working with live SQLite databases: introspection and query execution.
 
 use crate::db::{Cell, QueryResult};
+use crate::ddl;
 use crate::schema::*;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, fallible_iterator::FallibleIterator, types::ValueRef};
@@ -52,7 +53,7 @@ pub fn introspect(conn: &Connection, skipped: &mut Vec<String>) -> Result<Schema
 }
 
 fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &mut Vec<String>) -> Result<Table> {
-    let checks = column_checks(create_sql);
+    let (table_comment, extras) = column_extras(create_sql);
     let autoincrement = create_sql.to_ascii_uppercase().contains("AUTOINCREMENT");
 
     // PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
@@ -84,7 +85,13 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &m
             col.auto_increment = autoincrement && col.data_type == DataType::Int;
         }
         col.default = dflt.map(|d| parse_default(&d, &col.data_type));
-        col.check = checks.iter().find(|(c, _)| *c == cname).map(|(_, e)| e.clone());
+        if let Some(extra) = extras.iter().find(|e| e.name == cname) {
+            col.check = extra.check.clone();
+            col.comment = extra.comment.clone();
+            if let (Some(values), DataType::Text) = (&extra.values, &col.data_type) {
+                col.data_type = DataType::Enum(values.clone());
+            }
+        }
         columns.push(col);
     }
 
@@ -97,13 +104,25 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &m
     let fks: Vec<FkRow> = stmt
         .query_map([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
         .collect::<Result<_, _>>()?;
+    let mut foreign_keys: Vec<TableForeignKey> = Vec::new();
     for (id, ftable, from, to, on_update, on_delete) in &fks {
-        if fks.iter().filter(|f| f.0 == *id).count() > 1 {
-            let cols: Vec<&str> = fks.iter().filter(|f| f.0 == *id).map(|f| f.2.as_str()).collect();
-            let note = format!("multi-column foreign key on {name} ({})", cols.join(", "));
-            if !skipped.contains(&note) {
-                skipped.push(note);
+        let parts: Vec<&FkRow> = fks.iter().filter(|f| f.0 == *id).collect();
+        if parts.len() > 1 {
+            if parts[0].2 != *from {
+                continue;
             }
+            // Without target columns, the key references the other table's primary key.
+            let ref_columns = match parts.iter().map(|f| f.3.clone()).collect::<Option<Vec<String>>>() {
+                Some(cols) => cols,
+                None => primary_key(conn, ftable)?,
+            };
+            foreign_keys.push(TableForeignKey {
+                columns: parts.iter().map(|f| f.2.clone()).collect(),
+                table: ftable.clone(),
+                ref_columns,
+                on_delete: RefAction::parse(on_delete).unwrap_or(RefAction::NoAction),
+                on_update: RefAction::parse(on_update).unwrap_or(RefAction::NoAction),
+            });
             continue;
         }
         if let Some(col) = columns.iter_mut().find(|c| c.name == *from) {
@@ -158,13 +177,16 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &m
         vec![]
     };
 
-    Ok(Table {
-        name: name.to_string(),
-        columns,
-        composite_pk,
-        indexes,
-        was: vec![],
-    })
+    // The pragma lists foreign keys last to first.
+    foreign_keys.reverse();
+    Ok(Table { columns, composite_pk, indexes, foreign_keys, comment: table_comment, ..Table::new(name) })
+}
+
+/// The primary key columns of `table`, in key order.
+fn primary_key(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;
+    let cols = stmt.query_map([table], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(cols)
 }
 
 fn parse_default(raw: &str, ty: &DataType) -> DefaultValue {
@@ -197,74 +219,199 @@ fn parse_default(raw: &str, ty: &DataType) -> DefaultValue {
     DefaultValue::Expr(s.to_string())
 }
 
-/// Split `s` on `sep` occurring outside parentheses and quotes.
-fn split_top_level(s: &str, sep: char) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    for ch in s.chars() {
-        match (quote, ch) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '\'' | '"' | '`') => quote = Some(ch),
-            (None, '(') => depth += 1,
-            (None, ')') => depth -= 1,
-            (None, c) if c == sep && depth == 0 => {
-                parts.push(std::mem::take(&mut cur));
-                continue;
-            }
-            _ => {}
-        }
-        cur.push(ch);
-    }
-    parts.push(cur);
-    parts
+/// One comma-separated part of a CREATE TABLE body, without its comments.
+#[derive(Debug, Default, PartialEq)]
+struct Item {
+    text: String,
+    /// `--` or `/* */` comments on its line(s), or on lines of their own above it.
+    comment: Option<String>,
 }
 
-/// Extract inline `CHECK (...)` expressions per column from a CREATE TABLE statement.
-fn column_checks(create_sql: &str) -> Vec<(String, String)> {
-    let (Some(open), Some(close)) = (create_sql.find('('), create_sql.rfind(')')) else {
-        return vec![];
+/// The body of a CREATE TABLE split into its items, and the comment on the
+/// line of its opening parenthesis (the table's).
+fn table_items(create_sql: &str) -> (Option<String>, Vec<Item>) {
+    let chars: Vec<char> = create_sql.chars().collect();
+    let mut i = 0;
+    let mut line = 0;
+    let mut quote: Option<char> = None;
+    // Up to the opening parenthesis; the table name may be quoted.
+    while i < chars.len() && !(quote.is_none() && chars[i] == '(') {
+        match (quote, chars[i]) {
+            (Some(q), c) if c == q || (q == '[' && c == ']') => quote = None,
+            (None, c @ ('"' | '`' | '\'' | '[')) => quote = Some(c),
+            (_, '\n') => line += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let open_line = line;
+    i += 1;
+    let mut table_comment: Option<String> = None;
+    let mut items: Vec<Item> = Vec::new();
+    let mut current = Item::default();
+    let mut pending: Vec<String> = Vec::new();
+    // Line where the last finished item ended.
+    let mut ended = None;
+    let mut depth = 0;
+    let add = |c: &mut Option<String>, text: String| match c {
+        Some(c) => *c = format!("{c} {text}"),
+        None => *c = Some(text),
     };
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if let Some(q) = quote {
+            current.text.push(c);
+            if c == q || (q == '[' && c == ']') {
+                quote = None;
+            }
+            line += usize::from(c == '\n');
+            i += 1;
+            continue;
+        }
+        let comment = match (c, next) {
+            ('-', Some('-')) => {
+                let end = (i..chars.len()).find(|&j| chars[j] == '\n').unwrap_or(chars.len());
+                let text: String = chars[i + 2..end].iter().collect();
+                i = end;
+                Some(text)
+            }
+            ('/', Some('*')) => {
+                let end = (i + 2..chars.len()).find(|&j| chars[j] == '*' && chars.get(j + 1) == Some(&'/')).unwrap_or(chars.len());
+                let text: String = chars[i + 2..end].iter().collect();
+                line += text.matches('\n').count();
+                i = end + 2;
+                Some(text)
+            }
+            _ => None,
+        };
+        if let Some(text) = comment {
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if text.is_empty() {
+                // Nothing to keep.
+            } else if !current.text.trim().is_empty() {
+                add(&mut current.comment, text);
+            } else if let (Some(prev), Some(l)) = (items.last_mut(), ended)
+                && l == line
+            {
+                add(&mut prev.comment, text);
+            } else if items.is_empty() && line == open_line {
+                add(&mut table_comment, text);
+            } else {
+                pending.push(text);
+            }
+            current.text.push(' ');
+            continue;
+        }
+        match c {
+            '"' | '`' | '\'' | '[' => quote = Some(c),
+            '(' => depth += 1,
+            ')' if depth == 0 => break,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let mut item = std::mem::take(&mut current);
+                if !pending.is_empty() {
+                    add(&mut item.comment, pending.join(" "));
+                    pending.clear();
+                }
+                items.push(item);
+                ended = Some(line);
+                i += 1;
+                continue;
+            }
+            '\n' => line += 1,
+            _ => {}
+        }
+        current.text.push(c);
+        i += 1;
+    }
+    if !current.text.trim().is_empty() {
+        if !pending.is_empty() {
+            add(&mut current.comment, pending.join(" "));
+        }
+        items.push(current);
+    }
+    for item in &mut items {
+        item.text = item.text.trim().to_string();
+    }
+    (table_comment, items)
+}
+
+/// What a column's definition in the CREATE TABLE says beyond the pragmas.
+#[derive(Debug, Default, PartialEq)]
+struct ColumnExtra {
+    name: String,
+    check: Option<String>,
+    /// The values of an enum (`CONSTRAINT enum CHECK (x IN (...))`).
+    values: Option<Vec<String>>,
+    comment: Option<String>,
+}
+
+/// The table's comment and, per column, its `CHECK (...)` expression, enum values and comment.
+fn column_extras(create_sql: &str) -> (Option<String>, Vec<ColumnExtra>) {
+    let (table_comment, items) = table_items(create_sql);
     let mut out = Vec::new();
-    for item in split_top_level(&create_sql[open + 1..close], ',') {
-        let item = item.trim();
-        let first = item.split_whitespace().next().unwrap_or("");
+    for item in items {
+        let first = item.text.split_whitespace().next().unwrap_or("");
         let is_constraint = ["CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK"]
             .contains(&first.to_ascii_uppercase().as_str());
         if is_constraint {
             continue;
         }
-        let (col, rest) = leading_ident(item);
-        // The CHECK keyword, not the word inside a string, a name or another expression.
-        let Some(kw) = crate::safety::scan(rest).into_iter().find(|w| w.depth == 0 && w.text == "check") else { continue };
-        let rest = &rest[kw.at + 5..];
-        let Some(start) = rest.find('(') else { continue };
-        let mut depth = 0;
-        let mut end = None;
-        let mut quote: Option<char> = None;
-        for (i, ch) in rest[start..].char_indices() {
-            match (quote, ch) {
-                (Some(q), c) if c == q => quote = None,
-                (Some(_), _) => {}
-                (None, '\'' | '"') => quote = Some(ch),
-                (None, '(') => depth += 1,
-                (None, ')') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(start + i);
-                        break;
-                    }
-                }
-                _ => {}
+        let (name, rest) = leading_ident(&item.text);
+        let mut extra = ColumnExtra { name, comment: item.comment, ..ColumnExtra::default() };
+        // The CHECK keywords, not the word inside a string, a name or another expression.
+        let words = crate::safety::scan(rest);
+        for (k, kw) in words.iter().enumerate().filter(|(_, w)| w.depth == 0 && w.text == "check") {
+            let Some(expr) = paren_group(&rest[kw.at + 5..]) else { continue };
+            let named_enum = k >= 2 && words[k - 2].text == "constraint" && words[k - 1].text == ddl::SQLITE_ENUM;
+            match enum_check(&extra.name, expr).filter(|_| named_enum && extra.values.is_none()) {
+                Some(values) => extra.values = Some(values),
+                None if extra.check.is_none() => extra.check = Some(expr.trim().to_string()),
+                None => {}
             }
         }
-        if let Some(end) = end {
-            out.push((col, rest[start + 1..end].trim().to_string()));
+        out.push(extra);
+    }
+    (table_comment, out)
+}
+
+/// The inside of the parenthesised group `s` starts with (after whitespace).
+fn paren_group(s: &str) -> Option<&str> {
+    let start = s.find('(').filter(|&p| s[..p].trim().is_empty())?;
+    let mut depth = 0;
+    let mut quote: Option<char> = None;
+    for (i, ch) in s[start..].char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start + 1..start + i]);
+                }
+            }
+            _ => {}
         }
     }
-    out
+    None
+}
+
+/// The values of `column IN ('a', 'b')`, as `ddl::column_sql` writes an enum's check.
+fn enum_check(column: &str, expr: &str) -> Option<Vec<String>> {
+    let (name, rest) = leading_ident(expr.trim());
+    let rest = rest.trim_start();
+    let list = rest.get(..2).filter(|w| w.eq_ignore_ascii_case("in")).map(|_| &rest[2..])?;
+    if name != column {
+        return None;
+    }
+    let inner = paren_group(list).filter(|g| list.trim().len() == g.len() + 2)?;
+    match DataType::parse(&format!("enum({inner})")) {
+        DataType::Enum(values) => Some(values),
+        _ => None,
+    }
 }
 
 /// The leading identifier of a column definition, unquoted, and the rest.
@@ -447,7 +594,6 @@ mod tests {
         assert_eq!(
             skipped,
             [
-                "multi-column foreign key on b (x, y)",
                 "index b_lower on b (on an expression, or partial)",
                 "index b_named on b (on an expression, or partial)",
                 "trigger b_audit on b",
@@ -456,6 +602,37 @@ mod tests {
         );
         let indexes: Vec<&str> = schema.table("b").unwrap().indexes.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(indexes, ["b_x"]);
+        let fk = &schema.table("b").unwrap().foreign_keys;
+        assert_eq!((fk[0].columns.join(","), fk[0].table.as_str(), fk[0].ref_columns.join(",")), ("x,y".into(), "a", "x,y".into()));
+    }
+
+    #[test]
+    fn reads_comments_and_enums_from_the_create_statement() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE a (x INT, y INT, PRIMARY KEY (x, y));\n\
+             CREATE TABLE \"b (c)\" ( -- People, (who) 'log in'\n\
+               -- the key\n\
+               id INTEGER PRIMARY KEY, /* trailing */\n\
+               mood TEXT CONSTRAINT enum CHECK (mood IN ('ok', 'it''s, -- fine')) CHECK (mood <> 'x'), -- how they feel\n\
+               x INT, y INT,\n\
+               note TEXT CHECK (note <> '--') -- last\n\
+                 -- and more\n\
+               , FOREIGN KEY (y, x) REFERENCES a\n\
+             );",
+        )
+        .unwrap();
+        let schema = introspect(&conn, &mut Vec::new()).unwrap();
+        let b = schema.table("b (c)").unwrap();
+        assert_eq!(b.comment.as_deref(), Some("People, (who) 'log in'"));
+        let comments: Vec<Option<&str>> = b.columns.iter().map(|c| c.comment.as_deref()).collect();
+        assert_eq!(comments, [Some("the key trailing"), Some("how they feel"), None, None, Some("last and more")]);
+        let mood = b.column("mood").unwrap();
+        assert_eq!(mood.data_type, DataType::Enum(vec!["ok".into(), "it's, -- fine".into()]));
+        assert_eq!(mood.check.as_deref(), Some("mood <> 'x'"));
+        assert_eq!(b.column("note").unwrap().check.as_deref(), Some("note <> '--'"));
+        // Without target columns, the key points at the primary key.
+        assert_eq!(b.foreign_keys[0].ref_columns, ["x", "y"]);
     }
 
     #[test]
@@ -468,8 +645,9 @@ mod tests {
             [c] INT check(c < 9),
             CHECK (checked IN (0, 1))
         )"#;
+        let checks: Vec<(String, String)> = column_extras(sql).1.into_iter().filter_map(|e| Some((e.name, e.check?))).collect();
         assert_eq!(
-            column_checks(sql),
+            checks,
             [
                 ("two words".to_string(), r#""two words" <> ''"#.to_string()),
                 ("a\"b".into(), r#"("a""b") > 0"#.into()),
@@ -499,8 +677,9 @@ mod tests {
         let types = [
             DataType::Int, DataType::BigInt, DataType::SmallInt, DataType::Real, DataType::Decimal(8, 2), DataType::Bool,
             DataType::Text, DataType::Varchar(40), DataType::Date, DataType::Time, DataType::Timestamp, DataType::Blob,
-            DataType::Uuid, DataType::Json,
+            DataType::Uuid, DataType::Json, DataType::Enum(vec!["a".into(), "it's, (b)".into(), "-- c".into()]),
         ];
+        const COMMENTS: &[&str] = &["People", "it's, a (note) -- /* x */ \"q\"", "ends with a comma,", "*/ odd"];
         let actions = [RefAction::NoAction, RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault, RefAction::Restrict];
 
         let mut rng = Rng(7);
@@ -534,6 +713,7 @@ mod tests {
                             (t, _) if t.is_integer() => Some(DefaultValue::Number("-3".into())),
                             (DataType::Real | DataType::Decimal(..), _) => Some(DefaultValue::Number("1.5".into())),
                             (DataType::Timestamp, _) => Some(DefaultValue::Now),
+                            (DataType::Enum(values), _) => Some(DefaultValue::String(values[1].clone())),
                             (DataType::Text | DataType::Varchar(_), 1) => Some(DefaultValue::String("it's, \"x\"".into())),
                             (DataType::Text | DataType::Varchar(_), _) => Some(DefaultValue::Expr("lower('A')".into())),
                             _ => None,
@@ -555,9 +735,26 @@ mod tests {
                             });
                         }
                     }
+                    if rng.chance(0.3) {
+                        c.comment = Some(rng.pick(COMMENTS).to_string());
+                    }
                     columns.push(c);
                 }
                 let composite_pk = if composite { names[..2].to_vec() } else { vec![] };
+                // Reference the composite key of an earlier table from two plain columns.
+                let mut foreign_keys = Vec::new();
+                let free: Vec<&Column> = columns.iter().skip(1).filter(|c| c.references.is_none() && !composite_pk.contains(&c.name)).collect();
+                let targets: Vec<&Table> = schema.tables.iter().filter(|t| !t.composite_pk.is_empty()).collect();
+                if free.len() >= 2 && !targets.is_empty() && rng.chance(0.5) {
+                    let target = rng.pick(&targets);
+                    foreign_keys.push(TableForeignKey {
+                        columns: vec![free[1].name.clone(), free[0].name.clone()],
+                        table: target.name.clone(),
+                        ref_columns: target.composite_pk.clone(),
+                        on_delete: *rng.pick(&actions),
+                        on_update: *rng.pick(&actions),
+                    });
+                }
                 let mut indexes = Vec::new();
                 if names.len() >= 2 && rng.chance(0.5) {
                     let unique = rng.chance(0.5);
@@ -565,7 +762,8 @@ mod tests {
                     let name = format!("{tname}_{}_{}", cols[0], if unique { "key" } else { "idx" });
                     indexes.push(Index { name, columns: cols, unique });
                 }
-                schema.tables.push(Table { name: tname, columns, composite_pk, indexes, was: vec![] });
+                let comment = rng.chance(0.3).then(|| rng.pick(COMMENTS).to_string());
+                schema.tables.push(Table { columns, composite_pk, indexes, foreign_keys, comment, ..Table::new(tname) });
             }
             let sql = schema_sql(&schema, Dialect::Sqlite);
             let conn = Connection::open_in_memory().unwrap();

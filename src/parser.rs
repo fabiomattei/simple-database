@@ -7,10 +7,11 @@
 //!   email      varchar(255) unique not null
 //!   role       text not null default 'member' check (role in ('member', 'admin'))
 //!   team_id    int -> teams.id on delete cascade
-//!   created_at timestamp not null default now
+//!   created_at timestamp not null default now comment 'set on insert'
 //!
 //!   index (team_id)
 //!   unique index users_email_role (email, role)
+//!   fk (team_id, role) -> team_roles (team_id, role)
 //! }
 //! ```
 
@@ -279,21 +280,18 @@ impl Parser {
 
     fn parse_table(&mut self) -> Result<Table, ParseError> {
         let name = self.expect_word("table name")?;
-        let mut was = vec![];
+        let mut table = Table::new(name);
         if self.eat_keyword("was") {
-            self.parse_was(&mut was)?;
+            self.parse_was(&mut table.was)?;
+        }
+        if self.eat_keyword("comment") {
+            table.comment = self.parse_comment()?;
         }
         let line = self.line();
         if self.next() != Tok::LBrace {
-            return err(line, format!("expected '{{' after table name '{name}'"));
+            return err(line, format!("expected '{{' after table name '{}'", table.name));
         }
-        let mut table = Table {
-            name,
-            columns: vec![],
-            composite_pk: vec![],
-            indexes: vec![],
-            was,
-        };
+        let start = line;
         loop {
             self.skip_ends();
             if self.at_eof() {
@@ -310,6 +308,21 @@ impl Parser {
                 other => return err(line, format!("unexpected {other}")),
             }
         }
+        // A foreign key over one column belongs to that column.
+        for fk in std::mem::take(&mut table.foreign_keys) {
+            match table.columns.iter_mut().find(|c| fk.columns.len() == 1 && c.name == fk.columns[0]) {
+                Some(c) if c.references.is_some() => return err(start, format!("column '{}' has two foreign keys", c.name)),
+                Some(c) => {
+                    c.references = Some(ForeignKey {
+                        table: fk.table,
+                        column: fk.ref_columns[0].clone(),
+                        on_delete: fk.on_delete,
+                        on_update: fk.on_update,
+                    })
+                }
+                None => table.foreign_keys.push(fk),
+            }
+        }
         Ok(table)
     }
 
@@ -323,10 +336,32 @@ impl Parser {
         let is_index = first == "index" && self.looks_like_index();
         let is_unique_index = first == "unique"
             && (second_is_paren || matches!(self.peek_at(1), Tok::Word(w) if w.eq_ignore_ascii_case("index")));
-        let is_pk = (first == "pk" && second_is_paren)
-            || (first == "primary"
-                && matches!(self.peek_at(1), Tok::Word(w) if w.eq_ignore_ascii_case("key"))
-                && matches!(self.peek_at(2), Tok::Paren(_)));
+        let key_list = matches!(self.peek_at(1), Tok::Word(w) if w.eq_ignore_ascii_case("key")) && matches!(self.peek_at(2), Tok::Paren(_));
+        let is_pk = (first == "pk" && second_is_paren) || (first == "primary" && key_list);
+        let is_fk = (first == "fk" && second_is_paren) || (first == "foreign" && key_list);
+
+        if is_fk {
+            self.pos += if first == "fk" { 1 } else { 2 };
+            let columns = self.expect_paren_list("foreign key columns")?;
+            let line = self.line();
+            match self.next() {
+                Tok::Arrow => {}
+                Tok::Word(w) if w.eq_ignore_ascii_case("references") => {}
+                other => return err(line, format!("expected '->' after the foreign key columns, found {other}")),
+            }
+            let target = self.expect_word("referenced table")?;
+            let ref_columns = self.expect_paren_list("referenced columns")?;
+            if ref_columns.len() != columns.len() {
+                return err(line, format!("{} columns reference {} columns", columns.len(), ref_columns.len()));
+            }
+            let mut fk = TableForeignKey { columns, table: target, ref_columns, on_delete: RefAction::NoAction, on_update: RefAction::NoAction };
+            while self.eat_keyword("on") {
+                let (event, action) = self.parse_action()?;
+                if event == "delete" { fk.on_delete = action } else { fk.on_update = action }
+            }
+            table.foreign_keys.push(fk);
+            return Ok(());
+        }
 
         if is_pk {
             self.pos += if first == "pk" { 1 } else { 2 };
@@ -488,23 +523,13 @@ impl Parser {
                             });
                         }
                         "on" => {
-                            let event = self.expect_word("'delete' or 'update'")?.to_ascii_lowercase();
-                            let mut action = self.expect_word("referential action")?;
-                            if matches!(action.to_ascii_lowercase().as_str(), "set" | "no") {
-                                action = format!("{action} {}", self.expect_word("referential action")?);
-                            }
-                            let Some(action) = RefAction::parse(&action) else {
-                                return err(line, format!("unknown referential action '{action}' (use cascade, set_null, set_default, restrict, no_action)"));
-                            };
+                            let (event, action) = self.parse_action()?;
                             let Some(fk) = col.references.as_mut() else {
                                 return err(line, "'on delete/update' must follow a reference ('-> table.column')");
                             };
-                            match event.as_str() {
-                                "delete" => fk.on_delete = action,
-                                "update" => fk.on_update = action,
-                                other => return err(line, format!("expected 'delete' or 'update' after 'on', found '{other}'")),
-                            }
+                            if event == "delete" { fk.on_delete = action } else { fk.on_update = action }
                         }
+                        "comment" => col.comment = self.parse_comment()?,
                         other => return err(line, format!("unknown column modifier '{other}' on column '{}'", col.name)),
                     }
                 }
@@ -516,6 +541,33 @@ impl Parser {
             col.nullable = false;
         }
         Ok(col)
+    }
+
+    /// `delete cascade` after `on`: the event and the action.
+    fn parse_action(&mut self) -> Result<(&'static str, RefAction), ParseError> {
+        let line = self.line();
+        let event = match self.expect_word("'delete' or 'update'")?.to_ascii_lowercase().as_str() {
+            "delete" => "delete",
+            "update" => "update",
+            other => return err(line, format!("expected 'delete' or 'update' after 'on', found '{other}'")),
+        };
+        let mut action = self.expect_word("referential action")?;
+        if matches!(action.to_ascii_lowercase().as_str(), "set" | "no") {
+            action = format!("{action} {}", self.expect_word("referential action")?);
+        }
+        match RefAction::parse(&action) {
+            Some(a) => Ok((event, a)),
+            None => err(line, format!("unknown referential action '{action}' (use cascade, set_null, set_default, restrict, no_action)")),
+        }
+    }
+
+    /// The string after `comment`; an empty one means no comment.
+    fn parse_comment(&mut self) -> Result<Option<String>, ParseError> {
+        let line = self.line();
+        match self.next() {
+            Tok::Str(s) => Ok(Some(s).filter(|s| !s.is_empty())),
+            other => err(line, format!("expected a quoted string after 'comment', found {other}")),
+        }
     }
 
     fn parse_default(&mut self) -> Result<DefaultValue, ParseError> {
@@ -675,8 +727,9 @@ pub fn outline(src: &str) -> Vec<OutlineTable> {
                 let constraint = lower.starts_with("index(")
                     || lower.starts_with("unique(")
                     || lower.starts_with("pk(")
+                    || lower.starts_with("fk(")
                     || (lower == "unique" && second.starts_with("index"))
-                    || (lower == "primary" && second.starts_with("key("))
+                    || ((lower == "primary" || lower == "foreign") && second.starts_with("key("))
                     || (lower == "index"
                         && second.split_once('(').is_some_and(|(ty, _)| matches!(DataType::parse(ty), DataType::Custom(_))));
                 if !constraint && !first.starts_with(['(', '\'', '"']) && let Some(t) = tables.last_mut() {
@@ -757,6 +810,44 @@ mod tests {
         assert_eq!(pt.composite_pk, vec!["post_id", "tag"]);
         let fk = pt.column("post_id").unwrap().references.as_ref().unwrap();
         assert_eq!(fk.on_delete, RefAction::SetNull);
+    }
+
+    #[test]
+    fn parses_keys_enums_and_comments() {
+        let s = parse(
+            "table pairs comment 'Pairs, it''s' { a int not null comment 'left'\n b int\n mood enum('ok', it, 'x''y') default 'ok'\n pk (a, b) }\n\
+             table links was old_links comment '' { id int pk\n x int\n y int\n z int\n \
+             fk (x, y) -> pairs (a, b) on delete cascade on update restrict\n foreign key (y, x) references pairs (b, a)\n fk (z) -> links (id) }",
+        )
+        .unwrap();
+        let pairs = s.table("pairs").unwrap();
+        assert_eq!(pairs.comment.as_deref(), Some("Pairs, it's"));
+        assert_eq!(pairs.column("a").unwrap().comment.as_deref(), Some("left"));
+        assert_eq!(pairs.column("mood").unwrap().data_type, DataType::Enum(vec!["ok".into(), "it".into(), "x'y".into()]));
+        let links = s.table("links").unwrap();
+        assert_eq!((links.comment.as_ref(), links.was.as_slice()), (None, ["old_links".to_string()].as_slice()), "an empty comment is none");
+        let fk = &links.foreign_keys[0];
+        assert_eq!((fk.columns.join(","), fk.table.as_str(), fk.ref_columns.join(",")), ("x,y".into(), "pairs", "a,b".into()));
+        assert_eq!((fk.on_delete, fk.on_update), (RefAction::Cascade, RefAction::Restrict));
+        assert_eq!(links.foreign_keys[1].columns, ["y", "x"]);
+        // A key over one column is the column's.
+        assert_eq!(links.foreign_keys.len(), 2);
+        assert_eq!(links.column("z").unwrap().references.as_ref().map(|fk| fk.column.as_str()), Some("id"));
+        // Columns may still be called like the keywords.
+        let t = parse("table t { fk int\n foreign text\n comment \"int unsigned\" comment 'c'\n enum enum('a') }").unwrap();
+        let names: Vec<&str> = t.tables[0].columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["fk", "foreign", "comment", "enum"]);
+        assert_eq!(t.tables[0].columns[2].comment.as_deref(), Some("c"));
+
+        for (src, message) in [
+            ("table t { a int\n fk (a) -> u (x, y) }", "1 columns reference 2 columns"),
+            ("table t { a int -> u.x\n fk (a) -> u (y) }", "column 'a' has two foreign keys"),
+            ("table t { a int comment c }", "expected a quoted string after 'comment'"),
+            ("table t { a int\n fk (a) u (x) }", "expected '->' after the foreign key columns"),
+        ] {
+            let e = parse(src).unwrap_err();
+            assert!(e.message.contains(message), "{src}: {}", e.message);
+        }
     }
 
     #[test]

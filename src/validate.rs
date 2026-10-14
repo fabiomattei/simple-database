@@ -100,47 +100,75 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
                 warn(loc.clone(), format!("unknown type '{ty}' will be passed through verbatim"));
             }
 
-            let Some(fk) = &c.references else { continue };
+            if let DataType::Enum(values) = &c.data_type {
+                if let Some(v) = values.iter().enumerate().find(|(i, v)| values[..*i].contains(v)).map(|(_, v)| v) {
+                    error(loc.clone(), format!("enum value '{v}' is listed twice"));
+                }
+                if let Some(DefaultValue::String(v)) = &c.default
+                    && !values.contains(v)
+                {
+                    error(loc.clone(), format!("default '{v}' is not one of the enum's values"));
+                }
+            }
+        }
+
+        for fk in t.all_foreign_keys() {
+            let single = fk.columns.len() == 1;
+            // A column's own key is reported at the column, a multi-column one at the table.
+            let loc = if single { format!("{}.{}", t.name, fk.columns[0]) } else { t.name.clone() };
+            let what = if single { String::new() } else { format!("foreign key ({}) ", fk.columns.join(", ")) };
+            let cols: Vec<&Column> = fk.columns.iter().filter_map(|c| t.column(c)).collect();
+            if let Some(missing) = fk.columns.iter().find(|c| t.column(c).is_none()) {
+                error(loc.clone(), format!("{what}uses unknown column '{missing}'"));
+                continue;
+            }
+            if fk.columns.len() != fk.ref_columns.len() {
+                error(loc.clone(), format!("{what}has {} columns but references {}", fk.columns.len(), fk.ref_columns.len()));
+                continue;
+            }
             let Some(target_table) = schema.table(&fk.table) else {
-                error(loc.clone(), format!("references unknown table '{}'", fk.table));
+                error(loc.clone(), format!("{what}references unknown table '{}'", fk.table));
                 continue;
             };
-            let Some(target) = target_table.column(&fk.column) else {
-                error(loc.clone(), format!("references unknown column '{}.{}'", fk.table, fk.column));
+            let Some(targets) = fk.ref_columns.iter().map(|c| target_table.column(c)).collect::<Option<Vec<&Column>>>() else {
+                let missing = fk.ref_columns.iter().find(|c| target_table.column(c).is_none()).expect("one is missing");
+                error(loc.clone(), format!("{what}references unknown column '{}.{missing}'", fk.table));
                 continue;
             };
 
-            if (fk.on_delete == RefAction::SetNull || fk.on_update == RefAction::SetNull) && !c.nullable {
-                error(loc.clone(), "uses SET NULL but the column is NOT NULL".into());
+            let set_null = fk.on_delete == RefAction::SetNull || fk.on_update == RefAction::SetNull;
+            if set_null && cols.iter().any(|c| !c.nullable) {
+                error(loc.clone(), format!("{what}uses SET NULL but the column is NOT NULL"));
             }
-            let target_is_key = target_table.primary_key() == [target.name.clone()]
-                || target.unique
-                || target_table
-                    .indexes
-                    .iter()
-                    .any(|i| i.unique && i.columns == [target.name.clone()]);
+            let same = |a: &[String]| a.len() == fk.ref_columns.len() && a.iter().all(|c| fk.ref_columns.contains(c));
+            let target_is_key = same(&target_table.primary_key())
+                || (single && targets[0].unique)
+                || target_table.indexes.iter().any(|i| i.unique && same(&i.columns));
+            let shown = if single { format!("{}.{}", fk.table, fk.ref_columns[0]) } else { format!("{} ({})", fk.table, fk.ref_columns.join(", ")) };
             if !target_is_key {
-                error(
-                    loc.clone(),
-                    format!("references {}.{} which is neither a primary key nor unique", fk.table, fk.column),
-                );
+                error(loc.clone(), format!("{what}references {shown} which is neither a primary key nor unique"));
             }
-            if !types_compatible(&c.data_type, &target.data_type) {
-                warn(
-                    loc.clone(),
-                    format!(
-                        "type {} differs from referenced {}.{} ({})",
-                        c.data_type, fk.table, fk.column, target.data_type
-                    ),
-                );
+            for (c, target) in cols.iter().zip(&targets) {
+                if !types_compatible(&c.data_type, &target.data_type) {
+                    let place = if single { String::new() } else { format!("{} ", c.name) };
+                    warn(
+                        loc.clone(),
+                        format!("{place}type {} differs from referenced {}.{} ({})", c.data_type, fk.table, target.name, target.data_type),
+                    );
+                }
             }
-            let indexed = t.indexes.iter().any(|i| i.columns.first() == Some(&c.name))
-                || t.primary_key().first() == Some(&c.name)
-                || c.unique;
+            // An index whose first columns are the key's, in any order.
+            let leads = |idx: &[String]| idx.len() >= fk.columns.len() && fk.columns.iter().all(|c| idx[..fk.columns.len()].contains(c));
+            let indexed = t.indexes.iter().any(|i| leads(&i.columns)) || leads(&t.primary_key()) || (single && cols[0].unique);
             if !indexed {
                 warn(
                     loc.clone(),
-                    format!("foreign key is not indexed; joins and cascading deletes on '{}' will scan the table (add `index ({})`)", fk.table, c.name),
+                    format!(
+                        "{}is not indexed; joins and cascading deletes on '{}' will scan the table (add `index ({})`)",
+                        if single { "foreign key " } else { &what },
+                        fk.table,
+                        fk.columns.join(", ")
+                    ),
                 );
             }
         }
@@ -186,6 +214,23 @@ mod tests {
             "table a { id int pk }\n table b { id int pk\n a_id int -> a.id\n index (a_id) }",
         );
         assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn checks_multi_column_keys_and_enums() {
+        let m = messages(
+            "table a { x int\n y int\n s enum('on', 'off', 'on') default 'maybe'\n pk (x, y) }\n\
+             table b { id int pk\n x int not null\n y int\n fk (x, y) -> a (y, x) on delete set null }\n\
+             table c { id int pk\n x int\n y int\n fk (x, y) -> a (x, s)\n fk (y, z) -> a (x, y)\n index (x, y) }",
+        );
+        let joined = m.join("\n");
+        assert!(joined.contains("Error a.s: enum value 'on' is listed twice"), "{joined}");
+        assert!(joined.contains("Error a.s: default 'maybe' is not one of the enum's values"), "{joined}");
+        assert!(joined.contains("Error b: foreign key (x, y) uses SET NULL but the column is NOT NULL"), "{joined}");
+        assert!(joined.contains("Warning b: foreign key (x, y) is not indexed"), "{joined}");
+        assert!(joined.contains("Error c: foreign key (x, y) references a (x, s) which is neither a primary key nor unique"), "{joined}");
+        assert!(joined.contains("Error c: foreign key (y, z) uses unknown column 'z'"), "{joined}");
+        assert!(!joined.contains("Error b: foreign key (x, y) references"), "the key's columns in another order: {joined}");
     }
 
     #[test]

@@ -66,8 +66,9 @@ generated SQL next to the editor, in the dialect you pick. **Format** (Ctrl+Shif
 columns of every table and keeps comments and blank lines.
 
 The **Diagram** tab edits the schema file too. Double-click a table (or right-click → **Edit
-table…**) to rename it and edit its columns in a grid: type, PK, not null, unique, autoincrement,
-default, check, reference and its `on delete` action. Renames carry over to keys, indexes and the
+table…**) to rename it, set its comment and edit its columns in a grid: type, PK, not null, unique,
+autoincrement, default, check, comment, reference and its `on delete` action. Hovering a table or
+column shows its comment. Renames carry over to keys, indexes and the
 foreign keys pointing at them and are written down as `was` hints (see [Renames](#renames)), and an
 edit that would make the schema invalid is refused. Right-click
 the background for **New table…**, or a table to add a column, delete the column under the pointer,
@@ -80,7 +81,8 @@ The **SQL** tab edits the same schema as SQL. With the SQLite dialect selected, 
 `CREATE TABLE` / `CREATE INDEX` statements updates the schema text, and editing the schema
 updates the SQL. The SQL is checked by running it in a scratch in-memory SQLite database, so
 errors are SQLite's, shown on the statement's line. Only tables you change are rewritten in the
-schema text, so comments elsewhere are kept. Comments inside a rewritten table are lost. SQL
+schema text, so comments elsewhere are kept. Inside a rewritten table, a `-- comment` at the end of
+a column's line (or of the `CREATE TABLE … (` line) becomes its `comment`; others are lost. SQL
 edits don't apply while the schema text has a syntax error. **Regenerate** discards SQL edits
 that didn't apply. PostgreSQL and MySQL output is read-only.
 
@@ -125,11 +127,12 @@ sdb init                    # writes a starter schema.dbs
 ## The schema language (`.dbs`)
 
 ```text
-table users {
-  id          int           pk autoincrement
-  email       varchar(255)  unique not null
-  role        text          not null default 'author' check (role in ('author', 'admin'))
-  created_at  timestamp     not null default now
+table users comment 'People who can sign in' {
+  id          int                         pk autoincrement
+  email       varchar(255)                unique not null
+  role        enum('author', 'admin')     not null default 'author'
+  age         int                         check (age >= 18)
+  created_at  timestamp                   not null default now comment 'Set on insert'
 }
 
 table posts {
@@ -146,17 +149,37 @@ table post_tags {
   tag      text not null
   pk (post_id, tag)
 }
+
+table tag_votes {
+  post_id  int  not null
+  tag      text not null
+  user_id  int  not null -> users.id
+  pk (post_id, tag, user_id)
+  fk (post_id, tag) -> post_tags (post_id, tag) on delete cascade
+  index (user_id)
+}
 ```
 
 | | |
 |---|---|
-| Types | `int bigint smallint real decimal(p,s) bool text varchar(n) date time timestamp blob uuid json` (anything else is passed through verbatim; quote a type of several words: `"int unsigned"`) |
-| Column modifiers | `pk` `autoincrement` `unique` `not null` `null` `default <v>` `check (<expr>)` `-> table.col` (or `references table(col)`) `on delete <a>` `on update <a>` `was <old>` (or `was (a, b)`) |
+| Types | `int bigint smallint real decimal(p,s) bool text varchar(n) date time timestamp blob uuid json enum('a', 'b')` (anything else is passed through verbatim; quote a type of several words: `"int unsigned"`) |
+| Column modifiers | `pk` `autoincrement` `unique` `not null` `null` `default <v>` `check (<expr>)` `-> table.col` (or `references table(col)`) `on delete <a>` `on update <a>` `was <old>` (or `was (a, b)`) `comment 'text'` |
 | Referential actions | `cascade` `set_null` `set_default` `restrict` `no_action` |
 | Defaults | `'text'` `42` `true` `null` `now` `fn()` `(any sql expression)` |
-| Table level | `index [name] (a, b)` `unique index [name] (a, b)` `pk (a, b)` |
-| Renamed table | `table people was users { ... }` |
-| Comments | `# ...` or `// ...` |
+| Table level | `index [name] (a, b)` `unique index [name] (a, b)` `pk (a, b)` `fk (a, b) -> table (x, y) [on delete <a>] [on update <a>]` (or `foreign key (a, b) references table (x, y)`) |
+| Table header | `table people was users comment 'text' { ... }` (`was` and `comment` are optional) |
+| Comments | `# ...` or `// ...` (kept in the file only; `comment '...'` goes to the database) |
+
+* **Enums** are a native type on MySQL (`ENUM(...)`) and Postgres (a type named
+  `<table>_<column>_enum`, created, changed and dropped with the column). SQLite has no enums: the
+  column is `TEXT` with a check named `enum` (`CONSTRAINT enum CHECK (role IN (...))`), which is how
+  `pull` recognizes it. Changing the values migrates the column; rows must hold one of the new values.
+* **Multi-column foreign keys** point at a composite primary key or unique index, such as a join
+  table's. A one-column `fk (a) -> t (x)` is the same as `a ... -> t.x`. Their constraints are named
+  `fk_<table>_<a>_<b>`.
+* **Comments** become Postgres `COMMENT ON`, MySQL `COMMENT`, and on SQLite a `-- comment` at the end
+  of the column's line in `CREATE TABLE` (one line, since SQLite can only keep them in that text).
+  `pull` reads them all back.
 
 ## Commands
 
@@ -203,7 +226,7 @@ verifies the CA, as libpq does:
 | `sdb diagram SCHEMA -f mermaid\|dot` | ER diagram: paste Mermaid into GitHub/GitLab markdown, or `\| dot -Tsvg > er.svg` |
 | `sdb diff FROM TO -d DIALECT [-o file]` | Summary of changes + migration SQL |
 | `sdb push SCHEMA --db app.db [--dry-run] [-y]` | Migrate a database to match the schema |
-| `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database. What a schema can't describe (views, triggers, functions, enum types, expression and partial indexes, multi-column foreign keys) is listed in comments at the top |
+| `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database. What a schema can't describe (views, triggers, functions, enum types no column uses, expression and partial indexes, table-level checks) is listed in comments at the top |
 | `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42] [-y]` | Fill tables with realistic fake data (see below) |
 | `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown] [-y]` | Run SQL, print results. `-y` skips safe mode's question |
 | `sdb exec FILE --db app.db [-1] [--continue] [-v] [-f FORMAT] [-y]` | Run a SQL file statement by statement (see below) |
@@ -327,8 +350,9 @@ Statements end with `;` and may span lines. History is saved to `shell_history` 
 `sdb seed` reads the live database schema and inserts rows that satisfy it:
 
 * **Foreign keys**: parent tables are filled first, and child rows point at existing parent rows.
-  Self-references (`manager_id -> employees.id`) point at rows inserted earlier.
-* **Constraints**: `check (x in ('a', 'b'))` picks from the list, and `>=`, `<=` and `between`
+  Self-references (`manager_id -> employees.id`) point at rows inserted earlier. A multi-column
+  key takes all its values from one parent row.
+* **Constraints**: `enum(...)` and `check (x in ('a', 'b'))` pick from the list, and `>=`, `<=` and `between`
   bound numbers. Rows that break any other unique or check constraint are regenerated. After
   50 rejections in a row the table stops and the reason is reported. That happens, for
   example, when a join table asks for more distinct pairs than exist.
@@ -343,7 +367,8 @@ Statements end with `;` and may span lines. History is saved to `shell_history` 
 
 * **PostgreSQL**: `ALTER TABLE ... ALTER COLUMN` for type/null/default changes; named
   constraints (`fk_<table>_<col>`) so foreign keys can be dropped and re-added. Wrapped in a
-  transaction and rolled back if any statement fails.
+  transaction and rolled back if any statement fails. An enum whose values change gets a new
+  type, which the column is converted to through `text`; the old type is dropped.
 * **Primary keys and identities** change in place. Postgres drops `<table>_pkey` and adds the
   new key; a column that becomes `autoincrement` gets `GENERATED BY DEFAULT AS IDENTITY`,
   continuing after the largest id already there. MySQL makes the whole key change (with the
@@ -359,7 +384,7 @@ Statements end with `;` and may span lines. History is saved to `shell_history` 
   same way, in a scratch temporary table, so an unchanged check never shows up as a change.
   `pull` shows the server's spelling.
 * **SQLite**: simple column additions/drops use `ALTER TABLE`. Anything else (type changes,
-  constraints) uses SQLite's documented table-rebuild procedure: create new table → copy
+  constraints, comments) uses SQLite's documented table-rebuild procedure: create new table → copy
   data → drop old → rename, with foreign keys disabled. `sdb push` checks
   `PRAGMA foreign_key_check` before committing and rolls back on any violation.
 

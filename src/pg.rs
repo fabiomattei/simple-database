@@ -50,13 +50,16 @@ pub fn cancel(token: &postgres::CancelToken, url: &str) -> Result<()> {
 /// functions, triggers, types, some constraints and indexes) is described in `skipped`.
 pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Schema> {
     let tables = client.query(
-        "SELECT c.oid, c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+        "SELECT c.oid, c.relname::text, obj_description(c.oid, 'pg_class') FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') ORDER BY c.oid",
         &[],
     )?;
     let mut schema = Schema::default();
     for row in tables {
-        schema.tables.push(introspect_table(client, row.get(0), row.get(1), skipped)?);
+        let mut t = introspect_table(client, row.get(0), row.get(1), skipped)?;
+        t.comment = row.get::<_, Option<String>>(2).filter(|c| !c.is_empty());
+        schema.tables.push(t);
     }
     // Sequences behind identity and serial columns, and extension objects, belong to something else.
     let others = client.query(
@@ -70,6 +73,8 @@ pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Sche
          FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
          WHERE n.nspname = current_schema() AND t.typtype IN ('e', 'd', 'r') \
            AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e') \
+           AND NOT (t.typtype = 'e' AND EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE a.atttypid = t.oid AND NOT a.attisdropped AND c.relkind IN ('r', 'p') AND c.relnamespace = n.oid)) \
          UNION ALL \
          SELECT CASE p.prokind WHEN 'p' THEN 'procedure' WHEN 'a' THEN 'aggregate' WHEN 'w' THEN 'window function' ELSE 'function' END, \
                 p.proname::text \
@@ -100,7 +105,8 @@ fn attnames(list: &str, rel: &str) -> String {
 fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut Vec<String>) -> Result<Table> {
     let rows = client.query(
         "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
-         pg_get_expr(d.adbin, d.adrelid), a.attidentity::text \
+         pg_get_expr(d.adbin, d.adrelid), a.attidentity::text, col_description(a.attrelid, a.attnum), \
+         (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid) \
          FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
          WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
         &[&oid],
@@ -110,8 +116,13 @@ fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut V
     let mut generated = Vec::new();
     for r in rows {
         let cname: String = r.get(0);
-        let mut col = Column::new(cname.clone(), DataType::parse(r.get(1)));
+        let data_type = match r.get::<_, Option<Vec<String>>>(6) {
+            Some(values) => DataType::Enum(values),
+            None => DataType::parse(r.get(1)),
+        };
+        let mut col = Column::new(cname.clone(), data_type);
         col.nullable = !r.get::<_, bool>(2);
+        col.comment = r.get::<_, Option<String>>(5).filter(|c| !c.is_empty());
         let default: Option<String> = r.get(3);
         let identity: String = r.get(4);
         if !identity.is_empty() || default.as_deref().is_some_and(|d| d.starts_with("nextval(")) {
@@ -135,6 +146,14 @@ fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut V
     )?;
     let mut composite_pk = Vec::new();
     let mut indexes = Vec::new();
+    let mut foreign_keys = Vec::new();
+    let action = |code: String| match code.as_str() {
+        "r" => RefAction::Restrict,
+        "c" => RefAction::Cascade,
+        "n" => RefAction::SetNull,
+        "d" => RefAction::SetDefault,
+        _ => RefAction::NoAction,
+    };
     for r in constraints {
         let kind: String = r.get(0);
         let cname: String = r.get(1);
@@ -159,15 +178,15 @@ fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut V
                 }
             }
             "u" => indexes.push(Index { name: cname, columns: cols, unique: true }),
-            "f" if cols.len() == 1 => {
+            "f" if cols.len() > 1 => foreign_keys.push(TableForeignKey {
+                columns: cols,
+                table: r.get(3),
+                ref_columns: r.get(4),
+                on_update: action(r.get(5)),
+                on_delete: action(r.get(6)),
+            }),
+            "f" => {
                 let target: Vec<String> = r.get(4);
-                let action = |code: String| match code.as_str() {
-                    "r" => RefAction::Restrict,
-                    "c" => RefAction::Cascade,
-                    "n" => RefAction::SetNull,
-                    "d" => RefAction::SetDefault,
-                    _ => RefAction::NoAction,
-                };
                 if let Some(i) = col(&mut columns) {
                     columns[i].references = Some(ForeignKey {
                         table: r.get(3),
@@ -210,7 +229,7 @@ fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut V
         skipped.push(format!("index {} on {name} (on an expression, or partial)", r.get::<_, String>(0)));
     }
 
-    Ok(Table { name, columns, composite_pk, indexes, was: vec![] })
+    Ok(Table { columns, composite_pk, indexes, foreign_keys, ..Table::new(name) })
 }
 
 /// Read a default as `pg_get_expr` prints it: `'x'::text`, `'-1'::integer`, `0`, ...

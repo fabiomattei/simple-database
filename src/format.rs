@@ -18,18 +18,25 @@ fn format_table(t: &Table) -> String {
     let types: Vec<String> = t.columns.iter().map(|c| type_text(&c.name, &c.data_type)).collect();
     let type_w = types.iter().map(|s| s.chars().count()).max().unwrap_or(0);
 
-    let mut out = format!("table {}{} {{\n", t.name, was(&t.was));
+    let comment = t.comment.as_ref().map_or(String::new(), |c| format!(" comment {}", quoted(c)));
+    let mut out = format!("table {}{}{comment} {{\n", t.name, was(&t.was));
     for (c, ty) in t.columns.iter().zip(&types) {
         let mods = modifiers(c);
         let line = format!("  {:name_w$}  {:type_w$}  {}", c.name, ty, mods.join(" "));
         out.push_str(line.trim_end());
         out.push('\n');
     }
-    if !t.composite_pk.is_empty() || !t.indexes.is_empty() {
+    if !t.composite_pk.is_empty() || !t.indexes.is_empty() || !t.foreign_keys.is_empty() {
         out.push('\n');
     }
     if !t.composite_pk.is_empty() {
         out.push_str(&format!("  pk ({})\n", t.composite_pk.join(", ")));
+    }
+    for fk in &t.foreign_keys {
+        let mut line = format!("  fk ({}) -> {} ({})", fk.columns.join(", "), fk.table, fk.ref_columns.join(", "));
+        line.push_str(&actions(fk.on_delete, fk.on_update).iter().map(|a| format!(" {a}")).collect::<String>());
+        out.push_str(&line);
+        out.push('\n');
     }
     for idx in &t.indexes {
         let default_name = format!(
@@ -71,18 +78,30 @@ fn modifiers(c: &Column) -> Vec<String> {
     }
     if let Some(fk) = &c.references {
         m.push(format!("-> {}.{}", fk.table, fk.column));
-        if fk.on_delete != RefAction::NoAction {
-            m.push(format!("on delete {}", fk.on_delete.dsl()));
-        }
-        if fk.on_update != RefAction::NoAction {
-            m.push(format!("on update {}", fk.on_update.dsl()));
-        }
+        m.extend(actions(fk.on_delete, fk.on_update));
     }
     let was = was(&c.was);
     if !was.is_empty() {
         m.push(was.trim_start().to_string());
     }
+    if let Some(comment) = &c.comment {
+        m.push(format!("comment {}", quoted(comment)));
+    }
     m
+}
+
+/// `on delete cascade` and `on update ...`, leaving out NO ACTION.
+fn actions(on_delete: RefAction, on_update: RefAction) -> Vec<String> {
+    [("delete", on_delete), ("update", on_update)]
+        .into_iter()
+        .filter(|(_, a)| *a != RefAction::NoAction)
+        .map(|(event, a)| format!("on {event} {}", a.dsl()))
+        .collect()
+}
+
+/// `s` as a DSL string: `'it''s'`.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// The type of `column` as the DSL writes it. Types that wouldn't parse back
@@ -248,9 +267,9 @@ fn split_column(line: &str) -> Option<(&str, String, &str)> {
     let word = after.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).next().unwrap_or("");
     let paren_after_word = after[word.len()..].trim_start().starts_with('(');
     let constraint = match name.to_ascii_lowercase().as_str() {
-        "pk" => after.starts_with('('),
+        "pk" | "fk" => after.starts_with('('),
         "unique" => after.starts_with('(') || word.eq_ignore_ascii_case("index"),
-        "primary" => word.eq_ignore_ascii_case("key") && paren_after_word,
+        "primary" | "foreign" => word.eq_ignore_ascii_case("key") && paren_after_word,
         "index" => after.starts_with('(') || (!word.is_empty() && paren_after_word && matches!(DataType::parse(word), DataType::Custom(_))),
         _ => false,
     };
@@ -302,7 +321,8 @@ mod tests {
         let src = "table users { id int pk autoincrement\n email varchar(255) unique not null\n \
                    role text default 'it''s' check (role <> '')\n boss_id int -> users.id on delete set null\n \
                    created timestamp default now\n index (boss_id)\n unique index by_role (role, email) }\n\
-                   table tags was (labels, tag) { a int was x\n b text was (y, z)\n pk (a, b) }";
+                   table tags was (labels, tag) comment 'Tags, it''s' { a int was x comment 'first'\n b text was (y, z)\n pk (a, b) }\n\
+                   table post_tags { a int\n b text\n s enum('on', 'off', 'it''s') not null default 'on'\n fk (a, b) -> tags (a, b) on delete cascade\n foreign key (b, a) references tags (b, a) }";
         let schema = parse(src).unwrap();
         let printed = format_schema(&schema);
         assert_eq!(parse(&printed).unwrap(), schema, "{printed}");
@@ -375,13 +395,13 @@ mod tests {
         const NAMES: &[&str] = &[
             "id", "name", "user_id", "date", "time", "text", "json", "type", "key", "order", "select",
             "table", "was", "on", "not", "null", "check", "default", "pk", "primary", "unique", "index",
-            "_x", "a1", "É", "createdAt",
+            "_x", "a1", "É", "createdAt", "fk", "foreign", "comment", "enum", "references",
         ];
         const TYPES: &[&str] = &[
             "int", "bigint", "smallint", "real", "decimal(10,2)", "bool", "text", "varchar(40)", "date",
             "time", "timestamp", "blob", "uuid", "json", "geometry", "citext", "character(10)",
             "enum('a', 'b,c')", "int unsigned", "time with time zone", "integer[]", "bit varying(5)",
-            "decimal(8,2) unsigned",
+            "decimal(8,2) unsigned", "enum('it''s', '', 'x\ny', '#')", "enum(a, b)", "enum()", "enum('a' 'b')",
         ];
         const EXPRS: &[&str] = &[
             "1 + 2", "lower('A')", "gen_random_uuid()", "x || ')'", "a in ('b', 'c''d')", "\"q\" > 0",
@@ -438,6 +458,7 @@ mod tests {
                         });
                     }
                     c.was = names(&mut rng, 0, 2);
+                    c.comment = rng.chance(0.2).then(|| rng.pick(&STRINGS[1..]).to_string());
                     columns.push(c);
                 }
                 let composite_pk = if !inline_pk && cols.len() >= 2 && rng.chance(0.3) { cols[..2].to_vec() } else { vec![] };
@@ -452,15 +473,27 @@ mod tests {
                     };
                     indexes.push(Index { name, columns, unique });
                 }
+                let mut foreign_keys = Vec::new();
+                if cols.len() >= 2 && rng.chance(0.3) {
+                    foreign_keys.push(TableForeignKey {
+                        columns: vec![cols[1].clone(), cols[0].clone()],
+                        table: rng.pick(NAMES).to_string(),
+                        ref_columns: names(&mut rng, 2, 2),
+                        on_delete: *rng.pick(&ACTIONS),
+                        on_update: *rng.pick(&ACTIONS),
+                    });
+                }
                 let was = names(&mut rng, 0, 2);
-                schema.tables.push(Table { name: tname, columns, composite_pk, indexes, was });
+                let comment = rng.chance(0.2).then(|| rng.pick(&STRINGS[1..]).to_string());
+                schema.tables.push(Table { name: tname, columns, composite_pk, indexes, foreign_keys, was, comment });
             }
             let printed = format_schema(&schema);
             match parse(&printed) {
                 Ok(back) if back == schema => {
-                    // `align` works line by line and leaves text with multi-line strings alone.
-                    let expected = (!printed.contains("x\ny")).then_some(printed.as_str());
-                    if align(&printed).as_deref() != expected {
+                    // `align` works line by line and may leave text with multi-line strings alone.
+                    let aligned = align(&printed);
+                    let ok = aligned.as_deref() == Some(printed.as_str()) || (aligned.is_none() && printed.contains("x\ny"));
+                    if !ok {
                         failures.push(format!("align changes it:\n{printed}\n{:?}", align(&printed)));
                     }
                 }

@@ -36,6 +36,37 @@ pub fn quote_list(cols: &[String], d: Dialect) -> String {
     cols.iter().map(|c| quote(c, d)).collect::<Vec<_>>().join(", ")
 }
 
+/// `s` as a string literal. MySQL also treats backslashes as escapes.
+pub fn string_sql(s: &str, d: Dialect) -> String {
+    let s = s.replace('\'', "''");
+    if d == Dialect::Mysql { format!("'{}'", s.replace('\\', "\\\\")) } else { format!("'{s}'") }
+}
+
+fn string_list_sql(values: &[String], d: Dialect) -> String {
+    values.iter().map(|v| string_sql(v, d)).collect::<Vec<_>>().join(", ")
+}
+
+/// The type of a column. Unlike `type_sql`, it names a Postgres enum's type.
+pub fn column_type_sql(table: &str, c: &Column, d: Dialect) -> String {
+    match &c.data_type {
+        DataType::Enum(_) if d == Dialect::Postgres => quote(&enum_type_name(table, &c.name), d),
+        t => type_sql(t, d),
+    }
+}
+
+/// The Postgres type behind an enum column.
+pub fn enum_type_name(table: &str, column: &str) -> String {
+    format!("{table}_{column}_enum")
+}
+
+/// `CREATE TYPE` for a Postgres enum column, named `name`.
+pub fn create_enum_sql(name: &str, values: &[String]) -> String {
+    let d = Dialect::Postgres;
+    format!("CREATE TYPE {} AS ENUM ({});", quote(name, d), string_list_sql(values, d))
+}
+
+/// The type alone. A Postgres enum needs its column's named type
+/// (`column_type_sql`); here it is plain TEXT, as on SQLite.
 pub fn type_sql(t: &DataType, d: Dialect) -> String {
     use DataType::*;
     use Dialect::*;
@@ -62,6 +93,8 @@ pub fn type_sql(t: &DataType, d: Dialect) -> String {
         (Uuid, _) => "UUID".into(),
         (Json, Postgres) => "JSONB".into(),
         (Json, _) => "JSON".into(),
+        (Enum(values), Mysql) => format!("ENUM({})", string_list_sql(values, d)),
+        (Enum(_), _) => "TEXT".into(),
         (Custom(s), _) => s.clone(),
     }
 }
@@ -86,9 +119,20 @@ pub fn default_sql(v: &DefaultValue, d: Dialect) -> String {
     }
 }
 
-/// A single column definition, as used inside CREATE TABLE or ADD COLUMN.
-/// `inline_pk` is true when this column alone is the table's primary key.
-pub fn column_sql(c: &Column, inline_pk: bool, d: Dialect) -> String {
+/// A single column definition of `table`, as used inside CREATE TABLE or
+/// ADD COLUMN. `inline_pk` is true when this column alone is the table's
+/// primary key. Comments are left to the caller, except on MySQL.
+pub fn column_sql(table: &str, c: &Column, inline_pk: bool, d: Dialect) -> String {
+    let mut s = column_definition(table, c, inline_pk, d);
+    if d == Dialect::Mysql
+        && let Some(comment) = &c.comment
+    {
+        s.push_str(&format!(" COMMENT {}", string_sql(comment, d)));
+    }
+    s
+}
+
+fn column_definition(table: &str, c: &Column, inline_pk: bool, d: Dialect) -> String {
     let mut s = format!("{} ", quote(&c.name, d));
 
     if c.auto_increment && inline_pk {
@@ -111,7 +155,7 @@ pub fn column_sql(c: &Column, inline_pk: bool, d: Dialect) -> String {
         }
     }
 
-    s.push_str(&type_sql(&c.data_type, d));
+    s.push_str(&column_type_sql(table, c, d));
     if inline_pk {
         s.push_str(" PRIMARY KEY");
     } else if !c.nullable {
@@ -131,6 +175,11 @@ pub fn column_sql(c: &Column, inline_pk: bool, d: Dialect) -> String {
             s.push_str(&sql);
         }
     }
+    // SQLite has no enums: the values are checked, by a constraint whose name
+    // tells introspection that the column is an enum.
+    if let (DataType::Enum(values), Dialect::Sqlite) = (&c.data_type, d) {
+        s.push_str(&format!(" CONSTRAINT {SQLITE_ENUM} CHECK ({} IN ({}))", quote(&c.name, d), string_list_sql(values, d)));
+    }
     // MySQL checks are named table constraints (see `check_sql`) so they can be dropped.
     if let Some(chk) = &c.check
         && d != Dialect::Mysql
@@ -139,6 +188,9 @@ pub fn column_sql(c: &Column, inline_pk: bool, d: Dialect) -> String {
     }
     s
 }
+
+/// Name of the check constraint that makes a SQLite TEXT column an enum.
+pub const SQLITE_ENUM: &str = "enum";
 
 /// Name of a column's check constraint. Postgres picks this name itself;
 /// for MySQL it is set explicitly.
@@ -155,13 +207,29 @@ pub fn fk_name(table: &str, column: &str) -> String {
     format!("fk_{table}_{column}")
 }
 
+/// Name of a foreign key over several columns.
+pub fn table_fk_name(table: &str, fk: &TableForeignKey) -> String {
+    fk_name(table, &fk.columns.join("_"))
+}
+
 pub fn fk_sql(table: &str, c: &Column, fk: &ForeignKey, d: Dialect) -> String {
+    let fk = TableForeignKey {
+        columns: vec![c.name.clone()],
+        table: fk.table.clone(),
+        ref_columns: vec![fk.column.clone()],
+        on_delete: fk.on_delete,
+        on_update: fk.on_update,
+    };
+    table_fk_sql(table, &fk, d)
+}
+
+pub fn table_fk_sql(table: &str, fk: &TableForeignKey, d: Dialect) -> String {
     let mut s = format!(
         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
-        quote(&fk_name(table, &c.name), d),
-        quote(&c.name, d),
+        quote(&table_fk_name(table, fk), d),
+        quote_list(&fk.columns, d),
         quote(&fk.table, d),
-        quote(&fk.column, d)
+        quote_list(&fk.ref_columns, d)
     );
     if fk.on_delete != RefAction::NoAction {
         s.push_str(&format!(" ON DELETE {}", fk.on_delete.sql()));
@@ -172,35 +240,84 @@ pub fn fk_sql(table: &str, c: &Column, fk: &ForeignKey, d: Dialect) -> String {
     s
 }
 
+/// CREATE TABLE. SQLite keeps comments as `--` comments in it, which
+/// introspection reads back; Postgres needs `create_table_statements`.
 pub fn create_table_sql(t: &Table, d: Dialect) -> String {
     let single_pk = t.composite_pk.is_empty();
-    let mut lines: Vec<String> = t
+    // (definition, SQLite comment)
+    let mut lines: Vec<(String, Option<&String>)> = t
         .columns
         .iter()
-        .map(|c| column_sql(c, single_pk && c.primary_key, d))
+        .map(|c| (column_sql(&t.name, c, single_pk && c.primary_key, d), c.comment.as_ref()))
         .collect();
     if !t.composite_pk.is_empty() {
-        lines.push(format!("PRIMARY KEY ({})", quote_list(&t.composite_pk, d)));
+        lines.push((format!("PRIMARY KEY ({})", quote_list(&t.composite_pk, d)), None));
     }
-    for c in &t.columns {
-        if let Some(fk) = &c.references {
-            lines.push(fk_sql(&t.name, c, fk, d));
-        }
+    for fk in t.all_foreign_keys() {
+        lines.push((table_fk_sql(&t.name, &fk, d), None));
     }
     if d == Dialect::Mysql {
         for c in &t.columns {
             if let Some(chk) = &c.check {
-                lines.push(check_sql(&t.name, &c.name, chk, d));
+                lines.push((check_sql(&t.name, &c.name, chk, d), None));
             }
         }
     }
-    let body = lines
-        .iter()
-        .map(|l| format!("    {l}"))
-        .collect::<Vec<_>>()
-        .join(",\n");
-    let suffix = if d == Dialect::Mysql { " ENGINE=InnoDB" } else { "" };
-    format!("CREATE TABLE {} (\n{body}\n){suffix};", quote(&t.name, d))
+    let sqlite_comment = |c: Option<&String>| match c {
+        Some(c) if d == Dialect::Sqlite => format!(" -- {}", sqlite_comment_text(c)),
+        _ => String::new(),
+    };
+    let mut body = String::new();
+    for (i, (l, comment)) in lines.iter().enumerate() {
+        let comma = if i + 1 < lines.len() { "," } else { "" };
+        body.push_str(&format!("    {l}{comma}{}\n", sqlite_comment(*comment)));
+    }
+    let suffix = match d {
+        Dialect::Mysql => match &t.comment {
+            Some(c) => format!(" ENGINE=InnoDB COMMENT={}", string_sql(c, d)),
+            None => " ENGINE=InnoDB".into(),
+        },
+        _ => String::new(),
+    };
+    format!("CREATE TABLE {} ({}\n{body}){suffix};", quote(&t.name, d), sqlite_comment(t.comment.as_ref()))
+}
+
+/// A comment as a SQLite `--` comment holds it: one line, trimmed.
+fn sqlite_comment_text(c: &str) -> String {
+    c.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Everything that creates `t`, without its indexes: Postgres enum types,
+/// the table, Postgres comments.
+pub fn create_table_statements(t: &Table, d: Dialect) -> Vec<String> {
+    let mut out = Vec::new();
+    if d == Dialect::Postgres {
+        for c in &t.columns {
+            if let DataType::Enum(values) = &c.data_type {
+                out.push(create_enum_sql(&enum_type_name(&t.name, &c.name), values));
+            }
+        }
+    }
+    out.push(create_table_sql(t, d));
+    if d == Dialect::Postgres {
+        if t.comment.is_some() {
+            out.push(comment_sql(&t.name, None, t.comment.as_deref()));
+        }
+        for c in t.columns.iter().filter(|c| c.comment.is_some()) {
+            out.push(comment_sql(&t.name, Some(&c.name), c.comment.as_deref()));
+        }
+    }
+    out
+}
+
+/// Postgres `COMMENT ON` a table, or one of its columns; `None` removes it.
+pub fn comment_sql(table: &str, column: Option<&str>, comment: Option<&str>) -> String {
+    let d = Dialect::Postgres;
+    let target = match column {
+        Some(c) => format!("COLUMN {}.{}", quote(table, d), quote(c, d)),
+        None => format!("TABLE {}", quote(table, d)),
+    };
+    format!("COMMENT ON {target} IS {};", comment.map_or("NULL".into(), |c| string_sql(c, d)))
 }
 
 pub fn create_index_sql(table: &str, idx: &Index, d: Dialect) -> String {
@@ -231,12 +348,23 @@ pub fn canonical_table(t: &Table, d: Dialect) -> Table {
         c.was.clear();
     }
     if d == Dialect::Sqlite {
+        // Comments become `--` comments.
+        let one_line = |c: &mut Option<String>| *c = c.as_deref().map(sqlite_comment_text).filter(|c| !c.is_empty());
+        one_line(&mut t.comment);
+        for c in &mut t.columns {
+            one_line(&mut c.comment);
+        }
         // AUTOINCREMENT needs exactly INTEGER PRIMARY KEY.
         let single_pk = t.composite_pk.is_empty();
         for c in t.columns.iter_mut().filter(|c| single_pk && c.primary_key && c.auto_increment && c.data_type.is_integer()) {
             c.data_type = DataType::Int;
         }
         return t;
+    }
+    // MySQL lists foreign keys by name.
+    if d == Dialect::Mysql {
+        let name = t.name.clone();
+        t.foreign_keys.sort_by_key(|fk| table_fk_name(&name, fk));
     }
     let keyed: Vec<String> = t.indexes.iter().flat_map(|i| i.columns.clone()).collect();
     for c in &mut t.columns {
@@ -273,7 +401,7 @@ pub fn schema_sql(schema: &Schema, d: Dialect) -> String {
     let schema = canonical(schema, d);
     let mut out = Vec::new();
     for t in schema.tables_in_dependency_order() {
-        out.push(create_table_sql(t, d));
+        out.extend(create_table_statements(t, d));
         for idx in &t.indexes {
             out.push(create_index_sql(&t.name, idx, d));
         }
@@ -321,6 +449,32 @@ mod tests {
         assert!(my.contains("CONSTRAINT t_note_check CHECK (note <> '')"), "{my}");
         // SQLite keeps what was written.
         assert_eq!(canonical(&s, Dialect::Sqlite), s);
+    }
+
+    #[test]
+    fn enums_comments_and_multi_column_keys() {
+        let s = parse(
+            "table pairs comment 'It''s \\ here' { a int not null comment 'two\n  lines'\n b int not null\n \
+             mood enum('ok', 'a\\b') not null default 'ok' check (mood <> 'a\\b')\n pk (a, b) }\n\
+             table links { id int pk\n x int\n y int\n fk (x, y) -> pairs (a, b) on delete cascade }",
+        )
+        .unwrap();
+        let pg = schema_sql(&s, Dialect::Postgres);
+        assert!(pg.contains("CREATE TYPE pairs_mood_enum AS ENUM ('ok', 'a\\b');\n\nCREATE TABLE pairs"), "{pg}");
+        assert!(pg.contains("mood pairs_mood_enum NOT NULL DEFAULT 'ok' CHECK (mood <> 'a\\b')"), "{pg}");
+        assert!(pg.contains("COMMENT ON TABLE pairs IS 'It''s \\ here';"), "{pg}");
+        assert!(pg.contains("COMMENT ON COLUMN pairs.a IS 'two\n  lines';"), "{pg}");
+        assert!(pg.contains("CONSTRAINT fk_links_x_y FOREIGN KEY (x, y) REFERENCES pairs (a, b) ON DELETE CASCADE"), "{pg}");
+        let my = schema_sql(&s, Dialect::Mysql);
+        assert!(my.contains("mood ENUM('ok', 'a\\\\b') NOT NULL DEFAULT 'ok'"), "{my}");
+        assert!(my.contains("a INT NOT NULL COMMENT 'two\n  lines'"), "{my}");
+        assert!(my.contains(") ENGINE=InnoDB COMMENT='It''s \\\\ here';"), "{my}");
+        let lite = schema_sql(&s, Dialect::Sqlite);
+        assert!(lite.starts_with("CREATE TABLE pairs ( -- It's \\ here\n    a INTEGER NOT NULL, -- two lines\n"), "{lite}");
+        assert!(lite.contains("mood TEXT NOT NULL DEFAULT 'ok' CONSTRAINT enum CHECK (mood IN ('ok', 'a\\b')) CHECK (mood <> 'a\\b'),"), "{lite}");
+        // SQLite's comments are one line.
+        let c = canonical(&s, Dialect::Sqlite);
+        assert_eq!(c.tables[0].columns[0].comment.as_deref(), Some("two lines"));
     }
 
     #[test]

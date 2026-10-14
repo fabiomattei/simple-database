@@ -12,12 +12,12 @@ pub const DBS_KEYWORDS: &[&str] = &[
     "table", "pk", "primary", "key", "autoincrement", "auto_increment", "unique", "not", "null",
     "nullable", "default", "check", "references", "ref", "on", "delete", "update", "index",
     "cascade", "set_null", "set_default", "restrict", "no_action", "set", "no", "action", "now",
-    "true", "false", "was",
+    "true", "false", "was", "fk", "foreign", "comment",
 ];
 pub const DBS_TYPES: &[&str] = &[
     "int", "integer", "bigint", "smallint", "real", "float", "double", "decimal", "numeric", "bool",
     "boolean", "text", "string", "varchar", "char", "date", "time", "timestamp", "datetime", "blob",
-    "bytes", "uuid", "json", "jsonb",
+    "bytes", "uuid", "json", "jsonb", "enum",
 ];
 pub const SQL_KEYWORDS: &[&str] = &[
     "select", "from", "where", "and", "or", "not", "null", "is", "in", "like", "between", "join",
@@ -28,6 +28,7 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "commit", "rollback", "pragma", "union", "all", "case", "when", "then", "else", "end",
     "exists", "with", "cascade", "restrict", "autoincrement", "generated", "identity", "always",
     "engine", "modify", "type", "true", "false", "if", "returning", "explain", "query", "plan",
+    "comment", "enum",
 ];
 
 struct Palette {

@@ -6,8 +6,10 @@ use simple_database::{format, parser};
 use simple_database::schema::{RefAction, Schema, Table, note_rename};
 use simple_database::validate::{self, Severity};
 
-const TYPES: [&str; 14] =
-    ["int", "bigint", "smallint", "real", "decimal(10,2)", "bool", "text", "varchar(255)", "date", "time", "timestamp", "blob", "uuid", "json"];
+const TYPES: [&str; 15] = [
+    "int", "bigint", "smallint", "real", "decimal(10,2)", "bool", "text", "varchar(255)", "date", "time", "timestamp", "blob", "uuid", "json",
+    "enum('a', 'b')",
+];
 const ACTIONS: [RefAction; 5] = [RefAction::NoAction, RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault, RefAction::Restrict];
 
 /// One column as the grid edits it; defaults and checks in DSL spelling.
@@ -27,6 +29,7 @@ struct Row {
     references: String,
     on_delete: Option<RefAction>,
     on_update: Option<RefAction>,
+    comment: String,
 }
 
 pub struct TableEditor {
@@ -38,6 +41,9 @@ pub struct TableEditor {
     rows: Vec<Row>,
     /// Composite key; edited in the schema text only, shown for reference.
     composite_pk: Vec<String>,
+    /// Multi-column foreign keys as the DSL writes them; likewise only shown.
+    foreign_keys: Vec<String>,
+    comment: String,
     error: Option<String>,
 }
 
@@ -66,16 +72,27 @@ impl TableEditor {
                 references: c.references.as_ref().map(|fk| format!("{}.{}", fk.table, fk.column)).unwrap_or_default(),
                 on_delete: c.references.as_ref().map(|fk| fk.on_delete),
                 on_update: c.references.as_ref().map(|fk| fk.on_update),
+                comment: c.comment.clone().unwrap_or_default(),
             })
             .collect();
-        TableEditor { original: Some(t.name.clone()), place: None, name: t.name.clone(), rows, composite_pk: t.composite_pk.clone(), error: None }
+        let foreign_keys = t.foreign_keys.iter().map(|fk| format!("({}) -> {} ({})", fk.columns.join(", "), fk.table, fk.ref_columns.join(", "))).collect();
+        TableEditor {
+            original: Some(t.name.clone()),
+            place: None,
+            name: t.name.clone(),
+            rows,
+            composite_pk: t.composite_pk.clone(),
+            foreign_keys,
+            comment: t.comment.clone().unwrap_or_default(),
+            error: None,
+        }
     }
 
     /// A new table with an `id` key, named so it doesn't clash with `schema`.
     pub fn create(schema: &Schema, place: Pos2) -> Self {
         let name = (1..).map(|i| if i == 1 { "new_table".to_string() } else { format!("new_table_{i}") }).find(|n| schema.table(n).is_none()).unwrap();
         let id = Row { name: "id".into(), ty: "int".into(), pk: true, auto_increment: true, ..Row::default() };
-        TableEditor { original: None, place: Some(place), name, rows: vec![id], composite_pk: vec![], error: None }
+        TableEditor { original: None, place: Some(place), name, rows: vec![id], composite_pk: vec![], foreign_keys: vec![], comment: String::new(), error: None }
     }
 
     /// Start with an empty column row focused at the end.
@@ -97,10 +114,15 @@ impl TableEditor {
         ui.horizontal(|ui| {
             ui.label("Name:");
             ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(220.0));
-            if !self.composite_pk.is_empty() {
-                ui.label(RichText::new(format!("Composite key: ({})", self.composite_pk.join(", "))).weak());
-            }
+            ui.label("Comment:");
+            ui.add(egui::TextEdit::singleline(&mut self.comment).desired_width(260.0).hint_text("what the table holds"));
         });
+        if !self.composite_pk.is_empty() {
+            ui.label(RichText::new(format!("Composite key: ({})", self.composite_pk.join(", "))).weak());
+        }
+        for fk in &self.foreign_keys {
+            ui.label(RichText::new(format!("Foreign key: {fk}")).weak());
+        }
         ui.add_space(6.0);
 
         let targets = self.reference_targets(schema);
@@ -109,7 +131,7 @@ impl TableEditor {
         let last = self.rows.len().saturating_sub(1);
         egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
             egui::Grid::new("table_edit_grid").striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
-                for h in ["Column", "Type", "PK", "Not null", "Unique", "Auto inc", "Default", "Check", "References", "On delete", ""] {
+                for h in ["Column", "Type", "PK", "Not null", "Unique", "Auto inc", "Default", "Check", "Comment", "References", "On delete", ""] {
                     ui.label(RichText::new(h).strong());
                 }
                 ui.end_row();
@@ -139,6 +161,7 @@ impl TableEditor {
                     ui.checkbox(&mut row.auto_increment, "");
                     ui.add_sized([110.0, 20.0], egui::TextEdit::singleline(&mut row.default).hint_text("0, 'x', now"));
                     ui.add_sized([110.0, 20.0], egui::TextEdit::singleline(&mut row.check).hint_text("expression"));
+                    ui.add_sized([140.0, 20.0], egui::TextEdit::singleline(&mut row.comment).hint_text("description"));
                     let shown = if row.references.is_empty() { "—" } else { row.references.as_str() };
                     egui::ComboBox::from_id_salt(("ref", i)).selected_text(shown).width(150.0).show_ui(ui, |ui| {
                         if ui.selectable_label(row.references.is_empty(), "—").clicked() {
@@ -274,6 +297,9 @@ impl TableEditor {
                     }
                 }
             }
+            if !r.comment.trim().is_empty() {
+                line = format!("{line} comment '{}'", r.comment.trim().replace('\'', "''"));
+            }
             lines.push(line);
         }
         lines.push("}".into());
@@ -282,6 +308,7 @@ impl TableEditor {
             _ => e.message,
         })?;
         let columns = parsed.tables.into_iter().next().map(|t| t.columns).unwrap_or_default();
+        let comment = Some(self.comment.trim().to_string()).filter(|c| !c.is_empty());
 
         let mut out = schema.clone();
         let mut renamed = None;
@@ -308,6 +335,7 @@ impl TableEditor {
                 // Self references were written with the new names already.
                 if let Some(t) = out.tables.iter_mut().find(|t| t.name == name) {
                     t.columns = columns;
+                    t.comment = comment;
                     // Earlier names, so that a migration renames instead of dropping.
                     let before = schema.table(old);
                     note_rename(&mut t.was, old, &name);
@@ -321,7 +349,7 @@ impl TableEditor {
                     }
                 }
             }
-            None => out.tables.push(Table { name: name.clone(), columns, composite_pk: vec![], indexes: vec![], was: vec![] }),
+            None => out.tables.push(Table { columns, comment, ..Table::new(name.clone()) }),
         }
 
         let before: Vec<(String, String)> = validate::validate(schema).into_iter().map(|i| (i.location, i.message)).collect();
