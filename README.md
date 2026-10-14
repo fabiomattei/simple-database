@@ -325,7 +325,9 @@ objects) or `.jsonl`. Columns are matched by name, ignoring case; others are ski
 TSV an empty field is NULL and `""` is an empty string. NULL in a NOT NULL column with a default
 gets the default, and a column that is empty in every row and filled by the database
 (auto-increment or default) is left out. Values are checked against the column types, and all
-rows go in one transaction, so a bad row means nothing is inserted.
+rows go in one transaction, so a bad row means nothing is inserted. The file is read as it goes, never
+loaded whole, so its size doesn't matter (it is read twice: once to count and preview the rows,
+once to insert them).
 
 ### Running SQL files
 

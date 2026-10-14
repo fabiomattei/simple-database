@@ -422,12 +422,31 @@ impl Database {
     /// fails. Statements flagged `true` must change exactly one row. Returns
     /// the rows changed.
     pub fn write_statements(&mut self, stmts: &[(String, bool)]) -> Result<u64> {
+        self.write_stream(stmts.iter().map(|(s, one)| Ok((s.as_str(), *one))))
+    }
+
+    /// [`Database::write_statements`] over statements made while they run, so
+    /// they never all sit in memory. An `Err` from `stmts`, or a cancel,
+    /// rolls back too.
+    pub fn write_stream<S: AsRef<str>>(&mut self, stmts: impl IntoIterator<Item = Result<(S, bool)>>) -> Result<u64> {
         self.ensure_writable()?;
         let mysql = self.dialect() == Dialect::Mysql;
         self.execute(if mysql { "START TRANSACTION" } else { "BEGIN" })?;
         let mut total = 0;
         let mut result = Ok(());
-        for (stmt, one) in stmts {
+        for item in stmts {
+            let (stmt, one) = match item {
+                Ok((s, one)) if !self.cancel_requested() => (s, one),
+                Ok(_) => {
+                    result = Err(anyhow::anyhow!("cancelled"));
+                    break;
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            let (stmt, one) = (stmt.as_ref(), &one);
             let n: u64 = match self.run(stmt) {
                 Ok(r) => r.iter().filter_map(|r| r.changes).sum(),
                 Err(e) => {
@@ -1432,9 +1451,9 @@ mod tests {
         assert!(db.apply_changes(posts, &deleted).is_err());
 
         let tags = schema.table("tags").unwrap();
-        let rows = crate::import::parse("NAME\nimported-a\nimported-b\n", crate::import::ImportFormat::Csv).unwrap();
+        let rows = crate::import::scan_text("NAME\nimported-a\nimported-b\n", crate::import::ImportFormat::Csv).unwrap();
         assert_eq!(crate::import::import(db, tags, &rows).unwrap(), 2);
-        let dup = crate::import::parse("name\nimported-c\nimported-a\n", crate::import::ImportFormat::Csv).unwrap();
+        let dup = crate::import::scan_text("name\nimported-c\nimported-a\n", crate::import::ImportFormat::Csv).unwrap();
         assert!(crate::import::import(db, tags, &dup).is_err());
         assert_eq!(db.query_value("SELECT count(*) FROM tags WHERE name LIKE 'imported%'").unwrap().display(), "2");
 

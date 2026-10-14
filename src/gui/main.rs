@@ -168,10 +168,10 @@ struct ConfirmWrite {
     write: Write,
 }
 
-/// The Import dialog: a file read and waiting to go into a table.
+/// The Import dialog: a file scanned and waiting to go into a table.
 struct ImportState {
     path: PathBuf,
-    rows: import::Rows,
+    scan: import::Scan,
     table: String,
     error: Option<String>,
     /// The import is running.

@@ -187,14 +187,22 @@ impl App {
             return;
         };
         let format = ImportFormat::from_path(&path).unwrap_or(ImportFormat::Csv);
-        match import::read_file(&path, Some(format)) {
-            Ok(rows) => {
-                let stem = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let tables = self.db.as_ref().map(|d| d.schema.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
-                let table = tables.iter().find(|t| t.to_lowercase() == stem).cloned().or_else(|| self.data.table().map(str::to_owned)).unwrap_or_default();
-                self.dialog = Some(Dialog::Import(Box::new(ImportState { path, rows, table, error: None, busy: false })));
-            }
-            Err(e) => self.set_status(format!("{e:#}"), true),
-        }
+        // A big file takes a while to read through, so it goes on the worker, where it can be cancelled.
+        self.db_run(
+            "Reading the file",
+            move |conn| {
+                let res = import::scan(import::Source::File(path.clone()), format, &|| conn.cancel_requested());
+                (res.map_err(|e| format!("{e:#}")), path)
+            },
+            |app, (res, path)| match res {
+                Ok(scan) => {
+                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                    let tables = app.db.as_ref().map(|d| d.schema.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
+                    let table = tables.iter().find(|t| t.to_lowercase() == stem).cloned().or_else(|| app.data.table().map(str::to_owned)).unwrap_or_default();
+                    app.dialog = Some(Dialog::Import(Box::new(ImportState { path, scan, table, error: None, busy: false })));
+                }
+                Err(e) => app.set_status(e, true),
+            },
+        );
     }
 }

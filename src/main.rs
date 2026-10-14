@@ -474,7 +474,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Import { db, file, table, format, yes } => {
-            let rows = import::read_file(&file, format)?;
+            let scan = import::scan_file(&file, format)?;
             let mut db = open_existing(&db)?;
             db.ensure_writable()?;
             let table = match table {
@@ -483,9 +483,9 @@ fn run(cli: Cli) -> Result<()> {
             };
             let schema = db.introspect()?;
             let t = schema.table(&table).with_context(|| format!("{} has no table '{table}'", db.label()))?;
-            let plan = import::plan(t, &rows);
+            let plan = import::plan(t, &scan);
             let cols: Vec<&str> = plan.mapping.iter().map(|(_, c)| c.as_str()).collect();
-            eprintln!("{} row(s) into {table} ({})", rows.rows.len(), cols.join(", "));
+            eprintln!("{} row(s) into {table} ({})", scan.rows, cols.join(", "));
             if !plan.skipped.is_empty() {
                 eprintln!("{} {} (not in {table})", Paint::Yellow.err("skipped:"), plan.skipped.join(", "));
             }
@@ -495,7 +495,7 @@ fn run(cli: Cli) -> Result<()> {
             if db.confirms_writes() && !yes && !confirm(&format!("Import into {}?", db.label()))? {
                 bail!("not imported");
             }
-            let n = import::import(&mut db, t, &rows)?;
+            let n = import::import(&mut db, t, &scan)?;
             println!("Imported {n} row(s) into {table}.");
         }
         Command::Seed { db, rows, counts, only, seed, yes } => {

@@ -197,11 +197,11 @@ impl App {
                                 ui.selectable_value(&mut st.table, t.name.clone(), &t.name);
                             }
                         });
-                        ui.label(RichText::new(format!("{} row(s) in the file", st.rows.rows.len())).weak());
+                        ui.label(RichText::new(format!("{} row(s) in the file", st.scan.rows)).weak());
                     });
                     let table = tables.iter().find(|t| t.name == st.table);
                     if let Some(t) = table {
-                        let plan = import::plan(t, &st.rows);
+                        let plan = import::plan(t, &st.scan);
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Columns:");
                             for (_, c) in &plan.mapping {
@@ -221,8 +221,8 @@ impl App {
                     ui.add_space(4.0);
                     ui.label(RichText::new("Preview").small().strong());
                     let preview = QueryResult {
-                        columns: st.rows.columns.clone(),
-                        rows: st.rows.rows.iter().take(8).cloned().collect(),
+                        columns: st.scan.columns.clone(),
+                        rows: st.scan.preview.clone(),
                         changes: None,
                         truncated: false,
                     };
@@ -238,8 +238,8 @@ impl App {
                     }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let ok = table.is_some() && !read_only && !st.rows.rows.is_empty() && !st.busy;
-                        let button = egui::Button::new(RichText::new(format!("Import {} row(s)", st.rows.rows.len())).strong());
+                        let ok = table.is_some() && !read_only && st.scan.rows > 0 && !st.busy;
+                        let button = egui::Button::new(RichText::new(format!("Import {} row(s)", st.scan.rows)).strong());
                         if ui.add_enabled(ok, button).on_disabled_hover_text(if read_only { "The connection is read-only" } else { "Choose a table" }).clicked() {
                             answer = Some(true);
                         }
@@ -255,10 +255,10 @@ impl App {
                         if let Some(t) = tables.iter().find(|t| t.name == st.table).cloned() {
                             st.busy = true;
                             st.error = None;
-                            let rows = st.rows.clone();
+                            let scan = st.scan.clone();
                             self.db_run(
                                 "Importing rows",
-                                move |conn| (import::import(conn, &t, &rows).map_err(|e| format!("{e:#}")), t.name),
+                                move |conn| (import::import(conn, &t, &scan).map_err(|e| format!("{e:#}")), t.name),
                                 |app, (res, table)| match res {
                                     Ok(n) => {
                                         if matches!(app.dialog, Some(Dialog::Import(_))) {

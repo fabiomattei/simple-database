@@ -349,8 +349,8 @@ mod tests {
         // `import` reads an empty field as NULL and "" as an empty string.
         let r = result(&["a", "b"], vec![vec![Cell::Text(String::new()), Cell::Null]]);
         assert_eq!(render(&r, OutputFormat::Csv), "a,b\n\"\",");
-        let rows = crate::import::parse(&render(&r, OutputFormat::Csv), crate::import::ImportFormat::Csv).unwrap();
-        assert_eq!(rows.rows, [[Cell::Text(String::new()), Cell::Null]]);
+        let rows = crate::import::scan_text(&render(&r, OutputFormat::Csv), crate::import::ImportFormat::Csv).unwrap();
+        assert_eq!(rows.preview, [[Cell::Text(String::new()), Cell::Null]]);
     }
 
     #[test]
