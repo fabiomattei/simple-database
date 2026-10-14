@@ -358,6 +358,24 @@ impl Database {
         crate::framework::generate(current, &desired, self.dialect(), fw, opts)
     }
 
+    /// Run a migration's row checks: what existing rows would make it fail,
+    /// one message per check that finds any. Best effort: a check the
+    /// server can't run (e.g. `pg_input_is_valid` before Postgres 16) is skipped.
+    pub fn preflight(&mut self, m: &Migration) -> Vec<String> {
+        let mut out = Vec::new();
+        for check in &m.checks {
+            if self.cancel_requested() {
+                break;
+            }
+            // Postgres and MySQL sums come back as decimals.
+            let rows = self.query_value(&check.sql).map(|v| v.display().parse::<f64>().unwrap_or(0.0) as u64);
+            if let Ok(n @ 1..) = rows {
+                out.push(check.message(n));
+            }
+        }
+        out
+    }
+
     /// Execute a migration produced by [`Database::migration`].
     pub fn apply_migration(&mut self, m: &Migration) -> Result<()> {
         self.ensure_writable()?;
@@ -1096,11 +1114,62 @@ mod tests {
         drop_all(&mut db);
         live_cycles(&mut db);
         drop_all(&mut db);
+        live_preflight(&mut db);
+        drop_all(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
         if db.dialect() == Dialect::Postgres {
             let types = db.query_value("SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = current_schema() AND t.typtype = 'e'");
             assert_eq!(types.unwrap(), Cell::Int(0), "enum types left behind");
         }
+    }
+
+    /// Rows that would make a migration fail are found before it runs.
+    fn live_preflight(db: &mut Database) {
+        let v1 = parse(
+            "table owners { id int pk }\ntable items { id int pk\n name text\n qty bigint\n code text\n kind text\n \
+             owner_id int\n score int\n num text }",
+        )
+        .unwrap();
+        let m = db.migration(&Schema::default(), &v1);
+        db.apply_migration(&m).unwrap();
+        db.run(
+            "INSERT INTO owners VALUES (1); INSERT INTO items VALUES (1, NULL, 5000000000, 'abcdefgh', 'x', 99, -1, 'x'), \
+             (2, 'n', 1, 'abc', 'a', 1, 1, '1'), (3, 'n', 2, 'abc', 'b', NULL, 1, NULL)",
+        )
+        .unwrap();
+        let v2 = parse(
+            "table owners { id int pk }\ntable items { id int pk\n name text not null\n qty int\n code varchar(5) unique\n \
+             kind enum('a', 'b')\n owner_id int -> owners.id\n score int check (score >= 0)\n num int }",
+        )
+        .unwrap();
+        let current = db.introspect().unwrap();
+        let m = db.migration(&current, &v2);
+        let mut problems = db.preflight(&m);
+        problems.sort();
+        let mut expected = vec![
+            "1 row(s) of items fail the new check on score",
+            "1 row(s) of items have NULL in name, which becomes NOT NULL",
+            "1 row(s) of items have owner_id pointing at no row of owners",
+            "1 row(s) of items have kind not in (a, b)",
+            "2 row(s) of items repeat a value of code, which becomes unique",
+        ];
+        match db.dialect() {
+            Dialect::Sqlite => {}
+            d => {
+                expected.extend(["1 row(s) of items have code longer than 5 characters", "1 row(s) of items have qty outside the int range"]);
+                if d == Dialect::Postgres {
+                    expected.push("1 row(s) of items have num that doesn't convert to int");
+                }
+            }
+        }
+        expected.sort();
+        assert_eq!(problems.len(), expected.len(), "{problems:#?}");
+        for (p, e) in problems.iter().zip(&expected) {
+            assert!(p.starts_with(e), "{p} / {e}");
+        }
+        db.run("DELETE FROM items WHERE id <> 2").unwrap();
+        assert_eq!(db.preflight(&m), Vec::<String>::new());
+        db.apply_migration(&m).unwrap_or_else(|e| panic!("{e:#}\n{}", m.script()));
     }
 
     /// Tables whose foreign keys form a cycle are created, dumped and restored
@@ -1299,6 +1368,11 @@ mod tests {
     #[test]
     fn sqlite_key_changes() {
         live_key_changes(&mut Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t"));
+    }
+
+    #[test]
+    fn sqlite_preflight() {
+        live_preflight(&mut Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t"));
     }
 
     #[test]

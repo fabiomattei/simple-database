@@ -268,6 +268,8 @@ struct Db {
     migration: Option<(Schema, Option<Migration>)>,
     /// The same as a framework migration, when the tab shows one.
     framework_migration: Option<(Schema, Framework, Option<Generated>)>,
+    /// What rows would make pushing to that schema fail, checked as Push asks to confirm.
+    preflight: Option<(Schema, Option<Vec<String>>)>,
 }
 
 /// A connection made in the background, with its schema read.
@@ -717,7 +719,7 @@ impl App {
         self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None, framework_migration: None });
+        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;

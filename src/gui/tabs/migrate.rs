@@ -125,6 +125,10 @@ impl App {
                     .on_disabled_hover_text(why)
                     .clicked()
                 {
+                    // Check the rows as they are now.
+                    if let Some(db) = &mut self.db {
+                        db.preflight = None;
+                    }
                     self.dialog = Some(Dialog::ConfirmPush);
                 }
             });
@@ -272,6 +276,35 @@ impl App {
                     && *desired == target
                 {
                     *slot = Some(m);
+                }
+            },
+        );
+        None
+    }
+
+    /// What rows in the open database would make pushing `desired` fail,
+    /// checked on the database thread; `None` until ready.
+    pub(crate) fn preflight_for(&mut self, desired: &Schema) -> Option<Vec<String>> {
+        let db = self.db.as_mut()?;
+        match &db.preflight {
+            Some((s, p)) if s == desired => return p.clone(),
+            _ => {}
+        }
+        db.preflight = Some((desired.clone(), None));
+        let (current, target) = (db.schema.clone(), desired.clone());
+        db.worker.run(
+            "Checking existing rows",
+            move |conn| {
+                let m = conn.migration(&current, &target);
+                (conn.preflight(&m), current, target)
+            },
+            |app: &mut App, (problems, current, target)| {
+                if let Some(db) = &mut app.db
+                    && db.schema == current
+                    && let Some((desired, slot @ None)) = &mut db.preflight
+                    && *desired == target
+                {
+                    *slot = Some(problems);
                 }
             },
         );

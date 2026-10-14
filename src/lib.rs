@@ -19,6 +19,7 @@ pub mod mysqldb;
 pub mod output;
 pub mod parser;
 pub mod pg;
+pub mod preflight;
 pub mod safety;
 pub mod schema;
 pub mod seed;

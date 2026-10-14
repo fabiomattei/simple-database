@@ -41,7 +41,9 @@ impl App {
                 let resp = egui::Modal::new(egui::Id::new("push")).show(ctx, |ui| {
                     ui.set_width(420.0);
                     ui.heading("Apply migration?");
-                    let warnings = self.desired_schema().and_then(|s| self.migration_for(&s)).map(|m| m.warnings).unwrap_or_default();
+                    let desired = self.desired_schema();
+                    let warnings = desired.as_ref().and_then(|s| self.migration_for(s)).map(|m| m.warnings).unwrap_or_default();
+                    let problems = desired.as_ref().and_then(|s| self.preflight_for(s));
                     let dialect = self.dialect_of_db();
                     if dialect == Dialect::Mysql {
                         ui.colored_label(
@@ -56,9 +58,26 @@ impl App {
                             ui.colored_label(warn_color(ui), format!("⚠ {w}"));
                         }
                     }
+                    ui.add_space(4.0);
+                    match &problems {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking the rows already there…");
+                            });
+                        }
+                        Some(p) if p.is_empty() => {}
+                        Some(p) => {
+                            ui.colored_label(error_color(ui), "The migration would fail on these rows:");
+                            for problem in p {
+                                ui.colored_label(error_color(ui), format!("✖ {problem}"));
+                            }
+                        }
+                    }
                     ui.add_space(8.0);
+                    let label = if problems.as_ref().is_some_and(|p| !p.is_empty()) { "Apply anyway" } else { "Apply" };
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Apply").strong()).clicked() {
+                        if ui.button(RichText::new(label).strong()).clicked() {
                             self.dialog = None;
                             self.push_now();
                         }

@@ -1,6 +1,7 @@
 //! Compare two schemas and produce a migration script.
 
 use crate::ddl::*;
+use crate::preflight::{self, RowCheck};
 use crate::schema::*;
 
 #[derive(Debug, Clone, Default)]
@@ -11,6 +12,8 @@ pub struct Migration {
     pub warnings: Vec<String>,
     /// SQL statements, in execution order.
     pub statements: Vec<String>,
+    /// Queries for existing rows that would make it fail (`Database::preflight`).
+    pub checks: Vec<RowCheck>,
 }
 
 impl Migration {
@@ -217,6 +220,12 @@ pub fn plan(old: &Schema, new: &Schema, d: Dialect) -> Plan {
         }
         for (o, n) in &td.altered {
             changes.push(format!("~ column {}.{}: {}", new_t.name, n.name, describe_alter(o, n)));
+            if o.nullable && !n.nullable {
+                warnings.push(format!("{}.{} becomes NOT NULL; this fails if any row has NULL there", new_t.name, n.name));
+            }
+            if let Some(why) = preflight::type_risk(&o.data_type, &n.data_type, d) {
+                warnings.push(format!("{}.{} changes type {} -> {}: {why}", new_t.name, n.name, o.data_type, n.data_type));
+            }
         }
         if td.pk_changed && td.altered.iter().all(|(o, n)| o.primary_key == n.primary_key) {
             changes.push(format!(
@@ -246,10 +255,11 @@ pub fn plan(old: &Schema, new: &Schema, d: Dialect) -> Plan {
         }
         for c in &td.added {
             if !c.nullable && c.default.is_none() && !c.auto_increment {
-                warnings.push(format!(
-                    "{}.{} is NOT NULL without a default; this fails if the table already has rows",
-                    new_t.name, c.name
-                ));
+                warnings.push(if d == Dialect::Mysql {
+                    format!("{}.{} is NOT NULL without a default; rows already there get an empty value (0, '')", new_t.name, c.name)
+                } else {
+                    format!("{}.{} is NOT NULL without a default; this fails if the table already has rows", new_t.name, c.name)
+                });
             }
         }
 
@@ -323,7 +333,8 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
         body.extend(drop_table_statements(p.old.table(name).expect("dropped table"), d));
     }
 
-    let mut m = Migration { changes: p.changes, warnings: p.warnings, statements: Vec::new() };
+    let checks = preflight::row_checks(&p);
+    let mut m = Migration { changes: p.changes, warnings: p.warnings, statements: Vec::new(), checks };
     if body.is_empty() {
         return m;
     }
@@ -1064,8 +1075,9 @@ mod tests {
         for d in [Dialect::Postgres, Dialect::Mysql] {
             let m = diff(&old, &new, d);
             assert!(!m.script().contains("TODO"), "{}", m.script());
-            assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
-            assert!(m.warnings[0].contains("foreign keys point at the primary key of a"));
+            assert_eq!(m.warnings.len(), 2, "{:?}", m.warnings);
+            assert_eq!(m.warnings[0], "a.n becomes NOT NULL; this fails if any row has NULL there");
+            assert!(m.warnings[1].contains("foreign keys point at the primary key of a"));
         }
         let sql = diff(&old, &new, Dialect::Mysql).script();
         assert!(sql.contains("ALTER TABLE a DROP PRIMARY KEY, MODIFY COLUMN id INT, MODIFY COLUMN n INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (n);"), "{sql}");

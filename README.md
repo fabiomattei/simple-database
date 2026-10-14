@@ -247,7 +247,7 @@ certificate comes from a private CA, pass it with `sslrootcert`:
 | `sdb diagram SCHEMA -f mermaid\|dot` | ER diagram: paste Mermaid into GitHub/GitLab markdown, or `\| dot -Tsvg > er.svg` |
 | `sdb diff FROM TO -d DIALECT [-o file]` | Summary of changes + migration SQL |
 | `sdb diff FROM TO -d DIALECT -f laravel\|rails [--name NAME] [--rails-version 8.0] [-o dir]` | The same changes as a Laravel or Rails migration (see [Framework migrations](#framework-migrations)) |
-| `sdb push SCHEMA --db app.db [--dry-run] [-y]` | Migrate a database to match the schema |
+| `sdb push SCHEMA --db app.db [--dry-run] [-y] [--force]` | Migrate a database to match the schema. Refuses when rows already there would make it fail (see below) unless `--force` |
 | `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database. What a schema can't describe (views, triggers, functions, enum types no column uses, expression and partial indexes, table-level checks) is listed in comments at the top |
 | `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42] [-y]` | Fill tables with realistic fake data (see below) |
 | `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown] [-y]` | Run SQL, print results. `-y` skips safe mode's question |
@@ -426,7 +426,15 @@ Statements end with `;` and may span lines. History is saved to `shell_history` 
   data → drop old → rename, with foreign keys disabled. `sdb push` checks
   `PRAGMA foreign_key_check` before committing and rolls back on any violation.
 
-Destructive changes (dropped tables/columns) are flagged as warnings.
+Destructive changes (dropped tables/columns) are flagged as warnings, and so are changes that
+existing values can make fail or lose data: a column becoming NOT NULL, a narrower type
+(`text` → `varchar(10)`, `bigint` → `int`, fewer decimals, enum values removed) or another
+type the values must convert to. Before applying, `push` (and the app's **Push**) counts the rows
+that would make the migration fail, and names them, e.g. `2 row(s) of users repeat a value of
+email, which becomes unique`. It checks NULLs for NOT NULL, duplicates for new unique keys and
+primary keys, rows failing a new check, foreign keys pointing at no row, enum values; on
+PostgreSQL and MySQL also lengths and ranges, and on PostgreSQL 16+ whether text converts to
+the new type. `push` stops when any are found; fix the rows, or pass `--force` to try anyway.
 
 ### Renames
 

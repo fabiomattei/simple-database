@@ -100,6 +100,9 @@ enum Command {
         /// Apply without asking for confirmation
         #[arg(short, long)]
         yes: bool,
+        /// Apply even when rows in the database would make the migration fail
+        #[arg(long)]
+        force: bool,
     },
     /// Reverse-engineer a schema file from a database
     Pull {
@@ -383,7 +386,7 @@ fn run(cli: Cli) -> Result<()> {
                 None => print!("\n{}", m.script()),
             }
         }
-        Command::Push { schema, db, dry_run, yes } => {
+        Command::Push { schema, db, dry_run, yes, force } => {
             let desired = load_valid_schema(&schema)?;
             let mut db = open_db(&db)?;
             let current = db.introspect()?;
@@ -393,9 +396,16 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             print_changes(&m);
+            let problems = db.preflight(&m);
+            for p in &problems {
+                eprintln!("\x1b[31merror:\x1b[0m {p}");
+            }
             if dry_run {
                 print!("\n{}", m.script());
                 return Ok(());
+            }
+            if !problems.is_empty() && !force {
+                bail!("the migration would fail on the rows above; fix them first, or pass --force to try anyway");
             }
             if !yes && !confirm("\nApply these changes?")? {
                 println!("Aborted.");
@@ -750,7 +760,7 @@ fn write_framework_migration(g: framework::Generated, output: Option<&Path>) -> 
         eprintln!("Schemas are identical.");
         return Ok(());
     }
-    print_changes(&diff::Migration { changes: g.changes, warnings: g.warnings, statements: vec![] });
+    print_changes(&diff::Migration { changes: g.changes, warnings: g.warnings, ..Default::default() });
     match output {
         Some(path) => {
             let path = if path.is_dir() { path.join(&g.file_name) } else { path.to_path_buf() };
