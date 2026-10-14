@@ -394,7 +394,7 @@ cargo clippy --all-targets
 ```
 
 Source layout: `src/lib.rs` is the shared core and `src/main.rs` the CLI. `src/gui/` is the
-desktop app: `main.rs` (window, tabs), `er.rs` (diagram canvas), `grid.rs` (result grid),
+desktop app: `main.rs` (app state, window), `tabs/` (one file per tab), `panels.rs` (menu bar, sidebar, status bar), `dialogs.rs`, `file_menu.rs`, `er.rs` (diagram canvas), `grid.rs` (result grid),
 `editor.rs` (code editor: line numbers, commands, find/replace, column selection, autocomplete), `highlight.rs` (syntax colors). Core modules: `parser.rs` (DSL) → `schema.rs` (model) → `validate.rs`, `ddl.rs`,
 `diff.rs`, `diagram.rs`, `format.rs`; `seed.rs` (fake data); `db.rs` (live connections), which
 dispatches to `sqlite.rs`, `pg.rs` and `mysqldb.rs` (introspection & queries); `shell.rs`, `output.rs`.

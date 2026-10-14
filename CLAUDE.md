@@ -64,7 +64,11 @@ Binaries:
 | Path | Role |
 |---|---|
 | `src/main.rs` | `sdb` clap CLI; `load_schema` accepts a `.dbs` file **or** a SQLite file (detected by magic header) |
-| `src/gui/main.rs` | `sdb-gui`: `App` state, menus, sidebar, one `tab_*` method per tab, modal `Dialog`s, `Settings` persisted via eframe storage |
+| `src/gui/main.rs` | `sdb-gui`: `App` state and its types, `Settings` persisted via eframe storage, connecting and the worker plumbing (`db_run`, `poll_background`), shortcuts, the `eframe::App` impl. The rest of `App` is split into `impl App` blocks in other files; methods called across them are `pub(crate)` |
+| `src/gui/tabs/*.rs` | One file per tab (`schema`, `diagram`, `sql`, `migrate`, `query`, `data`, `seed`): its `tab_*` method and the actions that belong to it (e.g. `migration_for`, `run_query`, `load_data`) |
+| `src/gui/panels.rs` | Menu bar, sidebar and status bar |
+| `src/gui/dialogs.rs` | The modal `Dialog`s |
+| `src/gui/file_menu.rs` | File menu actions on the database: dump, restore, run SQL file |
 | `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
 | `src/gui/table_edit.rs` | Diagram's table editor dialog: column grid → DSL lines → `parser::parse`, renames via `Schema::rename_table` / `rename_column`; refuses edits that add validation errors |
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
