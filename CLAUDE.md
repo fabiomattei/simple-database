@@ -80,6 +80,7 @@ Binaries:
 | `src/gui/er_layout.rs` | Where table boxes go, pure and unit-tested: `layout` (connected groups in FK-depth layers, barycenter ordering, tall layers wrapped, groups shelf-packed, loners last), `place` (one new box in free space next to its related tables), `separate` (remove overlaps; `pinned` boxes stay, used when a box grows) |
 | `src/gui/table_edit.rs` | Diagram's table editor dialog: column grid → DSL lines → `parser::parse`, renames via `Schema::rename_table` / `rename_column`; refuses edits that add validation errors |
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
+| `src/gui/window.rs` | One database per window: another database opens in a new `sdb-gui` process (`open`), its target passed through `SDB_GUI_*` environment variables so a typed password stays off the command line (`launch`) |
 | `src/gui/worker.rs` | `Worker`: owns the open `Database` on its own thread, runs queued jobs and hands back replies; `Task`: one-off background work |
 | `src/gui/grid.rs` | Read-only virtualized result grid (egui_extras `TableBuilder`): Query results, import preview |
 | `src/gui/data_view.rs` | Data tab: `DataTabs` (one tab per open table, tab strip, `refresh` after a re-read), each a `DataView` (page, filters, sort, `Staged` edits/deletes/new rows), editable grid; returns `DataAction`s that `App` carries out (load, save, import, export) |
@@ -159,6 +160,8 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   (`run_script`, `seed`) also check `cancel_requested` between statements.
   Connecting and other one-off work (Migrate's "From" database, Connections → Test) use `worker::Task`.
   Query results are capped with `run_limited` (10,000 rows); Data pages are 200 rows.
+- Windows are separate processes, so files they share in `config_dir()` (history, saved queries,
+  `data_tabs.json`, connections) are re-read before each change; eframe storage is last-writer-wins.
 - Started without file arguments, the app reopens the previous session's schema file and shows
   the `Dialog::Welcome` connection picker (offering the last database) unless a database was given
   (eframe storage key `sdb-gui`). Pass files explicitly when testing for a predictable state.

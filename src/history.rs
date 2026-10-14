@@ -72,6 +72,16 @@ impl QueryLog {
         Ok(QueryLog { dir: dir.to_path_buf(), history: history.entries, saved: queries.queries })
     }
 
+    /// Re-read the files before a change, so what other windows saved meanwhile is kept.
+    fn reload(&mut self) {
+        if !self.dir.as_os_str().is_empty()
+            && let Ok(fresh) = QueryLog::load_from(&self.dir)
+        {
+            self.history = fresh.history;
+            self.saved = fresh.saved;
+        }
+    }
+
     fn save_history(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
         let file = HistoryFile { entries: self.history.clone() };
@@ -91,6 +101,7 @@ impl QueryLog {
         if sql.is_empty() {
             return Ok(());
         }
+        self.reload();
         self.history.retain(|e| !(e.sql.trim() == sql && e.database == entry.database));
         self.history.push(entry);
         let excess = self.history.len().saturating_sub(MAX_HISTORY);
@@ -99,6 +110,7 @@ impl QueryLog {
     }
 
     pub fn clear_history(&mut self) -> Result<()> {
+        self.reload();
         self.history.clear();
         self.save_history()
     }
@@ -119,6 +131,7 @@ impl QueryLog {
         if name.is_empty() {
             bail!("the query needs a name");
         }
+        self.reload();
         self.saved.retain(|q| q.name != name);
         self.saved.push(SavedQuery { name: name.to_string(), sql: sql.trim().to_string() });
         self.saved.sort_by_key(|q| q.name.to_lowercase());
@@ -126,6 +139,7 @@ impl QueryLog {
     }
 
     pub fn remove_query(&mut self, name: &str) -> Result<()> {
+        self.reload();
         self.saved.retain(|q| q.name != name);
         self.save_queries()
     }
@@ -184,6 +198,7 @@ mod tests {
         let mut log = QueryLog::load_from(&dir).unwrap();
         let entry = |i: usize| Entry { sql: format!("SELECT {i}"), database: "a.db".into(), at: i as u64, ..Default::default() };
         log.history = (0..MAX_HISTORY + 19).map(entry).collect();
+        log.save_history().unwrap();
         log.record(entry(MAX_HISTORY + 19)).unwrap();
         let log2 = QueryLog::load_from(&dir).unwrap();
         assert_eq!(log2.history.len(), MAX_HISTORY);
@@ -207,6 +222,22 @@ mod tests {
         assert_eq!(QueryLog::load_from(&dir).unwrap().history[0].database, "");
         std::fs::write(dir.join("queries.json"), "{").unwrap();
         assert!(QueryLog::load_from(&dir).unwrap_err().to_string().contains("queries.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn windows_keep_each_others_changes() {
+        let dir = std::env::temp_dir().join(format!("sdb-history-windows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut a, mut b) = (QueryLog::load_from(&dir).unwrap(), QueryLog::load_from(&dir).unwrap());
+        let entry = |sql: &str| Entry { sql: sql.into(), database: "a.db".into(), ..Default::default() };
+        a.record(entry("SELECT 1")).unwrap();
+        b.record(entry("SELECT 2")).unwrap();
+        a.save_query("x", "SELECT x").unwrap();
+        b.save_query("y", "SELECT y").unwrap();
+        let log = QueryLog::load_from(&dir).unwrap();
+        assert_eq!(log.history.len(), 2);
+        assert_eq!(log.saved.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

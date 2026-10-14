@@ -76,6 +76,11 @@ impl App {
                     action = m.show(ui, &mut self.conns);
                 });
                 match action {
+                    Some(conns::Action::Connect { target, label, safe_mode }) if self.shows_other_db(&label) => {
+                        let launch = crate::window::Launch { target, labeled: Some((label.clone(), safe_mode)), tab: None };
+                        self.open_window(Some(launch), &label);
+                        return;
+                    }
                     Some(conns::Action::Connect { target, label, safe_mode }) => {
                         m.message = Some((format!("Connecting to {label}…"), false));
                         self.start_open(format!("Connecting to {label}"), OpenFrom::Dialog, move || {

@@ -11,7 +11,9 @@ use simple_database::ddl::Dialect;
 use simple_database::output::ExportFormat;
 use simple_database::schema::{Schema, Table};
 use serde::{Deserialize, Serialize};
+use simple_database::connections::config_dir;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 pub const PAGE_SIZE: usize = 200;
 
@@ -96,6 +98,32 @@ pub fn remember(list: &mut Vec<SavedTabs>, s: SavedTabs) {
 }
 
 const MAX_SAVED_TABS: usize = 20;
+
+/// Every window shares the saved tabs through this file, and merges in only its own database.
+fn saved_tabs_file() -> PathBuf {
+    config_dir().join("data_tabs.json")
+}
+
+/// The saved tabs of all databases; `None` while there is no file yet.
+pub fn load_saved() -> Option<Vec<SavedTabs>> {
+    let text = std::fs::read_to_string(saved_tabs_file()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Remember `s` in the shared file (`list` without one), and return the list now saved.
+pub fn store_saved(list: &[SavedTabs], s: SavedTabs) -> anyhow::Result<Vec<SavedTabs>> {
+    let mut fresh = load_saved().unwrap_or_else(|| list.to_vec());
+    if fresh.first() == Some(&s) {
+        return Ok(fresh);
+    }
+    remember(&mut fresh, s);
+    let path = saved_tabs_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&fresh)?)?;
+    Ok(fresh)
+}
 
 /// The Data tab's open tables, one `DataView` each, so every table keeps its
 /// page, filters and staged changes while another one is shown.

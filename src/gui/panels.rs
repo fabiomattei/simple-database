@@ -28,7 +28,16 @@ impl App {
                     self.save_schema(true);
                 }
                 ui.separator();
-                if ui.button("Open database…").clicked()
+                let shortcut = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
+                if ui
+                    .add(egui::Button::new("New window").shortcut_text(ctx.format_shortcut(&shortcut)))
+                    .on_hover_text("Another window, to open another database")
+                    .clicked()
+                {
+                    self.open_window(None, "");
+                }
+                let hint = "With a database open, another one opens in a new window";
+                if ui.button("Open database…").on_hover_text(hint).clicked()
                     && let Some(p) = rfd::FileDialog::new()
                         .add_filter("SQLite database", &["db", "sqlite", "sqlite3"])
                         .add_filter("All files", &["*"])
@@ -42,8 +51,7 @@ impl App {
                         .set_file_name("app.db")
                         .save_file()
                 {
-                    self.open_db(&p.to_string_lossy());
-                    self.tab = Tab::Migrate;
+                    self.open_db_at(&p.to_string_lossy(), Some(Tab::Migrate));
                 }
                 if ui.add(egui::Button::new("Connections…").shortcut_text(ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::K)))).clicked() {
                     self.open_connections();
@@ -138,8 +146,7 @@ impl App {
                     if ui.button("New…").clicked()
                         && let Some(p) = rfd::FileDialog::new().add_filter("SQLite database", &["db"]).set_file_name("app.db").save_file()
                     {
-                        self.open_db(&p.to_string_lossy());
-                        self.tab = Tab::Migrate;
+                        self.open_db_at(&p.to_string_lossy(), Some(Tab::Migrate));
                     }
                     if ui.button("Connections…").on_hover_text("Saved connections, PostgreSQL and MySQL servers").clicked() {
                         self.open_connections();

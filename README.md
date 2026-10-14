@@ -61,6 +61,13 @@ use: reopen the last session's, connect to a saved connection, create a **New co
 open a SQLite file, or continue without one. A new schema starts empty; **Help → Example
 schema** shows a sample blog schema and can open it in the editor.
 
+Each window works with one database, and its title names it. With a database already open,
+opening or connecting to another one (File menu, Connections) opens it in a new window, which
+starts on the Data tab with an empty schema. **File → New window** (Ctrl+Shift+N) opens an
+empty window with the startup dialog. To switch the current window to another database, use
+**File → Close database** first. Query history, saved queries and the open Data tabs are
+shared by all windows.
+
 The app remembers the last schema file and database between sessions. For a saved connection
 it stores `@name`. For a plain server URL it stores the URL without the password, so the
 password must come from `PGPASSWORD` / `MYSQL_PWD` or be typed again. It asks before closing or

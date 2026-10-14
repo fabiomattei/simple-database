@@ -15,6 +15,7 @@ mod highlight;
 mod panels;
 mod table_edit;
 mod tabs;
+mod window;
 mod worker;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -68,7 +69,8 @@ struct Settings {
     hide_outline: bool,
     show_preview: bool,
     hide_history: bool,
-    /// The Data tab's open tables, per database, most recent first.
+    /// Read from older settings only: Data tabs now live in their own file, shared by all windows.
+    #[serde(skip_serializing)]
     data_tabs: Vec<data_view::SavedTabs>,
 }
 
@@ -95,6 +97,18 @@ impl Tab {
             "seed" => Tab::Seed,
             _ => return None,
         })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Schema => "schema",
+            Tab::Diagram => "diagram",
+            Tab::Sql => "sql",
+            Tab::Migrate => "migrate",
+            Tab::Query => "query",
+            Tab::Data => "data",
+            Tab::Seed => "seed",
+        }
     }
 }
 
@@ -360,7 +374,7 @@ impl App {
             history_search: String::new(),
             save_name: None,
             data: data_view::DataTabs::default(),
-            saved_tabs: settings.data_tabs.clone(),
+            saved_tabs: data_view::load_saved().unwrap_or_else(|| settings.data_tabs.clone()),
             data_loading: None,
             migrate_source: MigrateSource::SchemaFile,
             migrate_reading: None,
@@ -387,17 +401,34 @@ impl App {
 
         // Arguments on the command line win over the last session.
         let mut args: Vec<String> = Vec::new();
+        let mut tab = None;
         let mut raw = std::env::args_os().skip(1);
         while let Some(a) = raw.next() {
             if a == "--tab" {
                 let name = raw.next().unwrap_or_default();
                 match Tab::parse(&name.to_string_lossy()) {
-                    Some(t) => app.tab = t,
+                    Some(t) => tab = Some(t),
                     None => eprintln!("unknown tab {name:?}"),
                 }
             } else {
                 args.push(a.to_string_lossy().into_owned());
             }
+        }
+        if let Some(t) = tab {
+            app.tab = t;
+        }
+        // A window opened from another one starts without the last session's schema.
+        if window::spawned() {
+            if let Some(launch) = window::launch() {
+                app.tab = tab.unwrap_or(Tab::Data);
+                match launch.labeled {
+                    Some((label, mode)) => app.connect_labeled(launch.target, label, mode),
+                    None => app.open_db(&launch.target),
+                }
+            } else {
+                app.dialog = Some(Dialog::Welcome { last: settings.db_target });
+            }
+            return app;
         }
         let (mut schema_path, mut db_target) = (settings.schema_path, None);
         if !args.is_empty() {
@@ -538,10 +569,47 @@ impl App {
 
     /// Open a SQLite file, or connect to a server URL or saved `@name`, in
     /// the background. A failed connection to a server opens the Connections
-    /// dialog, e.g. to type a password.
+    /// dialog, e.g. to type a password. With another database open, it opens
+    /// in a new window.
     fn open_db(&mut self, target: &str) {
+        self.open_db_at(target, None);
+    }
+
+    /// `open_db`, then show `tab` (in the new window, if it goes to one).
+    fn open_db_at(&mut self, target: &str, tab: Option<Tab>) {
+        let label = if target.starts_with('@') { target.to_string() } else { db::redact(target) };
+        if self.shows_other_db(&label) {
+            self.open_window(Some(window::Launch { target: target.to_string(), labeled: None, tab: tab.map(Tab::name) }), &label);
+            return;
+        }
+        if let Some(t) = tab {
+            self.tab = t;
+        }
         let t = target.to_string();
         self.start_open(format!("Connecting to {}", db::redact(target)), OpenFrom::Target(t.clone()), move || Database::open(&t));
+    }
+
+    /// Connect as the Connections dialog does, with its label and safe mode.
+    fn connect_labeled(&mut self, target: String, label: String, safe_mode: SafeMode) {
+        let from = OpenFrom::Target(target.clone());
+        self.start_open(format!("Connecting to {label}"), from, move || {
+            Database::open_labeled(&target, label).and_then(|mut d| d.set_safe_mode(safe_mode).map(|()| d))
+        });
+    }
+
+    /// Whether this window has a database other than `label` open. One window
+    /// shows one database: another one opens in a new window.
+    pub(crate) fn shows_other_db(&self, label: &str) -> bool {
+        self.db.as_ref().is_some_and(|d| d.label != label)
+    }
+
+    /// Open another window, on `launch`'s database (named `label`) or empty.
+    pub(crate) fn open_window(&mut self, launch: Option<window::Launch>, label: &str) {
+        match window::open(launch) {
+            Ok(()) if label.is_empty() => {}
+            Ok(()) => self.set_status(format!("Opened {label} in a new window"), false),
+            Err(e) => self.set_status(format!("Cannot open a new window: {e}"), true),
+        }
     }
 
     /// Connect and read the schema on another thread; `poll_open` attaches it.
@@ -592,8 +660,14 @@ impl App {
 
     /// Keep the open database's Data tabs, to restore when it is opened again.
     pub(crate) fn remember_data_tabs(&mut self) {
-        if let Some(db) = &self.db {
-            data_view::remember(&mut self.saved_tabs, self.data.saved(&db.label));
+        let Some(db) = &self.db else { return };
+        let s = self.data.saved(&db.label);
+        match data_view::store_saved(&self.saved_tabs, s.clone()) {
+            Ok(list) => self.saved_tabs = list,
+            Err(e) => {
+                data_view::remember(&mut self.saved_tabs, s);
+                self.set_status(format!("Cannot save the open Data tabs: {e:#}"), true);
+            }
         }
     }
 
@@ -618,6 +692,9 @@ impl App {
             self.query = default_query(dialect).into();
         }
         self.remember_data_tabs();
+        if let Some(list) = data_view::load_saved() {
+            self.saved_tabs = list;
+        }
         self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
@@ -750,6 +827,10 @@ impl App {
         if ctx.input_mut(|i| i.consume_shortcut(&cmd(Key::O))) {
             self.request(Pending::OpenSchema, ctx);
         }
+        // Before Cmd+N, which would also match with Shift held.
+        if editor::take_key(ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::N) {
+            self.open_window(None, "");
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&cmd(Key::N))) {
             self.request(Pending::NewSchema, ctx);
         }
@@ -781,7 +862,15 @@ impl eframe::App for App {
             let last_good = std::mem::take(&mut self.analysis.last_good);
             self.analysis = analyze(&self.schema_text, last_good);
         }
-        let title = format!("{} — sdb", self.file_label());
+        // The schema only when there is one: a file, or edits not saved yet.
+        let schema = (self.schema_path.is_some() || self.dirty()).then(|| self.file_label());
+        let title = match (&self.db, &self.opening, schema) {
+            (Some(db), _, Some(file)) => format!("{} — {file} — sdb", db_title(&db.label)),
+            (Some(db), _, None) => format!("{} — sdb", db_title(&db.label)),
+            (None, Some((task, _)), _) => format!("{}… — sdb", task.what),
+            (None, None, Some(file)) => format!("{file} — sdb"),
+            (None, None, None) => "sdb".to_string(),
+        };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         self.handle_shortcuts(&ctx);
 
@@ -844,7 +933,7 @@ impl eframe::App for App {
             hide_outline: !self.show_outline,
             show_preview: self.show_preview,
             hide_history: !self.show_history,
-            data_tabs: self.saved_tabs.clone(),
+            data_tabs: Vec::new(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
     }
@@ -857,6 +946,14 @@ fn analyze(text: &str, last_good: Schema) -> Analysis {
     let issues = result.as_ref().map(validate::validate).unwrap_or_default();
     let last_good = result.as_ref().map_or(last_good, Clone::clone);
     Analysis { text: text.to_string(), result, issues, last_good, outline: parser::outline(text) }
+}
+
+/// How the window title names a database: a SQLite file by its name, a server URL or `@name` as is.
+fn db_title(label: &str) -> String {
+    if db::is_url(label) || label.starts_with('@') {
+        return label.to_string();
+    }
+    Path::new(label).file_name().map_or_else(|| label.to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// The table after the first FROM in `sql`, to name exported results.
