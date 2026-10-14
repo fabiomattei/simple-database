@@ -5,6 +5,7 @@
 
 mod conns;
 mod data_view;
+mod date_edit;
 mod dialogs;
 mod editor;
 mod er;

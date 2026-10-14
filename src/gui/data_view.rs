@@ -2,6 +2,7 @@
 //! place. Edits, new rows and deletions are staged until Save, which applies
 //! them in one transaction.
 
+use crate::date_edit;
 use crate::grid::{self, number_color};
 use eframe::egui::{self, Color32, Key, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -672,6 +673,8 @@ impl DataView {
         let mut select: Option<(usize, bool)> = None;
 
         let pk = table.map(|t| t.primary_key()).unwrap_or_default();
+        let kinds: Vec<Option<date_edit::Kind>> =
+            r.columns.iter().map(|c| table.and_then(|t| t.column(c)).and_then(|c| date_edit::Kind::of(&c.data_type))).collect();
         let sort = self.view.sort.clone();
         let fit_key = egui::Id::new(("data_grid", self.table.clone()));
         let generation = grid::fit_generation(ui, fit_key);
@@ -732,7 +735,7 @@ impl DataView {
                             select = Some((i, ui.input(|inp| inp.modifiers.command || inp.modifiers.shift)));
                         }
                     });
-                    for col in 0..r.columns.len() {
+                    for (col, kind) in kinds.iter().copied().enumerate() {
                         let (_, resp) = row.col(|ui| {
                             let bg = if deleted {
                                 Some(deleted_bg)
@@ -747,11 +750,16 @@ impl DataView {
                                 ui.painter().rect_filled(ui.max_rect().expand2(egui::vec2(4.0, 2.0)), 0.0, bg);
                             }
                             if let Some(e) = self.editing.as_mut().filter(|e| e.row == i && e.col == col) {
-                                let te = ui.add(egui::TextEdit::singleline(&mut e.text).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
-                                if std::mem::take(&mut e.focus) {
+                                // Room for the picker button beside the field.
+                                let width = if kind.is_some() { ui.available_width() - 28.0 } else { f32::INFINITY };
+                                let te = ui.add(egui::TextEdit::singleline(&mut e.text).desired_width(width).font(egui::TextStyle::Monospace));
+                                let picker = kind.map(|kind| date_edit::picker(ui, kind, &mut e.text));
+                                if std::mem::take(&mut e.focus) || picker.as_ref().is_some_and(|p| p.closed) {
                                     te.request_focus();
                                 }
-                                if ui.input(|inp| inp.key_pressed(Key::Escape)) {
+                                if picker.is_some_and(|p| p.busy) {
+                                    // The picker owns Escape and clicks while it is open.
+                                } else if ui.input(|inp| inp.key_pressed(Key::Escape)) {
                                     cancel = true;
                                 } else if te.lost_focus() {
                                     commit = true;
