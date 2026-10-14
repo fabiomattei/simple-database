@@ -205,6 +205,8 @@ verifies the CA, as libpq does:
 | `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42] [-y]` | Fill tables with realistic fake data (see below) |
 | `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown] [-y]` | Run SQL, print results. `-y` skips safe mode's question |
 | `sdb import --db app.db FILE [-t TABLE] [-f csv\|tsv\|json\|jsonl] [-y]` | Insert rows from a file (see below) |
+| `sdb dump --db app.db [-o dump.sql] [-t a,b] [--schema-only\|--data-only] [-d DIALECT]` | Write the schema and rows as a SQL script (see below) |
+| `sdb restore FILE --db app.db [--clean] [-y]` | Run a dump against a database in one transaction (see below) |
 | `sdb shell [--db app.db]` | Interactive SQL shell (in-memory if no `--db`) |
 | `sdb conn list` | List saved connections by group |
 | `sdb conn add NAME URL\|FILE [-g GROUP] [--no-password] [-f] [--safe-mode MODE]` | Save a connection. A password in the URL is saved unless `--no-password`; `-f` replaces an existing one |
@@ -264,6 +266,25 @@ TSV an empty field is NULL and `""` is an empty string. NULL in a NOT NULL colum
 gets the default, and a column that is empty in every row and filled by the database
 (auto-increment or default) is left out. Values are checked against the column types, and all
 rows go in one transaction, so a bad row means nothing is inserted.
+
+### Dump and restore
+
+`sdb dump --db app.db -o app.sql` writes the tables (CREATE TABLE and indexes, in dependency
+order) and their rows (batched INSERTs, sorted by primary key) as plain SQL in the database's
+dialect. `-t` limits it to some tables; `--schema-only` and `--data-only` leave out one half.
+`-d postgres` writes SQL for another database, so `sdb dump --db app.db -d postgres` moves a
+SQLite database to Postgres. For Postgres the dump ends with `setval` calls, so identity
+columns continue after the restored ids. The file has no BEGIN/COMMIT: `sqlite3`, `psql` and
+`mysql` can run it as is.
+
+`sdb restore app.sql --db copy.db` runs a dump (sdb's or plain SQL, such as `sqlite3 app.db
+.dump`) in one transaction: if a statement fails, nothing is changed. A SQLite target file is
+created if it is missing. Tables the dump creates must not exist yet; `--clean` drops them
+first (and always asks, unless `-y`). Foreign keys are checked at the end (SQLite) or switched
+off during the restore (MySQL), so row order doesn't matter. MySQL commits each CREATE and DROP
+on its own, so a failure there leaves the statements before it applied. Check expressions are
+dumped as the server spells them, so a check rewritten by Postgres (`= ANY (ARRAY[...])`) may
+not load into SQLite or MySQL. In the app: **File → Dump database…** and **Restore dump…**.
 
 ### Typical workflow
 

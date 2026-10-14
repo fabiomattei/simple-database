@@ -3,7 +3,7 @@
 `sdb` is a schema-first database tool in Rust: a **desktop app** (`sdb-gui`, egui/eframe) and a
 CLI (`sdb`). Both sit on one library crate (`simple_database`, `src/lib.rs`). You write schemas
 in a small DSL (`.dbs`). The tool validates them, generates DDL for SQLite/Postgres/MySQL, draws
-ER diagrams, diffs schemas into migrations, pushes to and pulls from live SQLite, PostgreSQL and
+ER diagrams, diffs schemas into migrations, dumps and restores databases, pushes to and pulls from live SQLite, PostgreSQL and
 MySQL databases, seeds fake data and runs SQL. The README documents the DSL, every CLI command and every GUI tab.
 
 ## Commands
@@ -46,6 +46,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `safety.rs` | `SafeMode` (off / warn / confirm / read-only) and `classify` (read, write, dangerous) over comment- and string-free words |
 | `history.rs` | `QueryLog`: query history (`history.json`, 500 entries, 0600) and saved queries (`queries.json`) in `config_dir()` |
 | `import.rs` | CSV/TSV/JSON/JSONL → `Rows`, `plan` (match columns by name), batched INSERTs, `import` in one transaction |
+| `dump.rs` | `dump` a database to SQL (DDL in dependency order, batched INSERTs, Postgres `setval`; any target dialect); `prepare` + `restore` run a dump file through `write_statements` (BEGIN/COMMIT dropped, `--clean` drops existing tables, SQLite defers FKs, MySQL turns FK checks off) |
 | `discover.rs` | Find databases in a project folder: `.env` URLs and Laravel `DB_*`, compose services (lenient line-based YAML scan), Prisma datasource |
 | `connections.rs` | Saved connections (`Store`: `connections.json` + 0600 `secrets.json` in `config_dir()`). `Connection::from_target` / `target` convert to and from URLs. `resolve("@name")` is called by `Database::open` |
 | `db.rs` | `Database`: one live connection (SQLite path or `postgres://` / `mysql://` URL). `introspect`, `run` / `run_limited`, `row_counts`, `migration`, `apply_migration`, `normalize_checks`. Also `Cell` / `QueryResult`, `split_statements` and `schema_from_sqlite_ddl` (DDL → `Schema` via an in-memory SQLite; the GUI's editable SQL tab) |

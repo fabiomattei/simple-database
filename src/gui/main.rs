@@ -20,6 +20,7 @@ use simple_database::parser::{self, ParseError};
 use simple_database::schema::Schema;
 use simple_database::connections::{SafeMode, Store};
 use simple_database::db::{self, Database, QueryResult};
+use simple_database::dump;
 use simple_database::history::{self, QueryLog};
 use simple_database::import::{self, ImportFormat};
 use simple_database::output::{self, ExportFormat};
@@ -112,6 +113,7 @@ enum Dialog {
     /// Safe mode asks before these statements run.
     ConfirmWrite(Box<ConfirmWrite>),
     Import(Box<ImportState>),
+    Restore(Box<RestoreState>),
 }
 
 /// A write held back until the user confirms it.
@@ -132,6 +134,14 @@ struct ImportState {
     path: PathBuf,
     rows: import::Rows,
     table: String,
+    error: Option<String>,
+}
+
+/// The Restore dialog: a dump read and checked against the open database.
+struct RestoreState {
+    path: PathBuf,
+    restore: dump::Restore,
+    clean: bool,
     error: Option<String>,
 }
 
@@ -574,6 +584,15 @@ impl App {
                 if ui.add(egui::Button::new("Connections…").shortcut_text(ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::K)))).clicked() {
                     self.open_connections();
                 }
+                ui.separator();
+                if ui.add_enabled(self.db.is_some(), egui::Button::new("Dump database…")).on_hover_text("Save the schema and all rows as a SQL file").clicked() {
+                    self.dump_db();
+                }
+                let writable = self.db.as_ref().is_some_and(|d| d.conn.safe_mode() != SafeMode::ReadOnly);
+                if ui.add_enabled(writable, egui::Button::new("Restore dump…")).on_hover_text("Run a SQL dump file against the open database").clicked() {
+                    self.pick_restore();
+                }
+                ui.separator();
                 if ui.add_enabled(self.db.is_some(), egui::Button::new("Close database")).clicked() {
                     self.db = None;
                     self.set_status("Database closed", false);
@@ -1785,6 +1804,41 @@ impl App {
         }
     }
 
+    /// Save the open database as a SQL dump in its own dialect.
+    fn dump_db(&mut self) {
+        let Some(db) = &mut self.db else { return };
+        let stem = Path::new(db.conn.label().rsplit(['/', '\\']).next().unwrap_or("dump"))
+            .file_stem()
+            .map(|s| s.to_string_lossy().trim_start_matches('@').to_string())
+            .unwrap_or_else(|| "dump".into());
+        let Some(path) = rfd::FileDialog::new().add_filter("SQL", &["sql"]).set_file_name(format!("{stem}.sql")).save_file() else {
+            return;
+        };
+        let res = std::fs::File::create(&path).map_err(anyhow::Error::from).and_then(|f| {
+            let mut out = std::io::BufWriter::new(f);
+            let report = dump::dump(&mut db.conn, &dump::DumpOptions::default(), &mut out)?;
+            std::io::Write::flush(&mut out)?;
+            Ok(report)
+        });
+        match res {
+            Ok(r) => self.set_status(format!("Dumped {} table(s), {} row(s) to {}", r.tables, r.rows, path.display()), false),
+            Err(e) => self.set_status(format!("Dump failed: {e:#}"), true),
+        }
+    }
+
+    /// Choose a dump file and open the Restore dialog for it.
+    fn pick_restore(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("SQL", &["sql"]).add_filter("All files", &["*"]).pick_file() else {
+            return;
+        };
+        let Some(db) = &mut self.db else { return };
+        let res = std::fs::read_to_string(&path).map_err(anyhow::Error::from).and_then(|sql| dump::prepare(&mut db.conn, &sql));
+        match res {
+            Ok(restore) => self.dialog = Some(Dialog::Restore(Box::new(RestoreState { path, restore, clean: false, error: None }))),
+            Err(e) => self.set_status(format!("{}: {e:#}", path.display()), true),
+        }
+    }
+
     fn tab_seed(&mut self, ui: &mut egui::Ui) {
         let Some(db) = &self.db else {
             empty_state(ui, "No database open", "Open a SQLite database or connect to a server to fill it with fake data.");
@@ -2135,6 +2189,69 @@ impl App {
                     Some(false) => {}
                     None if resp.should_close() => {}
                     None => self.dialog = Some(Dialog::Import(st)),
+                }
+                return;
+            }
+            Dialog::Restore(_) => {
+                let Some(Dialog::Restore(mut st)) = self.dialog.take() else { unreachable!() };
+                let mut answer = None;
+                let (label, dialect) = match &self.db {
+                    Some(d) => (d.conn.label().to_string(), d.conn.dialect()),
+                    None => (String::new(), Dialect::Sqlite),
+                };
+                let resp = egui::Modal::new(egui::Id::new("restore")).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(format!("Restore into {label}?"));
+                    ui.label(RichText::new(st.path.display().to_string()).monospace().small().weak());
+                    ui.add_space(6.0);
+                    let r = &st.restore;
+                    ui.label(format!("{} statement(s): {} table(s) to create, {} INSERT(s).", r.statements.len(), r.creates.len(), r.inserts()));
+                    if !r.creates.is_empty() {
+                        ui.label(RichText::new(r.creates.join(", ")).weak());
+                    }
+                    if !r.existing.is_empty() {
+                        ui.add_space(4.0);
+                        ui.colored_label(warn_color(ui), format!("⚠ The database already has {}.", r.existing.join(", ")));
+                        ui.checkbox(&mut st.clean, "Drop these tables first (their rows are lost)");
+                    }
+                    ui.add_space(4.0);
+                    if dialect == Dialect::Mysql {
+                        ui.colored_label(warn_color(ui), "⚠ MySQL commits each CREATE and DROP: if a statement fails, the ones before it stay applied.");
+                    } else {
+                        ui.label(RichText::new("Everything runs in one transaction: if a statement fails, nothing is changed.").small().weak());
+                    }
+                    if let Some(e) = &st.error {
+                        ui.colored_label(error_color(ui), format!("✖ {e}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ok = r.existing.is_empty() || st.clean;
+                        if ui.add_enabled(ok, egui::Button::new(RichText::new("Restore").strong())).on_disabled_hover_text("Tick the box to drop the existing tables").clicked() {
+                            answer = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+                match answer {
+                    Some(true) => {
+                        let res = match &mut self.db {
+                            Some(db) => dump::restore(&mut db.conn, &st.restore, st.clean).map_err(|e| format!("{e:#}")),
+                            None => Err("no database open".into()),
+                        };
+                        self.refresh_db();
+                        match res {
+                            Ok(n) => self.set_status(format!("Restored {}: {n} row(s)", st.path.display()), false),
+                            Err(e) => {
+                                st.error = Some(e);
+                                self.dialog = Some(Dialog::Restore(st));
+                            }
+                        }
+                    }
+                    Some(false) => {}
+                    None if resp.should_close() => {}
+                    None => self.dialog = Some(Dialog::Restore(st)),
                 }
                 return;
             }

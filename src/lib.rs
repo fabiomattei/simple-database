@@ -9,6 +9,7 @@ pub mod ddl;
 pub mod diagram;
 pub mod diff;
 pub mod discover;
+pub mod dump;
 pub mod format;
 pub mod history;
 pub mod import;

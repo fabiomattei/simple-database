@@ -541,7 +541,7 @@ pub fn schema_from_sqlite_ddl(sql: &str) -> std::result::Result<Schema, crate::p
 }
 
 /// `stmt` without `--` and `/* */` comments (statements from `split_statements`).
-fn strip_sql_comments(stmt: &str) -> String {
+pub(crate) fn strip_sql_comments(stmt: &str) -> String {
     let mut out = String::new();
     let mut rest = stmt;
     loop {

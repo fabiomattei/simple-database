@@ -140,6 +140,45 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Write a database's schema and rows to a SQL file
+    ///
+    /// Tables are created in dependency order, then filled with INSERTs. The
+    /// file has no BEGIN/COMMIT, so `sqlite3`, `psql` or `mysql` can run it too.
+    Dump {
+        #[arg(long)]
+        db: String,
+        /// Write to a file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Only these tables (comma-separated)
+        #[arg(short, long, value_delimiter = ',')]
+        tables: Vec<String>,
+        /// Only the CREATE statements
+        #[arg(long, conflicts_with = "data_only")]
+        schema_only: bool,
+        /// Only the INSERTs
+        #[arg(long)]
+        data_only: bool,
+        /// Write SQL for another database (default: the source's own)
+        #[arg(short, long, value_enum)]
+        dialect: Option<Dialect>,
+    },
+    /// Run a dump file against a database in one transaction
+    ///
+    /// Restores `sdb dump` output and plain SQL dumps such as `sqlite3 .dump`.
+    /// Tables the dump creates must not exist yet, unless --clean drops them.
+    Restore {
+        file: PathBuf,
+        /// SQLite file (created if missing) or postgres:// / mysql:// URL
+        #[arg(long)]
+        db: String,
+        /// Drop the tables the dump creates if they already exist
+        #[arg(long)]
+        clean: bool,
+        /// Restore without asking
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Interactive SQL shell (in-memory database if --db is omitted)
     Shell {
         #[arg(long)]
@@ -327,6 +366,43 @@ fn run(cli: Cli) -> Result<()> {
             let reports = seed::seed(&mut db, &opts)?;
             seed::print_reports(&reports);
             println!("(reproduce with --seed {seed})");
+        }
+        Command::Dump { db, output, tables, schema_only, data_only, dialect } => {
+            let mut db = open_existing(&db)?;
+            let opts = dump::DumpOptions { data_only, schema_only, tables, dialect };
+            let report = match &output {
+                Some(path) => {
+                    let mut file = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?);
+                    let report = dump::dump(&mut db, &opts, &mut file)?;
+                    std::io::Write::flush(&mut file)?;
+                    report
+                }
+                None => dump::dump(&mut db, &opts, &mut std::io::stdout().lock())?,
+            };
+            let to = output.map_or("stdout".to_string(), |p| p.display().to_string());
+            eprintln!("Dumped {} table(s), {} row(s) to {to}", report.tables, report.rows);
+        }
+        Command::Restore { file, db, clean, yes } => {
+            let sql = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let mut db = db::Database::open(&db)?;
+            db.ensure_writable()?;
+            let r = dump::prepare(&mut db, &sql)?;
+            eprintln!("{} statement(s): {} table(s) to create, {} INSERT(s)", r.statements.len(), r.creates.len(), r.inserts());
+            if !r.existing.is_empty() {
+                if !clean {
+                    bail!("{} already has {}; use --clean to drop them first", db.label(), r.existing.join(", "));
+                }
+                eprintln!("\x1b[31mwill drop:\x1b[0m {}", r.existing.join(", "));
+            }
+            if db.dialect() == Dialect::Mysql {
+                eprintln!("\x1b[33mwarning:\x1b[0m MySQL commits each CREATE/DROP, so a failure leaves earlier statements applied");
+            }
+            let asks = (clean && !r.existing.is_empty()) || db.confirms_writes();
+            if asks && !yes && !confirm(&format!("Restore {} into {}?", file.display(), db.label()))? {
+                bail!("not restored");
+            }
+            let n = dump::restore(&mut db, &r, clean)?;
+            println!("Restored {} into {}: {n} row(s).", file.display(), db.label());
         }
         Command::Shell { db } => {
             let db = match &db {
