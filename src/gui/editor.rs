@@ -377,11 +377,7 @@ pub fn code_editor(
         te_state.store(ui.ctx(), id);
     }
 
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
-        let mut job = (*highlight::highlight(ui, buf.as_str(), lang)).clone();
-        job.wrap.max_width = f32::INFINITY;
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| highlight::layout(ui, buf.as_str(), lang);
     let char_w = ui.fonts_mut(|f| f.glyph_width(&FontId::monospace(FONT_SIZE), ' '));
     let digits = line_count(text).to_string().len().max(3);
     let gutter_w = char_w * digits as f32 + 14.0;

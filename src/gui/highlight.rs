@@ -1,6 +1,6 @@
 //! Minimal syntax highlighting for the `.dbs` DSL and SQL.
 
-use eframe::egui::{self, Color32, FontId, TextFormat, text::LayoutJob};
+use eframe::egui::{self, Color32, FontId, Galley, TextFormat, text::LayoutJob};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,22 +73,46 @@ fn palette(dark: bool) -> Palette {
     }
 }
 
-/// `text` highlighted as `lang`. Kept from frame to frame while the text,
-/// language and theme stay the same: an editor lays its text out every frame.
-pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> Arc<LayoutJob> {
+/// `text` highlighted as `lang` and laid out without wrapping. egui's own
+/// galley cache hashes the whole text and every section on each lookup, which
+/// is most of a frame for a long file, so the galley is kept here while the
+/// text, language and theme stay the same.
+///
+/// A galley points into egui's font atlas, which egui rebuilds (clearing its
+/// galley cache) when the atlas fills up or the text options change. A kept
+/// galley is therefore used only while a tiny probe galley comes back from
+/// egui's cache as the same `Arc` as before: the cache, and so the atlas,
+/// survived. The probe's hash includes the scale, so a new scale also misses.
+pub fn layout(ui: &egui::Ui, text: &str, lang: Lang) -> Arc<Galley> {
     let dark = ui.visuals().dark_mode;
-    ui.ctx().memory_mut(|m| m.caches.cache::<HighlightCache>().get((text, lang, dark)).clone())
+    let probe = ui.fonts_mut(|f| f.layout_no_wrap("sdb".into(), FontId::monospace(8.0), Color32::WHITE));
+    let pass = ui.ctx().cumulative_pass_nr();
+    let id = egui::Id::new("sdb-highlight-galleys");
+    let kept = ui.data_mut(|d| {
+        let kept = d.get_temp_mut_or_default::<Vec<Kept>>(id);
+        kept.retain(|k| k.pass + 1 >= pass && Arc::ptr_eq(&k.probe, &probe));
+        kept.iter_mut().find(|k| k.lang == lang && k.dark == dark && k.galley.job.text == text).map(|k| {
+            k.pass = pass;
+            k.galley.clone()
+        })
+    });
+    if let Some(galley) = kept {
+        return galley;
+    }
+    let mut job = highlight_job(text, lang, dark);
+    job.wrap.max_width = f32::INFINITY;
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    ui.data_mut(|d| d.get_temp_mut_or_default::<Vec<Kept>>(id).push(Kept { lang, dark, galley: galley.clone(), probe, pass }));
+    galley
 }
 
-type HighlightCache = egui::cache::FrameCache<Arc<LayoutJob>, Highlighter>;
-
-#[derive(Default)]
-struct Highlighter;
-
-impl egui::cache::ComputerMut<(&str, Lang, bool), Arc<LayoutJob>> for Highlighter {
-    fn compute(&mut self, (text, lang, dark): (&str, Lang, bool)) -> Arc<LayoutJob> {
-        Arc::new(highlight_job(text, lang, dark))
-    }
+#[derive(Clone)]
+struct Kept {
+    lang: Lang,
+    dark: bool,
+    galley: Arc<Galley>,
+    probe: Arc<Galley>,
+    pass: u64,
 }
 
 fn highlight_job(text: &str, lang: Lang, dark: bool) -> LayoutJob {
@@ -188,9 +212,9 @@ fn highlight_job(text: &str, lang: Lang, dark: bool) -> LayoutJob {
 /// Read-only highlighted code, selectable for copying. Never wraps or
 /// justifies, even inside a justified layout such as `ui.columns`.
 pub fn code_view(ui: &mut egui::Ui, text: &str, lang: Lang) {
-    let job = highlight(ui, text, lang);
+    let galley = layout(ui, text, lang);
     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-        ui.add(egui::Label::new(job).selectable(true).wrap_mode(egui::TextWrapMode::Extend));
+        ui.add(egui::Label::new(galley).selectable(true).wrap_mode(egui::TextWrapMode::Extend));
     });
 }
 
@@ -211,17 +235,28 @@ mod tests {
     }
 
     #[test]
-    fn highlighting_is_kept_while_the_text_stays() {
+    fn layout_is_kept_until_the_text_or_the_font_atlas_changes() {
         let ctx = egui::Context::default();
         let frame = |text: &str, lang: Lang| {
-            let mut job = None;
-            let mut out = ctx.run_ui(Default::default(), |ui| job = Some(highlight(ui, text, lang)));
+            let mut galley = None;
+            let mut out = ctx.run_ui(Default::default(), |ui| galley = Some(layout(ui, text, lang)));
             out.textures_delta.clear();
-            job.unwrap()
+            galley.unwrap()
         };
-        let first = frame("table t { id int pk }", Lang::Dbs);
-        assert!(Arc::ptr_eq(&first, &frame("table t { id int pk }", Lang::Dbs)));
-        assert!(!Arc::ptr_eq(&first, &frame("table t { id int pk }", Lang::Sql)));
+        let text = "table t { id int pk }";
+        let first = frame(text, Lang::Dbs);
+        assert_eq!(first.job.text, text);
+        assert!(Arc::ptr_eq(&first, &frame(text, Lang::Dbs)));
+        assert!(!Arc::ptr_eq(&first, &frame(text, Lang::Sql)));
         assert!(!Arc::ptr_eq(&first, &frame("table t { id bigint pk }", Lang::Dbs)));
+
+        // A rebuilt font atlas (here: new text options) or a new scale lays it out again.
+        let kept = frame(text, Lang::Dbs);
+        assert!(Arc::ptr_eq(&kept, &frame(text, Lang::Dbs)));
+        ctx.global_style_mut(|s| s.visuals.text_options.font_hinting = !s.visuals.text_options.font_hinting);
+        let rebuilt = frame(text, Lang::Dbs);
+        assert!(!Arc::ptr_eq(&kept, &rebuilt));
+        ctx.set_pixels_per_point(3.0);
+        assert!(!Arc::ptr_eq(&rebuilt, &frame(text, Lang::Dbs)));
     }
 }

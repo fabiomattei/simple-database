@@ -88,7 +88,7 @@ Binaries:
 | `src/gui/grid.rs` | Read-only virtualized result grid (egui_extras `TableBuilder`): Query results, import preview |
 | `src/gui/data_view.rs` | Data tab: `DataTabs` (one tab per open table, tab strip, `refresh` after a re-read), each a `DataView` (page, filters, sort, `Staged` edits/deletes/new rows), editable grid; returns `DataAction`s that `App` carries out (load, save, import, export) |
 | `src/gui/editor.rs` | `code_editor`: `TextEdit` plus gutter and problem `Mark`s, line commands (`command`, pure and unit-tested), find/replace bar, column selection (multi-caret, consumed from input before `TextEdit` sees it) and autocomplete (`Vocabulary` from a `Schema`; context-aware for the DSL). `goto_line` / `caret_line` talk to it by id. Use `take_key` for exact-modifier shortcuts: `consume_key` also matches with Shift held |
-| `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view`. `highlight` returns an `Arc<LayoutJob>` kept in egui's `FrameCache` while text, language and theme stay the same (editors lay out every frame); same-color neighbors share a section |
+| `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view`. `layout` returns the laid-out `Galley`, kept while text, language and theme stay the same (egui's own cache would hash the whole text every frame) and dropped when egui rebuilds its font atlas, detected by a probe galley no longer coming back as the same `Arc`; same-color neighbors share a section |
 
 `examples/blog.dbs` is not just an example. It is the output of `sdb init` and the GUI's
 Help → Example schema (the GUI itself starts with an empty schema and a welcome dialog to pick a
