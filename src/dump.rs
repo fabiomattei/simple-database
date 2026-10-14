@@ -1,13 +1,14 @@
 //! Dump a database to a SQL script (schema and/or data) and restore one.
 //!
 //! A dump is plain SQL in one dialect: CREATE TABLE / CREATE INDEX in
-//! dependency order, then batched INSERTs (rows ordered by primary key), then,
+//! dependency order, then batched INSERTs (rows ordered by primary key, read in
+//! pages so a big table is never held whole), then,
 //! for Postgres, `setval` calls so identity columns continue after the
 //! restored ids. It has no BEGIN/COMMIT: [`restore`] runs it in one
 //! transaction, and other tools (`sqlite3`, `psql`, `mysql`) can run it as is.
 
 use crate::data::literal;
-use crate::db::{Database, is_transaction_control, statements_with_lines, strip_sql_comments};
+use crate::db::{Cell, Database, is_transaction_control, statements_with_lines, strip_sql_comments};
 use crate::ddl::{self, Dialect, quote};
 use crate::schema::*;
 use anyhow::{Context, Result, bail};
@@ -72,29 +73,35 @@ pub fn dump(db: &mut Database, opts: &DumpOptions, out: &mut dyn Write) -> Resul
         return Ok(report);
     }
     for t in &tables {
-        let rows = select_all(db, t, src)?;
-        if rows.is_empty() {
-            continue;
-        }
-        report.rows += rows.len();
-        writeln!(out, "\n-- {} ({} rows)", t.name, rows.len())?;
         let cols: Vec<String> = t.columns.iter().map(|c| quote(&c.name, d)).collect();
         let head = format!("INSERT INTO {} ({}) VALUES", quote(&t.name, d), cols.join(", "));
-        for chunk in rows.chunks(BATCH) {
-            let values: Vec<String> = chunk
-                .iter()
-                .map(|row| {
-                    let vals: Vec<String> = row
-                        .iter()
-                        .zip(&t.columns)
-                        // SQLite may hold values that don't fit the declared type; keep them as text.
-                        .map(|(v, c)| literal(v, Some(&c.data_type), d).or_else(|_| literal(v, None, d)))
-                        .collect::<Result<_>>()?;
-                    Ok(format!("({})", vals.join(", ")))
-                })
-                .collect::<Result<_>>()?;
-            writeln!(out, "{head}\n{};", values.join(",\n"))?;
+        let mut pages = Pages::new(t, src);
+        let mut n = 0;
+        while let Some(rows) = pages.next(db)? {
+            if n == 0 {
+                writeln!(out, "\n-- {}", t.name)?;
+            }
+            n += rows.len();
+            for chunk in rows.chunks(BATCH) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|row| {
+                        let vals: Vec<String> = row
+                            .iter()
+                            .zip(&t.columns)
+                            // SQLite may hold values that don't fit the declared type; keep them as text.
+                            .map(|(v, c)| literal(v, Some(&c.data_type), d).or_else(|_| literal(v, None, d)))
+                            .collect::<Result<_>>()?;
+                        Ok(format!("({})", vals.join(", ")))
+                    })
+                    .collect::<Result<_>>()?;
+                writeln!(out, "{head}\n{};", values.join(",\n"))?;
+            }
         }
+        if n == 0 {
+            continue;
+        }
+        report.rows += n;
         if d == Dialect::Postgres {
             for c in t.columns.iter().filter(|c| c.auto_increment) {
                 let table = quote(&t.name, d).replace('\'', "''");
@@ -112,17 +119,80 @@ pub fn dump(db: &mut Database, opts: &DumpOptions, out: &mut dyn Write) -> Resul
     Ok(report)
 }
 
-/// Every row of `t`, columns in schema order, sorted by primary key so
-/// self-referencing rows usually come after their parents.
-fn select_all(db: &mut Database, t: &Table, d: Dialect) -> Result<Vec<Vec<crate::db::Cell>>> {
-    let cols: Vec<String> = t.columns.iter().map(|c| quote(&c.name, d)).collect();
-    let mut sql = format!("SELECT {} FROM {}", cols.join(", "), quote(&t.name, d));
-    let pk = t.primary_key();
-    if !pk.is_empty() {
-        sql += &format!(" ORDER BY {}", pk.iter().map(|c| quote(c, d)).collect::<Vec<_>>().join(", "));
+/// Rows per SELECT when a table is read in pages.
+const PAGE: usize = 5000;
+
+/// Reads a table's rows, columns in schema order, sorted by primary key so
+/// self-referencing rows usually come after their parents. With a key whose
+/// values compare the same once printed back (the primary key, or else a
+/// unique NOT NULL column, of integers, strings or uuids) it reads `PAGE`
+/// rows at a time after the last key seen, so a big table never sits in
+/// memory whole; otherwise all at once.
+struct Pages<'a> {
+    t: &'a Table,
+    d: Dialect,
+    /// The key's column positions; empty when the table is read at once.
+    key: Vec<usize>,
+    after: Option<Vec<Cell>>,
+    done: bool,
+}
+
+impl<'a> Pages<'a> {
+    fn new(t: &'a Table, d: Dialect) -> Self {
+        let position = |name: &String| t.columns.iter().position(|c| &c.name == name);
+        let pk = t.primary_key();
+        let unique = t.columns.iter().find(|c| c.unique && !c.nullable).map(|c| vec![c.name.clone()]);
+        let candidate = if pk.is_empty() { unique.unwrap_or_default() } else { pk };
+        let key: Option<Vec<usize>> = candidate.iter().map(position).collect();
+        let exact = |i: &usize| {
+            use DataType::*;
+            matches!(t.columns[*i].data_type, SmallInt | Int | BigInt | Text | Varchar(_) | Uuid)
+        };
+        let key = key.filter(|k| !k.is_empty() && k.iter().all(exact)).unwrap_or_default();
+        Pages { t, d, key, after: None, done: false }
     }
-    let mut r = db.run(&sql).with_context(|| format!("reading {}", t.name))?;
-    Ok(r.pop().map(|r| r.rows).unwrap_or_default())
+
+    fn next(&mut self, db: &mut Database) -> Result<Option<Vec<Vec<Cell>>>> {
+        if self.done {
+            return Ok(None);
+        }
+        if db.cancel_requested() {
+            bail!("cancelled");
+        }
+        let (t, d) = (self.t, self.d);
+        let cols: Vec<String> = t.columns.iter().map(|c| quote(&c.name, d)).collect();
+        let mut sql = format!("SELECT {} FROM {}", cols.join(", "), quote(&t.name, d));
+        let order: Vec<String> = if self.key.is_empty() {
+            t.primary_key().iter().map(|c| quote(c, d)).collect()
+        } else {
+            self.key.iter().map(|i| cols[*i].clone()).collect()
+        };
+        if let Some(last) = &self.after {
+            let values: Vec<String> = self
+                .key
+                .iter()
+                .zip(last)
+                .map(|(i, v)| literal(v, Some(&t.columns[*i].data_type), d).or_else(|_| literal(v, None, d)))
+                .collect::<Result<_>>()?;
+            sql += &match values.len() {
+                1 => format!(" WHERE {} > {}", order[0], values[0]),
+                _ => format!(" WHERE ({}) > ({})", order.join(", "), values.join(", ")),
+            };
+        }
+        if !order.is_empty() {
+            sql += &format!(" ORDER BY {}", order.join(", "));
+        }
+        if !self.key.is_empty() {
+            sql += &format!(" LIMIT {PAGE}");
+        }
+        let mut r = db.run(&sql).with_context(|| format!("reading {}", t.name))?;
+        let rows = r.pop().map(|r| r.rows).unwrap_or_default();
+        self.done = self.key.is_empty() || rows.len() < PAGE;
+        if let Some(last) = rows.last() {
+            self.after = Some(self.key.iter().map(|i| last[*i].clone()).collect());
+        }
+        Ok((!rows.is_empty()).then_some(rows))
+    }
 }
 
 fn dialect_name(d: Dialect) -> &'static str {
@@ -269,6 +339,52 @@ fn strip_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
     (head.eq_ignore_ascii_case(word) && rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
 }
 
+/// Tables that span several pages, keyed in each way `Pages` handles, are
+/// dumped and restored with every row. Shared with the server tests.
+#[cfg(test)]
+pub(crate) fn paging_round_trip(db: &mut Database) {
+    let schema = crate::parser::parse(
+        "table big { id int pk\n name text }\ntable pairs { a varchar(10) not null\n b int not null\n pk (a, b) }\n\
+         table coded { code varchar(20) unique not null\n x int }\ntable loose { n int\n s text }",
+    )
+    .unwrap();
+    let before = db.introspect().unwrap();
+    let m = db.migration(&before, &schema);
+    db.apply_migration(&m).unwrap();
+    let insert = |db: &mut Database, table: &str, rows: Vec<String>| {
+        for chunk in rows.chunks(1000) {
+            db.execute(&format!("INSERT INTO {table} VALUES {}", chunk.join(", "))).unwrap();
+        }
+    };
+    insert(db, "big", (1..=12_345).map(|i| format!("({i}, 'it''s {i}')")).collect());
+    insert(db, "pairs", ["x", "y''q", "Z"].iter().flat_map(|a| (0..4000).map(move |b| format!("('{a}', {b})"))).collect());
+    insert(db, "coded", (0..6000).map(|i| format!("('c{i:05}', {i})")).collect());
+    insert(db, "loose", (0..7000).map(|i| format!("({}, 's')", i % 10)).collect());
+    let current = db.introspect().unwrap();
+    let pages = |db: &mut Database, t: &str| {
+        let mut p = Pages::new(current.table(t).unwrap(), db.dialect());
+        std::iter::from_fn(|| p.next(db).unwrap()).map(|rows| rows.len()).collect::<Vec<_>>()
+    };
+    assert_eq!(pages(db, "big"), [5000, 5000, 2345]);
+    assert_eq!(pages(db, "pairs"), [5000, 5000, 2000]);
+    assert_eq!(pages(db, "coded"), [5000, 1000]);
+    assert_eq!(pages(db, "loose"), [7000], "no key: read at once");
+
+    let mut out = Vec::new();
+    let report = dump(db, &DumpOptions { tables: vec!["big".into(), "pairs".into(), "coded".into(), "loose".into()], ..Default::default() }, &mut out).unwrap();
+    assert_eq!(report.rows, 12_345 + 12_000 + 6000 + 7000);
+    let r = prepare(db, &String::from_utf8(out).unwrap()).unwrap();
+    assert_eq!(restore(db, &r, true).unwrap(), report.rows as u64);
+    let count = |db: &mut Database, sql: &str| db.query_value(sql).unwrap().display();
+    assert_eq!(count(db, "SELECT count(*) FROM big WHERE name = concat('it''s ', id)"), "12345");
+    assert_eq!(count(db, "SELECT count(*) FROM pairs WHERE a = 'y''q'"), "4000");
+    assert_eq!(count(db, "SELECT count(*) FROM coded"), "6000");
+    assert_eq!(count(db, "SELECT count(*) FROM loose"), "7000");
+    let after = db.introspect().unwrap();
+    let m = db.migration(&after, &Schema::default());
+    db.apply_migration(&m).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +449,11 @@ mod tests {
         let r = prepare(&mut dst, "INSERT INTO users (id, email) VALUES (2, 'b@x.io');\nINSERT INTO users (id, email) VALUES (3, 'a@x.io');").unwrap();
         assert!(restore(&mut dst, &r, false).is_err());
         assert_eq!(rows(&mut dst, "SELECT count(*) FROM users"), [[Cell::Int(1)]]);
+    }
+
+    #[test]
+    fn big_tables_are_read_in_pages() {
+        paging_round_trip(&mut Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t"));
     }
 
     #[test]

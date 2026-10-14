@@ -1116,6 +1116,7 @@ mod tests {
         drop_all(&mut db);
         live_preflight(&mut db);
         drop_all(&mut db);
+        crate::dump::paging_round_trip(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
         if db.dialect() == Dialect::Postgres {
             let types = db.query_value("SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = current_schema() AND t.typtype = 'e'");

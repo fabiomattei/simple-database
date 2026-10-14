@@ -45,6 +45,9 @@ pub fn print_reports(reports: &[TableReport]) {
 /// Give up on a table after this many inserts in a row are rejected.
 const MAX_CONSECUTIVE_FAILURES: usize = 50;
 
+/// Rows per INSERT.
+const BATCH: usize = 100;
+
 pub fn seed(db: &mut Database, opts: &SeedOptions) -> Result<Vec<TableReport>> {
     db.ensure_writable()?;
     let schema = db.introspect()?;
@@ -85,18 +88,22 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
     };
 
     let columns: Vec<&Column> = t.columns.iter().filter(|c| !c.auto_increment).collect();
-    let insert = |values: &[Value]| {
+    let insert = |rows: &[Vec<Value>]| {
         if columns.is_empty() {
             return match d {
                 Dialect::Mysql => format!("INSERT INTO {} () VALUES ()", quote(&t.name, d)),
                 _ => format!("INSERT INTO {} DEFAULT VALUES", quote(&t.name, d)),
             };
         }
+        let rows: Vec<String> = rows
+            .iter()
+            .map(|values| format!("({})", values.iter().zip(&columns).map(|(v, c)| literal(v, &c.data_type, d)).collect::<Vec<_>>().join(", ")))
+            .collect();
         format!(
-            "INSERT INTO {} ({}) VALUES ({})",
+            "INSERT INTO {} ({}) VALUES {}",
             quote(&t.name, d),
             columns.iter().map(|c| quote(&c.name, d)).collect::<Vec<_>>().join(", "),
-            values.iter().zip(&columns).map(|(v, c)| literal(v, &c.data_type, d)).collect::<Vec<_>>().join(", ")
+            rows.join(", ")
         )
     };
 
@@ -141,8 +148,7 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
         .filter(|c| c.references.as_ref().is_some_and(|fk| fk.table == t.name))
         .collect();
 
-    let mut failures = 0;
-    while report.inserted < requested {
+    let row = |g: &mut Generator, parents: &HashMap<String, Vec<Value>>, key: i64| -> Vec<Value> {
         g.person = (g.rng.pick(FIRST), g.rng.pick(LAST));
         let mut chosen: HashMap<&str, Value> = HashMap::new();
         for (fk, rows) in &parent_rows {
@@ -151,7 +157,7 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
                 chosen.insert(c, row.map_or(Value::Null, |r| r[i].clone()));
             }
         }
-        let values: Vec<Value> = columns
+        columns
             .iter()
             .map(|c| {
                 if let Some(v) = chosen.get(c.name.as_str()) {
@@ -164,48 +170,72 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
                     return g.rng.pick(candidates).clone();
                 }
                 if pk.len() == 1 && pk[0] == c.name && c.data_type.is_integer() {
-                    return Value::Int(next_int_key);
+                    return Value::Int(key);
                 }
                 g.value(t, c, pk.contains(&c.name))
             })
-            .collect();
+            .collect()
+    };
+    // Rows go in `BATCH` at a time. Self-referencing rows point at the rows
+    // inserted just before them, and DEFAULT VALUES takes one row: those one by one.
+    let batch = if self_refs.is_empty() && !columns.is_empty() { BATCH } else { 1 };
 
-        // A failed statement aborts a whole Postgres transaction unless it
-        // ran inside a savepoint.
-        let sql = insert(&values);
+    let mut failures = 0;
+    'fill: while report.inserted < requested {
+        let n = batch.min(requested - report.inserted);
+        let rows: Vec<Vec<Value>> = (0..n).map(|i| row(g, &parents, next_int_key + i as i64)).collect();
+        next_int_key += n as i64;
         anyhow::ensure!(!db.cancel_requested(), "cancelled");
-        let attempt = match d {
-            Dialect::Postgres => db.execute(&format!("SAVEPOINT sdb_row; {sql}; RELEASE SAVEPOINT sdb_row")).inspect_err(|_| {
-                let _ = db.execute("ROLLBACK TO SAVEPOINT sdb_row; RELEASE SAVEPOINT sdb_row");
-            }),
-            _ => db.execute(&sql),
-        };
-        match attempt {
-            Ok(()) => {
-                report.inserted += 1;
-                failures = 0;
-                next_int_key += 1;
-                // Later rows may reference rows inserted earlier in this run.
-                for c in &self_refs {
-                    let fk = c.references.as_ref().unwrap();
-                    let v = match columns.iter().position(|col| col.name == fk.column) {
-                        Some(i) => values[i].clone(),
-                        None => db.last_insert_id()?,
-                    };
-                    parents.entry(c.name.clone()).or_default().push(v);
+        if n > 1 {
+            match try_insert(db, &insert(&rows)) {
+                Ok(()) => {
+                    report.inserted += n;
+                    failures = 0;
+                    continue;
                 }
+                Err(e) if db.cancel_requested() => return Err(e.context("cancelled")),
+                // A constraint rejected one of them: keep the others.
+                Err(_) => {}
             }
-            Err(e) if db.cancel_requested() => return Err(e.context("cancelled")),
-            Err(e) => {
-                failures += 1;
-                if failures >= MAX_CONSECUTIVE_FAILURES {
-                    report.note = Some(format!("stopped early: {e}"));
-                    break;
+        }
+        for values in &rows {
+            match try_insert(db, &insert(std::slice::from_ref(values))) {
+                Ok(()) => {
+                    report.inserted += 1;
+                    failures = 0;
+                    // Later rows may reference rows inserted earlier in this run.
+                    for c in &self_refs {
+                        let fk = c.references.as_ref().unwrap();
+                        let v = match columns.iter().position(|col| col.name == fk.column) {
+                            Some(i) => values[i].clone(),
+                            None => db.last_insert_id()?,
+                        };
+                        parents.entry(c.name.clone()).or_default().push(v);
+                    }
+                }
+                Err(e) if db.cancel_requested() => return Err(e.context("cancelled")),
+                Err(e) => {
+                    failures += 1;
+                    if failures >= MAX_CONSECUTIVE_FAILURES {
+                        report.note = Some(format!("stopped early: {e}"));
+                        break 'fill;
+                    }
                 }
             }
         }
     }
     Ok(report)
+}
+
+/// Run one INSERT. A failed statement aborts a whole Postgres transaction
+/// unless it ran inside a savepoint.
+fn try_insert(db: &mut Database, sql: &str) -> Result<()> {
+    match db.dialect() {
+        Dialect::Postgres => db.execute(&format!("SAVEPOINT sdb_row; {sql}; RELEASE SAVEPOINT sdb_row")).inspect_err(|_| {
+            let _ = db.execute("ROLLBACK TO SAVEPOINT sdb_row; RELEASE SAVEPOINT sdb_row");
+        }),
+        _ => db.execute(sql),
+    }
 }
 
 fn existing_values(db: &mut Database, table: &str, column: &str) -> Result<Vec<Value>> {
@@ -728,6 +758,20 @@ mod tests {
         let r = seed(&mut db, &o).unwrap();
         assert!(r[0].inserted <= 2, "{}", r[0].inserted);
         assert!(r[0].note.as_deref().unwrap_or("").contains("stopped early"));
+    }
+
+    #[test]
+    fn a_rejected_batch_keeps_the_rows_that_fit() {
+        let mut db = setup();
+        let mut o = opts(15, 1);
+        o.only = vec!["users".into(), "posts".into(), "tags".into()];
+        seed(&mut db, &o).unwrap();
+        // 225 pairs: a batch of 150 random ones repeats some, so it goes in row by row.
+        let mut o = opts(150, 4);
+        o.only = vec!["post_tags".into()];
+        let r = seed(&mut db, &o).unwrap();
+        assert_eq!((r[0].inserted, r[0].note.as_deref()), (150, None));
+        assert_eq!(db.query_value("SELECT count(*) FROM post_tags").unwrap(), Value::Int(150));
     }
 
     #[test]
