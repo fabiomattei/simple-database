@@ -51,6 +51,19 @@ impl App {
         }
     }
 
+    /// Switch to the Data tab showing `table`, unless the table shown there has unsaved changes.
+    pub(crate) fn open_table_data(&mut self, table: String) {
+        self.tab = Tab::Data;
+        if self.data.table.as_deref() == Some(table.as_str()) {
+            return;
+        }
+        if self.data.pending() > 0 {
+            self.set_status("Save or discard the changes to this table first", true);
+        } else {
+            self.data.open(Some(table));
+        }
+    }
+
     pub(crate) fn dialect_of_db(&self) -> Dialect {
         self.db.as_ref().map_or(Dialect::Sqlite, |d| d.dialect)
     }

@@ -6,7 +6,7 @@ and push changes into a live SQLite, PostgreSQL or MySQL database. Includes an i
 
 ```sh
 cargo install --path .      # installs `sdb-gui` (desktop app) and `sdb` (CLI)
-sdb-gui                     # opens with a starter schema
+sdb-gui                     # asks which database to use (saved or new connection)
 sdb-gui schema.dbs app.db   # open a schema and a SQLite database
 sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 ```
@@ -16,7 +16,7 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | Tab | What you do there |
 |---|---|
 | **Schema** | Edit the `.dbs` file with syntax highlighting and line numbers. Errors and design warnings update as you type |
-| **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file or the live database. The schema file's diagram is editable (see below). **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
+| **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. **Auto layout** keeps related tables together (parents left of the tables that reference them, tall layers wrapped into several columns, unrelated tables in a grid at the end) without overlaps; **Tidy** only moves overlapping tables apart, and a table that grows pushes its neighbors aside. **Browse data** (or right-click a table → **Browse data**, or double-click it in the read-only database diagram) opens the selected table in the Data tab. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file or the live database. The schema file's diagram is editable (see below). **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
 | **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save. In SQLite it is editable and kept in sync with the schema (see below) |
 | **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, or another database (a saved connection or a SQLite file), to make the open database match it. **Pull** replaces the editor with the database's schema |
 | **Query** | Run SQL (Ctrl+Enter) and see the results in a grid. Shows up to 10,000 rows per result. **Explain** shows each statement's query plan: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept. **History** lists past queries (searchable; click to load, double-click to run) and saved queries (**Save query…**). **Export** saves the result as CSV, TSV, JSON, JSON Lines, Markdown, HTML or SQL INSERTs, or copies it |
@@ -51,6 +51,11 @@ detect`); click one to fill the form. **Test** connects without opening the data
 **Duplicate** and **Delete** do what they say. Favorites and recent connections are also
 listed in the sidebar while no database is open. When a connection fails, for example because
 a password is missing, the dialog opens with the error.
+
+At startup, unless a database is given on the command line, the app asks which database to
+use: reopen the last session's, connect to a saved connection, create a **New connection**,
+open a SQLite file, or continue without one. A new schema starts empty; **Help → Example
+schema** shows a sample blog schema and can open it in the editor.
 
 The app remembers the last schema file and database between sessions. For a saved connection
 it stores `@name`. For a plain server URL it stores the URL without the password, so the
@@ -425,7 +430,7 @@ cargo clippy --all-targets
 ```
 
 Source layout: `src/lib.rs` is the shared core and `src/main.rs` the CLI. `src/gui/` is the
-desktop app: `main.rs` (app state, window), `tabs/` (one file per tab), `panels.rs` (menu bar, sidebar, status bar), `dialogs.rs`, `file_menu.rs`, `er.rs` (diagram canvas), `grid.rs` (result grid),
+desktop app: `main.rs` (app state, window), `tabs/` (one file per tab), `panels.rs` (menu bar, sidebar, status bar), `dialogs.rs`, `file_menu.rs`, `er.rs` (diagram canvas), `er_layout.rs` (table placement), `grid.rs` (result grid),
 `editor.rs` (code editor: line numbers, commands, find/replace, column selection, autocomplete), `highlight.rs` (syntax colors). Core modules: `parser.rs` (DSL) → `schema.rs` (model) → `validate.rs`, `ddl.rs`,
 `diff.rs`, `diagram.rs`, `format.rs`; `seed.rs` (fake data); `db.rs` (live connections), which
 dispatches to `sqlite.rs`, `pg.rs` and `mysqldb.rs` (introspection & queries); `shell.rs`, `output.rs`.

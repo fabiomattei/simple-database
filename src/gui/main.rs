@@ -8,6 +8,7 @@ mod data_view;
 mod dialogs;
 mod editor;
 mod er;
+mod er_layout;
 mod file_menu;
 mod grid;
 mod highlight;
@@ -105,6 +106,8 @@ enum DiagramSource {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pending {
     NewSchema,
+    /// Replace the editor with the example schema (Help → Example schema).
+    ExampleSchema,
     OpenSchema,
     PullIntoEditor,
     Quit,
@@ -114,6 +117,9 @@ enum Dialog {
     Unsaved(Pending),
     ConfirmPush,
     Syntax,
+    Example,
+    /// Shown at startup: pick a saved connection or make a new one.
+    Welcome { last: Option<String> },
     Connections(Box<conns::Manager>),
     Table(Box<table_edit::TableEditor>),
     /// Safe mode asks before these statements run.
@@ -323,9 +329,9 @@ impl App {
 
         let mut app = App {
             schema_path: None,
-            schema_text: STARTER_SCHEMA.to_string(),
+            schema_text: String::new(),
             saved_text: String::new(),
-            analysis: analyze(STARTER_SCHEMA, Schema::default()),
+            analysis: analyze("", Schema::default()),
             db: None,
             opening: None,
             tab: Tab::Schema,
@@ -388,7 +394,7 @@ impl App {
                 args.push(a.to_string_lossy().into_owned());
             }
         }
-        let (mut schema_path, mut db_target) = (settings.schema_path, settings.db_target);
+        let (mut schema_path, mut db_target) = (settings.schema_path, None);
         if !args.is_empty() {
             schema_path = None;
             db_target = None;
@@ -407,11 +413,11 @@ impl App {
         }
         if let Some(p) = schema_path.filter(|p| p.exists()) {
             app.load_schema_file(&p);
-        } else {
-            app.saved_text = app.schema_text.clone(); // the starter isn't "unsaved work"
         }
-        if let Some(t) = db_target {
-            app.open_db(&t);
+        // Without a database on the command line, ask which one to use.
+        match db_target {
+            Some(t) => app.open_db(&t),
+            None => app.dialog = Some(Dialog::Welcome { last: settings.db_target }),
         }
         app
     }
@@ -486,11 +492,19 @@ impl App {
     fn perform(&mut self, action: Pending, ctx: &egui::Context) {
         match action {
             Pending::NewSchema => {
+                self.schema_text = String::new();
+                self.saved_text = String::new();
+                self.schema_path = None;
+                self.er.reset_layout();
+                self.tab = Tab::Schema;
+            }
+            Pending::ExampleSchema => {
                 self.schema_text = STARTER_SCHEMA.to_string();
                 self.saved_text = String::new();
                 self.schema_path = None;
                 self.er.reset_layout();
                 self.tab = Tab::Schema;
+                self.set_status("Loaded the example schema (not saved yet)", false);
             }
             Pending::OpenSchema => {
                 if let Some(p) = rfd::FileDialog::new().add_filter("sdb schema", &["dbs"]).pick_file() {
@@ -666,6 +680,11 @@ impl App {
     }
 
     fn open_connections(&mut self) {
+        self.connections_dialog(false);
+    }
+
+    /// The Connections dialog; `new` starts with an empty form instead of the most recent connection.
+    fn connections_dialog(&mut self, new: bool) {
         let current = self.db.as_ref().and_then(|d| d.label.strip_prefix('@'));
         // Look for databases next to the schema file and in the working directory.
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -677,7 +696,7 @@ impl App {
         {
             dirs.push(cwd);
         }
-        let manager = conns::Manager::new(&self.conns, current).with_detected(&dirs);
+        let manager = if new { conns::Manager::empty() } else { conns::Manager::new(&self.conns, current) }.with_detected(&dirs);
         self.dialog = Some(Dialog::Connections(Box::new(manager)));
     }
 
@@ -801,7 +820,11 @@ impl eframe::App for App {
             db_target: match (&self.db, &self.opening) {
                 (_, Some((_, OpenFrom::Target(t)))) => Some(db::redact(t)),
                 (Some(d), _) => Some(d.label.clone()),
-                _ => None,
+                // Still on the welcome dialog: keep offering the last database.
+                _ => match &self.dialog {
+                    Some(Dialog::Welcome { last }) => last.clone(),
+                    _ => None,
+                },
             },
             dialect: match self.dialect {
                 Dialect::Sqlite => 0,

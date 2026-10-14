@@ -76,7 +76,8 @@ Binaries:
 | `src/gui/panels.rs` | Menu bar, sidebar and status bar |
 | `src/gui/dialogs.rs` | The modal `Dialog`s |
 | `src/gui/file_menu.rs` | File menu actions on the database: dump, restore, run SQL file |
-| `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
+| `src/gui/er.rs` | ER diagram canvas painted by hand (drag, pan, zoom). `ErAction::OpenData` opens a table in the Data tab (`App::open_table_data`, shared with the sidebar). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
+| `src/gui/er_layout.rs` | Where table boxes go, pure and unit-tested: `layout` (connected groups in FK-depth layers, barycenter ordering, tall layers wrapped, groups shelf-packed, loners last), `place` (one new box in free space next to its related tables), `separate` (remove overlaps; `pinned` boxes stay, used when a box grows) |
 | `src/gui/table_edit.rs` | Diagram's table editor dialog: column grid → DSL lines → `parser::parse`, renames via `Schema::rename_table` / `rename_column`; refuses edits that add validation errors |
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
 | `src/gui/worker.rs` | `Worker`: owns the open `Database` on its own thread, runs queued jobs and hands back replies; `Task`: one-off background work |
@@ -85,8 +86,9 @@ Binaries:
 | `src/gui/editor.rs` | `code_editor`: `TextEdit` plus gutter and problem `Mark`s, line commands (`command`, pure and unit-tested), find/replace bar, column selection (multi-caret, consumed from input before `TextEdit` sees it) and autocomplete (`Vocabulary` from a `Schema`; context-aware for the DSL). `goto_line` / `caret_line` talk to it by id. Use `take_key` for exact-modifier shortcuts: `consume_key` also matches with Shift held |
 | `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view` |
 
-`examples/blog.dbs` is not just an example. It is the output of `sdb init`, the GUI's "New
-schema" and its first-run content. The GUI's Help → Schema syntax dialog is built from its
+`examples/blog.dbs` is not just an example. It is the output of `sdb init` and the GUI's
+Help → Example schema (the GUI itself starts with an empty schema and a welcome dialog to pick a
+connection). The GUI's Help → Schema syntax dialog is built from its
 leading `#` comment lines. Keep that header accurate when the DSL changes.
 
 ## Invariants: keep these true
@@ -157,7 +159,8 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   (`run_script`, `seed`) also check `cancel_requested` between statements.
   Connecting and other one-off work (Migrate's "From" database, Connections → Test) use `worker::Task`.
   Query results are capped with `run_limited` (10,000 rows); Data pages are 200 rows.
-- Started without file arguments, the app reopens the previous session's schema and database
+- Started without file arguments, the app reopens the previous session's schema file and shows
+  the `Dialog::Welcome` connection picker (offering the last database) unless a database was given
   (eframe storage key `sdb-gui`). Pass files explicitly when testing for a predictable state.
 - Diagram editing works only on the schema file, and only while the text parses: `patch` falls
   back to reprinting the whole file when the text doesn't parse, which would drop the user's

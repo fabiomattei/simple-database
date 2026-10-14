@@ -2,6 +2,7 @@
 //! export as PNG (what the canvas shows) or SVG (every visible table). When
 //! editable, it also asks for schema changes through `ErAction`s.
 
+use crate::er_layout;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use simple_database::schema::{Schema, Table};
 use std::collections::{HashMap, HashSet};
@@ -11,8 +12,6 @@ use std::path::PathBuf;
 const ROW_H: f32 = 20.0;
 const HEADER_H: f32 = 26.0;
 const PAD_X: f32 = 10.0;
-const COL_GAP: f32 = 90.0;
-const ROW_GAP: f32 = 40.0;
 pub const MIN_ZOOM: f32 = 0.1;
 pub const MAX_ZOOM: f32 = 4.0;
 
@@ -54,6 +53,8 @@ pub enum ErAction {
     /// Make `table.column` a foreign key to `target.target_column`.
     Link { table: String, column: String, target: String, target_column: String },
     Unlink { table: String, column: String },
+    /// Show the table's rows in the Data tab.
+    OpenData(String),
 }
 
 /// Sent with the screenshot command, returned with the screenshot.
@@ -207,8 +208,9 @@ impl ErView {
 
     /// `full` is the whole schema; hidden tables are left out here. With
     /// `editable`, double-clicks, the context menu and the column handles
-    /// return the changes the user asks for.
-    pub fn ui(&mut self, ui: &mut egui::Ui, full: &Schema, editable: bool) -> Option<ErAction> {
+    /// return the changes the user asks for. `browsable` are the tables of
+    /// the open database, whose data the context menu offers to show.
+    pub fn ui(&mut self, ui: &mut egui::Ui, full: &Schema, editable: bool, browsable: &HashSet<String>) -> Option<ErAction> {
         if self.zoom == 0.0 {
             self.zoom = 1.0;
             self.fit_requested = true;
@@ -233,12 +235,26 @@ impl ErView {
                 self.context_column = None;
                 self.context_world = response.interact_pointer_pos().map(|p| ((p - canvas.min - self.pan) / self.zoom).to_pos2());
             }
-            return self.context_menu(&response, full, editable);
+            return self.context_menu(&response, full, editable, browsable);
         }
 
         // Measure boxes in world units (zoom 1).
-        self.sizes = full.tables.iter().map(|t| (t.name.clone(), box_size(&painter, t))).collect();
-        let sizes = std::mem::take(&mut self.sizes);
+        let before = std::mem::take(&mut self.sizes);
+        let sizes: HashMap<String, Vec2> = full.tables.iter().map(|t| (t.name.clone(), box_size(&painter, t))).collect();
+        // A box that grew (a column added, a longer name) pushes its neighbors aside.
+        let grown: HashSet<String> = schema
+            .tables
+            .iter()
+            .filter(|t| before.get(&t.name).zip(sizes.get(&t.name)).is_some_and(|(a, b)| b.x > a.x + 0.5 || b.y > a.y + 0.5))
+            .map(|t| t.name.clone())
+            .collect();
+        if !grown.is_empty() {
+            let mut placed: HashMap<String, Pos2> =
+                schema.tables.iter().filter_map(|t| Some((t.name.clone(), *self.positions.get(&t.name)?))).collect();
+            if er_layout::separate(&mut placed, &sizes, &grown) {
+                self.positions.extend(placed);
+            }
+        }
         self.auto_place(schema, &sizes);
         let layouts = self.layouts(schema, &sizes);
         self.sizes = sizes;
@@ -331,17 +347,20 @@ impl ErView {
             self.selected = hovered_table.clone();
         }
         if response.double_clicked()
-            && editable
             && let Some(t) = &hovered_table
         {
-            action = Some(ErAction::EditTable(t.clone()));
+            if editable {
+                action = Some(ErAction::EditTable(t.clone()));
+            } else if browsable.contains(t) {
+                action = Some(ErAction::OpenData(t.clone()));
+            }
         }
         if response.secondary_clicked() {
             self.context_table = hovered_table.clone();
             self.context_column = hovered_column.clone();
             self.context_world = hover_world;
         }
-        if let Some(a) = self.context_menu(&response, full, editable) {
+        if let Some(a) = self.context_menu(&response, full, editable, browsable) {
             action = Some(a);
         }
         // Comments show on hover: a column's on its row, the table's elsewhere on the box.
@@ -504,7 +523,13 @@ impl ErView {
                 "{:.0}%{}  ·  drag tables to move, drag background to pan, scroll to zoom, right-click for options{}  ·  ! = not null",
                 self.zoom * 100.0,
                 if hidden > 0 { format!("  ·  {hidden} hidden") } else { String::new() },
-                if editable { ", double-click a table to edit, drag a column's ○ onto another column to link them" } else { "" }
+                if editable {
+                    ", double-click a table to edit, drag a column's ○ onto another column to link them"
+                } else if !browsable.is_empty() {
+                    ", double-click a table to browse its data"
+                } else {
+                    ""
+                }
             ),
             FontId::proportional(11.0),
             visuals.weak_text_color(),
@@ -512,13 +537,21 @@ impl ErView {
         action
     }
 
-    fn context_menu(&mut self, response: &egui::Response, full: &Schema, editable: bool) -> Option<ErAction> {
+    fn context_menu(&mut self, response: &egui::Response, full: &Schema, editable: bool, browsable: &HashSet<String>) -> Option<ErAction> {
         let mut action = None;
         response.context_menu(|ui| {
             if let Some(table) = self.context_table.clone()
                 && let Some(t) = full.table(&table)
             {
                 ui.label(egui::RichText::new(&table).strong());
+                if ui
+                    .add_enabled(browsable.contains(&table), egui::Button::new("Browse data"))
+                    .on_disabled_hover_text("The open database has no such table")
+                    .clicked()
+                {
+                    action = Some(ErAction::OpenData(table.clone()));
+                    ui.close();
+                }
                 if editable {
                     let mut pick = |ui: &mut egui::Ui, label: &str, a: ErAction| {
                         if ui.button(label).clicked() {
@@ -677,57 +710,32 @@ impl ErView {
         out
     }
 
-    /// Place tables that don't have a position yet: one column per FK depth,
-    /// parents to the left of the tables that reference them.
+    /// Place tables that don't have a position yet: all of them through
+    /// `er_layout::layout` when none has one, else each in free space next to
+    /// its related tables.
     fn auto_place(&mut self, schema: &Schema, sizes: &HashMap<String, Vec2>) {
-        let missing: Vec<&Table> = schema.tables.iter().filter(|t| !self.positions.contains_key(&t.name)).collect();
+        let missing: Vec<&str> = schema.tables.iter().map(|t| t.name.as_str()).filter(|n| !self.positions.contains_key(*n)).collect();
         if missing.is_empty() {
             return;
         }
-        let mut depth: HashMap<&str, usize> = HashMap::new();
-        fn depth_of<'a>(s: &'a Schema, t: &'a Table, memo: &mut HashMap<&'a str, usize>, stack: &mut Vec<&'a str>) -> usize {
-            if let Some(&d) = memo.get(t.name.as_str()) {
-                return d;
-            }
-            if stack.contains(&t.name.as_str()) {
-                return 0;
-            }
-            stack.push(&t.name);
-            let d = t
-                .all_foreign_keys()
-                .iter()
-                .filter(|fk| fk.table != t.name)
-                .filter_map(|fk| s.table(&fk.table))
-                .map(|p| depth_of(s, p, memo, stack) + 1)
-                .max()
-                .unwrap_or(0);
-            stack.pop();
-            memo.insert(&t.name, d);
-            d
+        let visible: HashMap<String, Vec2> = schema.tables.iter().filter_map(|t| Some((t.name.clone(), *sizes.get(&t.name)?))).collect();
+        if missing.len() == schema.tables.len() {
+            self.positions.extend(er_layout::layout(schema, &visible));
+            return;
         }
-        for t in &schema.tables {
-            depth_of(schema, t, &mut depth, &mut Vec::new());
+        for name in missing {
+            let at = er_layout::place(schema, name, &visible, &self.positions);
+            self.positions.insert(name.to_string(), at);
         }
+    }
 
-        let max_depth = depth.values().copied().max().unwrap_or(0);
-        let mut x = 0.0;
-        for d in 0..=max_depth {
-            let column: Vec<&Table> = schema.tables.iter().filter(|t| depth[t.name.as_str()] == d).collect();
-            let width = column.iter().map(|t| sizes[&t.name].x).fold(0.0, f32::max);
-            let mut y = 0.0;
-            for t in column {
-                if !self.positions.contains_key(&t.name) {
-                    // Keep clear of tables the user has already placed.
-                    let mut pos = pos2(x, y);
-                    while self.positions.values().any(|p| (p.x - pos.x).abs() < 1.0 && (p.y - pos.y).abs() < 1.0) {
-                        pos.y += ROW_GAP;
-                    }
-                    self.positions.insert(t.name.clone(), pos);
-                }
-                y += sizes[&t.name].y + ROW_GAP;
-            }
-            x += width + COL_GAP;
-        }
+    /// Move overlapping tables apart, keeping the arrangement.
+    pub fn tidy(&mut self, full: &Schema) {
+        let schema = self.visible(full);
+        let sizes: HashMap<String, Vec2> = schema.tables.iter().filter_map(|t| Some((t.name.clone(), *self.sizes.get(&t.name)?))).collect();
+        let mut positions: HashMap<String, Pos2> = sizes.keys().filter_map(|n| Some((n.clone(), *self.positions.get(n)?))).collect();
+        er_layout::separate(&mut positions, &sizes, &HashSet::new());
+        self.positions.extend(positions);
     }
 
     fn fit(&mut self, canvas: Rect, layouts: &HashMap<String, BoxLayout>) {
@@ -778,6 +786,9 @@ fn edges(schema: &Schema, layouts: &HashMap<String, BoxLayout>) -> Vec<Edge> {
             let (child_x, child_dir, parent_x, parent_dir) = if t.name == fk.table {
                 // Self reference: loop out of the right edge.
                 (child.rect.max.x, 1.0, parent.rect.max.x, 1.0)
+            } else if parent.rect.min.x < child.rect.max.x && child.rect.min.x < parent.rect.max.x {
+                // One above the other: loop out of the right edges rather than cross both boxes.
+                (child.rect.max.x, 1.0, parent.rect.max.x, 1.0)
             } else if parent.rect.center().x < child.rect.center().x {
                 (child.rect.min.x, -1.0, parent.rect.max.x, 1.0)
             } else {
@@ -786,8 +797,15 @@ fn edges(schema: &Schema, layouts: &HashMap<String, BoxLayout>) -> Vec<Edge> {
             let a = pos2(child_x, cy);
             let b = pos2(parent_x, py);
             let bend = 40.0 + (a.x - b.x).abs() * 0.4;
+            let (c1, c2) = if child_dir == parent_dir {
+                // Same side: both control points beyond the wider box.
+                let x = a.x.max(b.x) + 40.0 + (a.y - b.y).abs() * 0.15;
+                (pos2(x, a.y), pos2(x, b.y))
+            } else {
+                (a + vec2(child_dir * bend, 0.0), b + vec2(parent_dir * bend, 0.0))
+            };
             out.push(Edge {
-                points: [a, a + vec2(child_dir * bend, 0.0), b + vec2(parent_dir * bend, 0.0), b],
+                points: [a, c1, c2, b],
                 child_dir,
                 parent_dir,
                 nullable,

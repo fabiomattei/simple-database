@@ -436,6 +436,104 @@ impl App {
                 }
                 return;
             }
+            Dialog::Welcome { last } => {
+                let last = last.clone();
+                let mut pick: Option<String> = None;
+                let mut new_conn = false;
+                let mut open_file = false;
+                let mut skip = false;
+                let resp = egui::Modal::new(egui::Id::new("welcome")).show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.heading("Welcome to sdb");
+                    ui.label("Which database do you want to work with?");
+                    ui.add_space(8.0);
+                    if let Some(t) = &last {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Last session:").weak());
+                            ui.label(RichText::new(t).strong());
+                            if ui.button("Reopen").clicked() {
+                                pick = Some(t.clone());
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    ui.label(RichText::new("SAVED CONNECTIONS").small().strong().weak());
+                    if self.conns.connections.is_empty() {
+                        ui.label(RichText::new("No saved connections yet.").weak());
+                    }
+                    let mut list: Vec<&simple_database::connections::Connection> = self.conns.connections.iter().collect();
+                    list.sort_by_key(|c| (!c.favorite, std::cmp::Reverse(c.last_used), c.name.to_lowercase()));
+                    egui::ScrollArea::vertical().id_salt("welcome_conns").max_height(260.0).show(ui, |ui| {
+                        for c in list {
+                            ui.horizontal(|ui| {
+                                conns::color_dot(ui, c.color);
+                                let star = if c.favorite { "★ " } else { "" };
+                                if ui.button(format!("{star}{}", c.name)).on_hover_text(c.summary()).clicked() {
+                                    pick = Some(format!("@{}", c.name));
+                                }
+                                ui.label(RichText::new(c.kind.label()).small().weak());
+                            });
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        new_conn = ui.button(RichText::new("➕ New connection…").strong()).clicked();
+                        open_file = ui.button("Open SQLite file…").clicked();
+                        skip = ui.button("Continue without a database").clicked();
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Help → Example schema shows a sample schema to start from.").small().weak());
+                });
+                if let Some(t) = pick {
+                    self.dialog = None;
+                    self.open_db(&t);
+                    return;
+                }
+                if new_conn {
+                    self.connections_dialog(true);
+                    return;
+                }
+                if open_file {
+                    self.dialog = None;
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("SQLite database", &["db", "sqlite", "sqlite3"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                    {
+                        self.open_db(&p.to_string_lossy());
+                    }
+                    return;
+                }
+                skip || resp.should_close()
+            }
+            Dialog::Example => {
+                let resp = egui::Modal::new(egui::Id::new("example")).show(ctx, |ui| {
+                    ui.set_width(620.0);
+                    ui.heading("Example schema");
+                    ui.label("A small blog (users, posts, tags) that uses most of the syntax.");
+                    ui.add_space(6.0);
+                    egui::ScrollArea::both().max_height(460.0).show(ui, |ui| {
+                        highlight::code_view(ui, STARTER_SCHEMA, Lang::Dbs);
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Open in editor").strong()).on_hover_text("Replace the editor with this schema").clicked() {
+                            self.dialog = None;
+                            self.request(crate::Pending::ExampleSchema, ctx);
+                        }
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(STARTER_SCHEMA.to_string());
+                        }
+                        if ui.button("Close").clicked() {
+                            self.dialog = None;
+                        }
+                    });
+                });
+                if self.dialog.is_none() {
+                    return;
+                }
+                resp.should_close()
+            }
             Dialog::Syntax => {
                 let resp = egui::Modal::new(egui::Id::new("syntax")).show(ctx, |ui| {
                     ui.set_width(620.0);

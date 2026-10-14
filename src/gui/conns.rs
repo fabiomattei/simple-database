@@ -58,6 +58,11 @@ impl Manager {
         m
     }
 
+    /// Open with an empty form, for a new connection.
+    pub fn empty() -> Manager {
+        Manager::blank()
+    }
+
     fn blank() -> Manager {
         Manager {
             search: String::new(),

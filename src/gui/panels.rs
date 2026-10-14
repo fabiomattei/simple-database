@@ -87,6 +87,9 @@ impl App {
                 if ui.button("Schema syntax").clicked() {
                     self.dialog = Some(Dialog::Syntax);
                 }
+                if ui.button("Example schema").clicked() {
+                    self.dialog = Some(Dialog::Example);
+                }
             });
         });
     }
@@ -209,15 +212,7 @@ impl App {
             }
         }
         if let Some(Some(t)) = open_table {
-            if self.data.table.as_deref() == Some(t.as_str()) {
-                self.tab = Tab::Data;
-            } else if self.data.pending() > 0 {
-                self.tab = Tab::Data;
-                self.set_status("Save or discard the changes to this table first", true);
-            } else {
-                self.data.open(Some(t));
-                self.tab = Tab::Data;
-            }
+            self.open_table_data(t);
         }
     }
 

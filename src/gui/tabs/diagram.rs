@@ -5,6 +5,7 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 use simple_database::diagram::{self, DiagramFormat};
 use simple_database::schema::Schema;
 use simple_database::format;
+use std::collections::HashSet;
 
 impl App {
     pub(crate) fn tab_diagram(&mut self, ui: &mut egui::Ui) {
@@ -13,6 +14,7 @@ impl App {
         if self.schema_text != self.diagram_after {
             self.diagram_undo.clear();
         }
+        let browsable: HashSet<String> = self.db.as_ref().map(|d| d.schema.tables.iter().map(|t| t.name.clone()).collect()).unwrap_or_default();
         let undo_key = self.dialog.is_none() && editor::take_key(ui.ctx(), Modifiers::COMMAND, Key::Z);
         ui.horizontal(|ui| {
             ui.label("Source:");
@@ -25,8 +27,11 @@ impl App {
                 self.er.reset_layout();
             }
             ui.separator();
-            if ui.button("Auto layout").clicked() {
+            if ui.button("Auto layout").on_hover_text("Arrange every table again: related tables together, parents left of the tables that reference them").clicked() {
                 self.er.reset_layout();
+            }
+            if ui.button("Tidy").on_hover_text("Move overlapping tables apart, keeping the arrangement").clicked() {
+                self.er.tidy(&self.diagram_schema(&db_schema));
             }
             if ui.button("Fit").clicked() {
                 self.er.request_fit();
@@ -106,6 +111,17 @@ impl App {
                 self.schema_text = text.clone();
                 self.diagram_after = text;
             }
+            ui.separator();
+            let selected = self.er.selected.clone().filter(|t| browsable.contains(t));
+            let browse = ui
+                .add_enabled(selected.is_some(), egui::Button::new("Browse data"))
+                .on_hover_text("Show the selected table's rows in the Data tab (also in a table's right-click menu)")
+                .on_disabled_hover_text("Select a table of the open database first");
+            if browse.clicked()
+                && let Some(t) = selected
+            {
+                self.open_table_data(t);
+            }
             if self.er_source == DiagramSource::SchemaFile && self.analysis.result.is_err() {
                 ui.colored_label(warn_color(ui), "⚠ showing last valid version; fix the syntax error to edit");
             } else if self.er_source == DiagramSource::Database {
@@ -114,7 +130,7 @@ impl App {
         });
         ui.add_space(4.0);
         let schema = self.diagram_schema(&db_schema);
-        if let Some(action) = self.er.ui(ui, &schema, editable) {
+        if let Some(action) = self.er.ui(ui, &schema, editable, &browsable) {
             self.diagram_action(action, &schema);
         }
         match self.er.take_png_result() {
@@ -145,6 +161,10 @@ impl App {
             }
             A::NewTable(pos) => {
                 self.dialog = Some(Dialog::Table(Box::new(table_edit::TableEditor::create(schema, pos))));
+                return;
+            }
+            A::OpenData(t) => {
+                self.open_table_data(t);
                 return;
             }
             A::DeleteTable(t) => new.drop_table(&t),
