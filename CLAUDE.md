@@ -66,6 +66,7 @@ Binaries:
 | `src/gui/er.rs` | ER diagram canvas painted by hand (layout by FK depth, drag, pan, zoom). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
 | `src/gui/table_edit.rs` | Diagram's table editor dialog: column grid → DSL lines → `parser::parse`, renames via `Schema::rename_table` / `rename_column`; refuses edits that add validation errors |
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
+| `src/gui/worker.rs` | `Worker`: owns the open `Database` on its own thread, runs queued jobs and hands back replies; `Task`: one-off background work |
 | `src/gui/grid.rs` | Read-only virtualized result grid (egui_extras `TableBuilder`): Query results, import preview |
 | `src/gui/data_view.rs` | Data tab: `DataView` (page, filters, sort, `Staged` edits/deletes/new rows), editable grid; returns `DataAction`s that `App` carries out (load, save, import, export) |
 | `src/gui/editor.rs` | `code_editor`: `TextEdit` plus gutter and problem `Mark`s, line commands (`command`, pure and unit-tested), find/replace bar, column selection (multi-caret, consumed from input before `TextEdit` sees it) and autocomplete (`Vocabulary` from a `Schema`; context-aware for the DSL). `goto_line` / `caret_line` talk to it by id. Use `take_key` for exact-modifier shortcuts: `consume_key` also matches with Shift held |
@@ -124,8 +125,16 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   position), so put them in a `ScrollArea::both`.
 - Read-only code goes through `highlight::code_view`, which forces a non-justified, non-wrapping
   layout. Plain labels inside `ui.columns` get justified and mangle SQL.
-- All database work is synchronous on the UI thread (fine for local SQLite). Query results are
-  capped with `sqlite::run_limited` (10,000 rows); Data pages are 200 rows.
+- Database work never runs on the UI thread. The open `Database` lives on a `worker::Worker`
+  thread: `App::db_run(label, work, then)` queues `work(&mut Database)`, and `then(&mut App, result)`
+  runs on the UI thread when `poll_background` (start of each frame) picks it up. Jobs run in
+  order, one at a time. `Db` keeps what the UI shows (label, dialect, safe mode, schema, counts),
+  and replies must check that the state they update is still current (see `load_data`, `migration_for`).
+  `Worker::cancel` stops the running job through `Database::canceller` (SQLite interrupt,
+  Postgres cancel token, MySQL `KILL QUERY` from a second connection); long loops in the library
+  (`run_script`, `seed`) also check `cancel_requested` between statements.
+  Connecting and other one-off work (Migrate's "From" database, Connections → Test) use `worker::Task`.
+  Query results are capped with `run_limited` (10,000 rows); Data pages are 200 rows.
 - Started without file arguments, the app reopens the previous session's schema and database
   (eframe storage key `sdb-gui`). Pass files explicitly when testing for a predictable state.
 - Diagram editing works only on the schema file, and only while the text parses: `patch` falls

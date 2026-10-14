@@ -285,7 +285,12 @@ impl DataView {
                     action = Some(a);
                 }
             }
-            None => {}
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading…").weak());
+                });
+            }
         }
         action
     }

@@ -33,6 +33,17 @@ pub fn connect(url: &str) -> Result<Client> {
     client.with_context(|| format!("connecting to {label}"))
 }
 
+/// Cancel the query running on the connection `token` came from; `url` is
+/// the one it was opened with, for the TLS settings.
+pub fn cancel(token: &postgres::CancelToken, url: &str) -> Result<()> {
+    let (_, tls) = tls::split_url(url)?;
+    let result = match tls.mode() {
+        SslMode::Disable => token.cancel_query(NoTls),
+        mode => token.cancel_query(MakeRustlsConnect::new(tls::client_config(&tls, mode)?)),
+    };
+    result.context("cancelling the query")
+}
+
 // ---------------------------------------------------------------- introspection
 
 pub fn introspect(client: &mut Client) -> Result<Schema> {

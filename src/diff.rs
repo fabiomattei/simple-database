@@ -3,7 +3,7 @@
 use crate::ddl::*;
 use crate::schema::*;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Migration {
     /// Human-readable summary of each change, e.g. `+ table users`.
     pub changes: Vec<String>,

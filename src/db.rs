@@ -12,6 +12,8 @@ use crate::{mysqldb, pg, sqlite};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub enum Conn {
     Sqlite(rusqlite::Connection),
@@ -25,6 +27,35 @@ pub struct Database {
     safe_mode: SafeMode,
     /// Server-normalized check expressions per scratch table definition.
     check_cache: HashMap<String, Vec<(String, String)>>,
+    cancel: Arc<Canceller>,
+}
+
+/// Stops what a [`Database`] is running, from another thread.
+pub struct Canceller {
+    requested: AtomicBool,
+    via: CancelVia,
+}
+
+enum CancelVia {
+    Sqlite(rusqlite::InterruptHandle),
+    /// The URL (with its password) to reach the server again.
+    Postgres { token: postgres::CancelToken, target: String },
+    Mysql { target: String, id: u32 },
+}
+
+impl Canceller {
+    /// Interrupt the running statement; scripts and seeding also stop before
+    /// their next statement. Postgres and MySQL open a second connection for
+    /// it, so this can take as long as connecting.
+    pub fn cancel(&self) -> Result<()> {
+        self.requested.store(true, Ordering::SeqCst);
+        match &self.via {
+            CancelVia::Sqlite(h) => h.interrupt(),
+            CancelVia::Postgres { token, target } => pg::cancel(token, target)?,
+            CancelVia::Mysql { target, id } => mysqldb::cancel(target, *id)?,
+        }
+        Ok(())
+    }
 }
 
 /// True if `target` is a server URL rather than a SQLite file path.
@@ -76,11 +107,37 @@ impl Database {
             Some(_) => Conn::Mysql(Box::new(mysqldb::connect(target)?)),
             None => Conn::Sqlite(sqlite::open(Path::new(target))?),
         };
-        Ok(Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new() })
+        let via = match &conn {
+            Conn::Sqlite(c) => CancelVia::Sqlite(c.get_interrupt_handle()),
+            Conn::Postgres(c) => CancelVia::Postgres { token: c.cancel_token(), target: target.to_string() },
+            Conn::Mysql(c) => CancelVia::Mysql { target: target.to_string(), id: c.connection_id() },
+        };
+        Ok(Database::new(conn, label, via))
     }
 
     pub fn from_sqlite(conn: rusqlite::Connection, label: impl Into<String>) -> Database {
-        Database { conn: Conn::Sqlite(conn), label: label.into(), safe_mode: SafeMode::Off, check_cache: HashMap::new() }
+        let via = CancelVia::Sqlite(conn.get_interrupt_handle());
+        Database::new(Conn::Sqlite(conn), label.into(), via)
+    }
+
+    fn new(conn: Conn, label: String, via: CancelVia) -> Database {
+        let cancel = Arc::new(Canceller { requested: AtomicBool::new(false), via });
+        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel }
+    }
+
+    /// A handle to cancel what this connection runs, from another thread.
+    pub fn canceller(&self) -> Arc<Canceller> {
+        self.cancel.clone()
+    }
+
+    /// Whether [`Canceller::cancel`] was called since [`Database::clear_cancel`].
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel.requested.load(Ordering::SeqCst)
+    }
+
+    /// Forget a cancel request, before starting new work.
+    pub fn clear_cancel(&self) {
+        self.cancel.requested.store(false, Ordering::SeqCst);
     }
 
     pub fn safe_mode(&self) -> SafeMode {
@@ -113,10 +170,7 @@ impl Database {
 
     /// The statements in `sql` the safe mode wants confirmed before they run.
     pub fn needs_confirmation(&self, sql: &str) -> Vec<(String, Kind)> {
-        if !matches!(self.safe_mode, SafeMode::Warn | SafeMode::Confirm) {
-            return vec![];
-        }
-        safety::classify_all(sql).into_iter().filter(|(_, k)| self.safe_mode.asks(k)).collect()
+        self.safe_mode.confirmations(sql)
     }
 
     /// Whether the safe mode wants writes confirmed (any write, not just dangerous ones).
@@ -397,9 +451,16 @@ impl Database {
             }
             report.run += 1;
             on_step(Step { line: *line, sql: stmt, result: &result, elapsed: started.elapsed() });
-            let Err(e) = result else { continue };
-            report.failed += 1;
-            if opts.keep_going && !opts.transaction {
+            let cancelled = self.cancel_requested();
+            let e = match result {
+                Ok(_) if !cancelled => continue,
+                Ok(_) => anyhow::anyhow!("cancelled"),
+                Err(e) => {
+                    report.failed += 1;
+                    e
+                }
+            };
+            if opts.keep_going && !opts.transaction && !cancelled {
                 continue;
             }
             let first = stmt.lines().next().unwrap_or_default();
@@ -805,6 +866,65 @@ pub fn strip_outer_parens(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::parser::parse;
+
+    /// Run a slow query on another thread, cancel it, and return its result.
+    /// The connection must still work afterwards.
+    fn cancel_slow_query(mut db: Database, sql: &'static str) -> Result<Vec<QueryResult>> {
+        let canceller = db.canceller();
+        let running = std::thread::spawn(move || {
+            let res = db.run(sql);
+            db.clear_cancel();
+            (res, db.run("SELECT 1").map(drop))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        canceller.cancel().unwrap();
+        let (res, after) = running.join().unwrap();
+        after.expect("the connection works after a cancel");
+        res
+    }
+
+    const SQLITE_SLOW: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n";
+
+    #[test]
+    fn cancels_a_running_sqlite_query() {
+        let db = Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "test");
+        let started = std::time::Instant::now();
+        assert!(cancel_slow_query(db, SQLITE_SLOW).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cancel_stops_a_script() {
+        let mut db = Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "test");
+        let canceller = db.canceller();
+        let opts = ScriptOptions { transaction: false, keep_going: true, max_rows: 10 };
+        let script = "CREATE TABLE t (id int);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);";
+        let mut ran = 0;
+        let res = db.run_script(script, &opts, &mut |_| {
+            ran += 1;
+            if ran == 1 {
+                canceller.cancel().unwrap();
+            }
+        });
+        assert!(res.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(ran, 1);
+        db.clear_cancel();
+        assert!(db.run("SELECT count(*) FROM t").is_ok());
+    }
+
+    #[test]
+    fn cancels_a_running_server_query() {
+        for (var, sql) in [("SDB_TEST_POSTGRES", "SELECT pg_sleep(30)"), ("SDB_TEST_MYSQL", "SELECT SLEEP(30)")] {
+            let Ok(url) = std::env::var(var) else { continue };
+            let started = std::time::Instant::now();
+            let res = cancel_slow_query(Database::open(&url).unwrap(), sql);
+            // MySQL's SLEEP returns 1 when killed instead of failing.
+            if var == "SDB_TEST_POSTGRES" {
+                assert!(res.is_err(), "{var}: {res:?}");
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "{var} was not cancelled");
+        }
+    }
 
     #[test]
     fn splits_triggers_and_counts_lines() {

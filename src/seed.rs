@@ -151,6 +151,7 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
         // A failed statement aborts a whole Postgres transaction unless it
         // ran inside a savepoint.
         let sql = insert(&values);
+        anyhow::ensure!(!db.cancel_requested(), "cancelled");
         let attempt = match d {
             Dialect::Postgres => db.execute(&format!("SAVEPOINT sdb_row; {sql}; RELEASE SAVEPOINT sdb_row")).inspect_err(|_| {
                 let _ = db.execute("ROLLBACK TO SAVEPOINT sdb_row; RELEASE SAVEPOINT sdb_row");
@@ -172,6 +173,7 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
                     parents.entry(c.name.clone()).or_default().push(v);
                 }
             }
+            Err(e) if db.cancel_requested() => return Err(e.context("cancelled")),
             Err(e) => {
                 failures += 1;
                 if failures >= MAX_CONSECUTIVE_FAILURES {

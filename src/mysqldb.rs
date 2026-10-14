@@ -58,6 +58,11 @@ pub fn connect(url: &str) -> Result<Conn> {
     conn.with_context(|| format!("connecting to {label}"))
 }
 
+/// Stop the statement running on connection `id`, from a new connection to `url`.
+pub fn cancel(url: &str, id: u32) -> Result<()> {
+    connect(url)?.query_drop(format!("KILL QUERY {id}")).context("cancelling the query")
+}
+
 // ---------------------------------------------------------------- introspection
 
 pub fn introspect(conn: &mut Conn) -> Result<Schema> {

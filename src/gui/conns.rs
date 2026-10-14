@@ -7,6 +7,7 @@ use simple_database::db::{self, Database};
 use simple_database::discover::{self, Found};
 use std::path::PathBuf;
 use std::time::Instant;
+use crate::worker::Task;
 
 const SSL_MODES: [&str; 6] = ["", "disable", "prefer", "require", "verify-ca", "verify-full"];
 
@@ -24,6 +25,8 @@ pub struct Manager {
     confirm_delete: bool,
     /// Databases described by files in the project folders.
     detected: Vec<Found>,
+    /// The Test button's connection attempt, while it runs.
+    testing: Option<Task<(String, bool)>>,
 }
 
 /// What the dialog asks the app to do.
@@ -65,6 +68,7 @@ impl Manager {
             message: None,
             confirm_delete: false,
             detected: Vec::new(),
+            testing: None,
         }
     }
 
@@ -121,6 +125,10 @@ impl Manager {
 
     pub fn show(&mut self, ui: &mut egui::Ui, store: &mut Store) -> Option<Action> {
         let mut action = None;
+        if let Some(r) = self.testing.as_ref().and_then(|t| t.poll()) {
+            self.testing = None;
+            self.message = Some(r.unwrap_or_else(|e| (e, true)));
+        }
         ui.heading("Connections");
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
@@ -465,15 +473,19 @@ impl Manager {
                     *action = Some(Action::Connect { target, label, safe_mode: self.form.safe_mode });
                 }
             }
-            if ui.button("Test").clicked() {
+            if ui.add_enabled(self.testing.is_none(), egui::Button::new("Test")).clicked() {
                 let (target, _) = self.target(store);
-                let started = Instant::now();
-                self.message = Some(
+                self.message = None;
+                self.testing = Some(Task::spawn("Testing the connection", ui.ctx(), move || {
+                    let started = Instant::now();
                     match Database::open_labeled(&target, db::redact(&target)).and_then(|mut d| d.introspect()) {
                         Ok(s) => (format!("Connected in {:.0?}: {} table(s)", started.elapsed(), s.tables.len()), false),
                         Err(e) => (format!("{e:#}"), true),
-                    },
-                );
+                    }
+                }));
+            }
+            if self.testing.is_some() {
+                ui.spinner();
             }
             if ui.add_enabled(named && unsaved, egui::Button::new("Save")).clicked() {
                 self.message = Some(match self.save(store) {

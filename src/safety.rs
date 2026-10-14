@@ -44,6 +44,14 @@ impl SafeMode {
     pub fn asks(self, kind: &Kind) -> bool {
         matches!((self, kind), (SafeMode::Warn, Kind::Dangerous(_)) | (SafeMode::Confirm, Kind::Write | Kind::Dangerous(_)))
     }
+
+    /// The statements in `sql` this mode wants confirmed before they run.
+    pub fn confirmations(self, sql: &str) -> Vec<(String, Kind)> {
+        if !matches!(self, SafeMode::Warn | SafeMode::Confirm) {
+            return vec![];
+        }
+        classify_all(sql).into_iter().filter(|(_, k)| self.asks(k)).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
