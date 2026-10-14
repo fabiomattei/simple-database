@@ -211,7 +211,9 @@ Any `SCHEMA` argument may be a `.dbs` file, **a SQLite database file or a databa
 ```
 
 Without a password in the URL, `PGPASSWORD` or `MYSQL_PWD` is used. PostgreSQL works on the
-current schema (normally `public`). MySQL needs 8.0.16 or newer for check constraints.
+current schema (normally `public`); add `schema=name` to the URL for another one
+(`postgres://app@localhost/app?schema=billing`, or the connection's **Options** field). `pull`
+lists the other schemas that hold tables. MySQL needs 8.0.16 or newer for check constraints.
 
 TLS uses the same libpq-style URL parameters for both servers:
 
@@ -303,6 +305,11 @@ Each saved connection has a safe mode, set in the app or with `sdb conn add --sa
 | `warn` | Ask before DROP, TRUNCATE, ALTER … DROP, and DELETE or UPDATE without WHERE |
 | `confirm` | Ask before every statement that writes, including saving edits, importing and seeding |
 | `read-only` | Refuse every write. The session is also made read-only on the server (`SET SESSION … READ ONLY`, SQLite `PRAGMA query_only`), so nothing gets past the check |
+
+A statement counts as a write by what it calls too: `SELECT nextval(...)`, `setval`, `lo_import`,
+`load_extension` and other built-in functions that write are writes, and `pg_terminate_backend`,
+`pg_cancel_backend` or `lo_unlink` are dangerous. Functions you wrote yourself can't be told apart
+from reads; in `read-only` mode the server stops them.
 
 The app shows the mode under the database name and asks in a dialog that lists the statements.
 The CLI asks on the terminal; `-y` answers yes. `push` always asks unless `-y`.

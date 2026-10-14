@@ -1121,7 +1121,27 @@ mod tests {
         if db.dialect() == Dialect::Postgres {
             let types = db.query_value("SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = current_schema() AND t.typtype = 'e'");
             assert_eq!(types.unwrap(), Cell::Int(0), "enum types left behind");
+            live_other_schema(&mut db, url);
         }
+    }
+
+    /// `schema=` reads and writes another Postgres schema; without it, that schema is only mentioned.
+    fn live_other_schema(db: &mut Database, url: &str) {
+        db.run("DROP SCHEMA IF EXISTS \"sdb App\" CASCADE; CREATE SCHEMA \"sdb App\"").unwrap();
+        let joined = |param: &str| format!("{url}{}{param}", if url.contains('?') { '&' } else { '?' });
+        let mut app = Database::open(&joined("schema=sdb%20App")).unwrap();
+        let desired = parse("table parents { id int pk\n name text not null }\ntable kids { id int pk\n parent int -> parents.id }").unwrap();
+        let m = app.migration(&Schema::default(), &desired);
+        app.apply_migration(&m).unwrap();
+        let current = app.introspect().unwrap();
+        assert!(app.migration(&current, &desired).is_empty());
+        assert!(db.introspect().unwrap().tables.is_empty(), "the default schema got the tables");
+        let (_, skipped) = db.introspect_with_skipped().unwrap();
+        assert!(skipped.iter().any(|s| s.starts_with("schema sdb App (2 tables")), "{skipped:?}");
+        drop(app);
+        db.run("DROP SCHEMA \"sdb App\" CASCADE").unwrap();
+        let err = Database::open(&joined("schema=nope")).err().expect("a missing schema is an error");
+        assert!(format!("{err:#}").contains("schema \"nope\" doesn't exist"), "{err:#}");
     }
 
     /// Rows that would make a migration fail are found before it runs.

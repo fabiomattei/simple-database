@@ -265,7 +265,7 @@ fn saved_connections_and_safe_mode() {
 
     // Read-only: reads run, and every way to write is refused.
     s.ok(&["query", "--db", "@ro", "SELECT count(*) FROM users"]);
-    for sql in ["INSERT INTO tags (name) VALUES ('x')", "PRAGMA query_only(0)", "WITH x AS (SELECT 1) DELETE FROM tags"] {
+    for sql in ["INSERT INTO tags (name) VALUES ('x')", "PRAGMA query_only(0)", "SELECT load_extension('x')", "WITH x AS (SELECT 1) DELETE FROM tags"] {
         let out = s.fails(&["query", "--db", "@ro", sql, "-y"]);
         assert!(out.contains("read-only"), "{sql}: {out}");
     }
@@ -438,4 +438,78 @@ fn colors_only_on_a_terminal_or_when_forced() {
         assert!(pick(escape(&run(args, &[("CLICOLOR_FORCE", "1")]))), "CLICOLOR_FORCE colors it");
         assert!(!pick(escape(&run(args, &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")]))), "NO_COLOR wins");
     }
+}
+
+#[test]
+fn push_refuses_what_the_rows_would_break() {
+    let s = Scratch::new("preflight");
+    s.ok(&["init", "schema.dbs"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    s.ok(&["seed", "--db", "app.db", "-n", "5", "--seed", "1", "-y"]);
+    s.ok(&["query", "--db", "app.db", "UPDATE posts SET title = 'same' WHERE id <= 3"]);
+    s.edit("schema.dbs", "  title       text       not null", "  title text not null unique");
+
+    let out = s.fails(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    assert!(out.contains("3 row(s) of posts repeat a value of title") && out.contains("--force"), "{out}");
+    // A dry run lists the problems and still prints the script.
+    let out = s.ok(&["push", "schema.dbs", "--db", "app.db", "--dry-run"]);
+    assert!(out.contains("error:") && out.contains("CREATE TABLE"), "{out}");
+    // --force tries, the database refuses, and nothing changes.
+    s.fails(&["push", "schema.dbs", "--db", "app.db", "-y", "--force"]);
+    assert_eq!(s.count("app.db", "posts"), 5);
+
+    s.ok(&["query", "--db", "app.db", "UPDATE posts SET title = 'title ' || id"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    assert!(s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]).contains("already up to date"));
+}
+
+#[test]
+fn dump_seed_and_import_options() {
+    let s = Scratch::new("options");
+    s.ok(&["init", "schema.dbs"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+
+    // Seed: per-table counts, only some tables (their parents must have rows).
+    s.ok(&["seed", "--db", "app.db", "--only", "users,tags", "-n", "4", "-c", "tags=9", "-y"]);
+    assert_eq!((s.count("app.db", "users"), s.count("app.db", "tags"), s.count("app.db", "posts")), (4, 9, 0));
+
+    // Dump: chosen tables, schema or data only, another dialect.
+    let schema = s.ok(&["dump", "--db", "app.db", "-t", "tags", "--schema-only"]);
+    assert!(schema.contains("CREATE TABLE tags") && !schema.contains("INSERT") && !schema.contains("users"), "{schema}");
+    let data = s.ok(&["dump", "--db", "app.db", "-t", "tags,users", "--data-only", "-d", "postgres"]);
+    assert!(data.contains("INSERT INTO tags") && data.contains("INSERT INTO users") && !data.contains("CREATE TABLE"), "{data}");
+    assert!(data.contains("setval"), "Postgres sequences follow the ids:\n{data}");
+    s.fails(&["dump", "--db", "app.db", "--schema-only", "--data-only"]);
+    s.fails(&["dump", "--db", "app.db", "-t", "nowhere"]);
+
+    // Import: TSV with Windows line endings, JSON Lines, a format given for an unknown extension.
+    std::fs::write(s.path("tags.tsv"), "name\tcolor\r\nweb\tred\r\n\"tab\tbed\"\t\r\n").unwrap();
+    s.ok(&["import", "--db", "app.db", "tags.tsv", "-y"]);
+    assert_eq!(s.count("app.db", "tags WHERE name IN ('web', 'tab\tbed')"), 2);
+    std::fs::write(s.path("tags.jsonl"), "{\"name\": \"one\"}\n\n{\"name\": \"two\", \"x\": [1]}\n").unwrap();
+    s.ok(&["import", "--db", "app.db", "tags.jsonl", "-y"]);
+    std::fs::write(s.path("export.txt"), "name\nthree\n").unwrap();
+    s.fails(&["import", "--db", "app.db", "export.txt", "-t", "tags", "-y"]);
+    s.ok(&["import", "--db", "app.db", "export.txt", "-t", "tags", "-f", "csv", "-y"]);
+    assert_eq!(s.count("app.db", "tags"), 14);
+    std::fs::write(s.path("broken.jsonl"), "{\"name\": \"a\"}\n{\"name\": \n").unwrap();
+    assert!(s.fails(&["import", "--db", "app.db", "broken.jsonl", "-t", "tags", "-y"]).contains("line 2"));
+}
+
+#[test]
+fn imports_more_rows_than_one_insert_holds() {
+    let s = Scratch::new("big-import");
+    s.ok(&["init", "schema.dbs"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    let mut csv = String::from("name\n");
+    for i in 0..1234 {
+        csv += &format!("tag {i}\n");
+    }
+    std::fs::write(s.path("tags.csv"), &csv).unwrap();
+    s.ok(&["import", "--db", "app.db", "tags.csv", "-y"]);
+    assert_eq!(s.count("app.db", "tags"), 1234);
+    // A duplicate in the last batch rolls back the earlier batches too.
+    std::fs::write(s.path("again.csv"), csv.replace("tag", "other") + "other 0\n").unwrap();
+    s.fails(&["import", "--db", "app.db", "again.csv", "-t", "tags", "-y"]);
+    assert_eq!(s.count("app.db", "tags"), 1234);
 }

@@ -77,9 +77,48 @@ const READ_PRAGMAS: [&str; 9] = [
     "foreign_key_list", "foreign_key_check", "integrity_check",
 ];
 
-/// Classify one statement. Unknown statements count as writes.
+/// Functions that write, or act on the server, from inside any statement, a SELECT included.
+/// Functions the user wrote can write too; only the server's read-only mode stops those.
+const WRITING_FUNCTIONS: [&str; 24] = [
+    // Postgres
+    "nextval", "setval", "lo_import", "lo_export", "lo_create", "lo_creat", "lo_from_bytea", "lo_put",
+    "pg_reload_conf", "pg_rotate_logfile", "pg_switch_wal", "pg_create_restore_point", "pg_logical_emit_message",
+    "pg_create_physical_replication_slot", "pg_create_logical_replication_slot", "pg_promote",
+    "pg_import_system_collations", "pg_replication_origin_create", "dblink_exec", "pg_file_write",
+    "pg_file_rename", "pg_file_sync",
+    // SQLite: runs code from a file; the fileio extension writes files
+    "load_extension", "writefile",
+];
+
+/// Functions that destroy something or reach into other sessions, with why.
+const DANGEROUS_FUNCTIONS: [(&str, &str); 6] = [
+    ("pg_terminate_backend", "ends another session"),
+    ("pg_cancel_backend", "cancels another session's query"),
+    ("lo_unlink", "deletes a large object"),
+    ("pg_drop_replication_slot", "drops a replication slot"),
+    ("pg_replication_origin_drop", "drops a replication origin"),
+    ("pg_file_unlink", "deletes a file on the server"),
+];
+
+/// Classify one statement. Unknown statements count as writes. A function
+/// call that writes makes a read a write; a dangerous one makes anything dangerous.
 pub fn classify(stmt: &str) -> Kind {
     let scanned = scan(stmt);
+    let kind = classify_scanned(stmt, &scanned);
+    let calls = scanned.iter().filter(|s| stmt[s.at..].trim_start_matches(|c: char| c.is_alphanumeric() || c == '_').trim_start().starts_with('('));
+    let mut writes = false;
+    for call in calls {
+        let name = call.text.as_str();
+        if let Some((_, why)) = DANGEROUS_FUNCTIONS.iter().find(|(f, _)| *f == name) {
+            return Kind::Dangerous(format!("{name}() {why}"));
+        }
+        // Postgres `pg_stat_reset`, `pg_stat_reset_shared`, … clear statistics.
+        writes |= WRITING_FUNCTIONS.contains(&name) || name.starts_with("pg_stat_reset");
+    }
+    if writes && kind == Kind::Read { Kind::Write } else { kind }
+}
+
+fn classify_scanned(stmt: &str, scanned: &[Word]) -> Kind {
     let w: Vec<&str> = scanned.iter().map(|s| s.text.as_str()).collect();
     let has = |x: &str| w.contains(&x);
     // A WHERE in a subquery doesn't limit an UPDATE or DELETE.
@@ -282,6 +321,20 @@ mod tests {
         write("SELECT * FROM users INTO OUTFILE '/tmp/u.csv'");
         read("SELECT 'into' FROM t");
         read("SELECT * FROM t FOR UPDATE");
+
+        // Function calls that write or act on the server.
+        write("SELECT nextval('users_id_seq')");
+        write("select pg_catalog.setval ('s', 1)");
+        write("SELECT lo_import('/etc/passwd')");
+        write("SELECT load_extension('evil')");
+        write("SELECT pg_stat_reset()");
+        write("WITH x AS (SELECT nextval('s')) SELECT * FROM x");
+        dangerous("SELECT pg_terminate_backend(pid) FROM pg_stat_activity");
+        dangerous("INSERT INTO t SELECT lo_unlink(oid) FROM l");
+        dangerous("select 1 where PG_CANCEL_BACKEND(42)");
+        read("SELECT nextval FROM t");
+        read("SELECT 'nextval(1)', \"setval\"(x) FROM t");
+        read("SELECT currval('s'), pg_stat_get_live_tuples(1)");
 
         // Pragmas set with the call form too.
         write("PRAGMA user_version(5)");

@@ -1,10 +1,11 @@
 //! Working with live PostgreSQL databases: introspection and queries.
 //!
-//! Only the current schema (normally `public`) is read.
+//! Only the current schema is read: normally `public`, or the one a `schema=`
+//! URL parameter names, which `connect` puts first on the `search_path`.
 
 use crate::db::{Cell, QueryResult, split_statements, strip_outer_parens};
 use crate::schema::*;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crate::tls::{self, SslMode};
 use postgres::config::SslMode as PgSslMode;
 use postgres::{Client, NoTls, Row, SimpleQueryMessage, types::Type};
@@ -13,10 +14,12 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use std::str::FromStr;
 
 /// Connect to a `postgres://` URL. Without a password in the URL,
-/// `PGPASSWORD` is used. TLS is set by the `crate::tls` URL parameters.
+/// `PGPASSWORD` is used. TLS is set by the `crate::tls` URL parameters, and
+/// `schema=name` makes that schema the one sdb reads and writes.
 pub fn connect(url: &str) -> Result<Client> {
     let label = crate::db::redact(url);
-    let (url, tls) = tls::split_url(url)?;
+    let (url, schema) = take_schema(url)?;
+    let (url, tls) = tls::split_url(&url)?;
     let mut config = postgres::Config::from_str(&url).context("invalid PostgreSQL URL")?;
     if config.get_password().is_none()
         && let Ok(pw) = std::env::var("PGPASSWORD")
@@ -31,7 +34,34 @@ pub fn connect(url: &str) -> Result<Client> {
             config.connect(MakeRustlsConnect::new(tls::client_config(&tls, mode)?))
         }
     };
-    client.with_context(|| format!("connecting to {label}")).map_err(|e| tls::explain(e, mode))
+    let mut client = client.with_context(|| format!("connecting to {label}")).map_err(|e| tls::explain(e, mode))?;
+    if let Some(schema) = schema {
+        if client.query_opt("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema])?.is_none() {
+            bail!("schema \"{schema}\" doesn't exist in {label}");
+        }
+        client.batch_execute(&format!("SET search_path TO \"{}\"", schema.replace('"', "\"\"")))?;
+    }
+    Ok(client)
+}
+
+/// The URL without its `schema` parameter, and the schema it named.
+fn take_schema(url: &str) -> Result<(String, Option<String>)> {
+    let Some((base, query)) = url.split_once('?') else {
+        return Ok((url.to_string(), None));
+    };
+    let mut schema = None;
+    let mut rest = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("schema", raw)) => {
+                let name = percent_encoding::percent_decode_str(raw).decode_utf8().context("invalid schema value")?;
+                schema = Some(name.into_owned()).filter(|n| !n.is_empty());
+            }
+            _ => rest.push(pair),
+        }
+    }
+    let url = if rest.is_empty() { base.to_string() } else { format!("{base}?{}", rest.join("&")) };
+    Ok((url, schema))
 }
 
 /// Cancel the query running on the connection `token` came from; `url` is
@@ -135,6 +165,13 @@ pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Sche
          SELECT 'trigger', t.tgname::text || ' on ' || c.relname::text \
          FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = current_schema() AND NOT t.tgisinternal \
+         UNION ALL \
+         SELECT 'schema', n.nspname::text || ' (' || count(*) || ' tables; connect with ?schema=' || n.nspname::text || ' to read it)' \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r', 'p') AND n.nspname IS DISTINCT FROM current_schema() \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e') \
+         GROUP BY n.nspname \
          ORDER BY 1, 2",
         &[],
     )?;
@@ -421,6 +458,17 @@ fn cell(text: Option<&str>, ty: &Type) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_the_schema_parameter() {
+        let take = |u: &str| take_schema(u).unwrap();
+        assert_eq!(take("postgres://h/db"), ("postgres://h/db".into(), None));
+        assert_eq!(take("postgres://h/db?schema=app"), ("postgres://h/db".into(), Some("app".into())));
+        assert_eq!(
+            take("postgres://h/db?sslmode=require&schema=My%20App&application_name=x"),
+            ("postgres://h/db?sslmode=require&application_name=x".into(), Some("My App".into()))
+        );
+    }
 
     #[test]
     fn reads_defaults() {
