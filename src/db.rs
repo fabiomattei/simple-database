@@ -29,6 +29,8 @@ pub struct Database {
     check_cache: HashMap<String, Vec<(String, String)>>,
     cancel: Arc<Canceller>,
     tls_warning: Option<String>,
+    /// Postgres: the schemas a `schema=` URL parameter lists, the default first.
+    pg_schemas: Vec<String>,
 }
 
 /// Stops what a [`Database`] is running, from another thread.
@@ -103,8 +105,13 @@ impl Database {
     /// Like [`Database::open`] without `@name` lookup; `label` is what
     /// [`Database::label`] reports (it must not contain a password).
     pub fn open_labeled(target: &str, label: String) -> Result<Database> {
+        let mut pg_schemas = Vec::new();
         let conn = match url_dialect(target) {
-            Some(Dialect::Postgres) => Conn::Postgres(Box::new(pg::connect(target)?)),
+            Some(Dialect::Postgres) => {
+                let (client, schemas) = pg::connect(target)?;
+                pg_schemas = schemas;
+                Conn::Postgres(Box::new(client))
+            }
             Some(_) => Conn::Mysql(Box::new(mysqldb::connect(target)?)),
             None => Conn::Sqlite(sqlite::open(Path::new(target))?),
         };
@@ -115,6 +122,7 @@ impl Database {
         };
         let mut db = Database::new(conn, label, via);
         db.tls_warning = crate::tls::warning(target);
+        db.pg_schemas = pg_schemas;
         Ok(db)
     }
 
@@ -125,7 +133,7 @@ impl Database {
 
     fn new(conn: Conn, label: String, via: CancelVia) -> Database {
         let cancel = Arc::new(Canceller { requested: AtomicBool::new(false), via });
-        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel, tls_warning: None }
+        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel, tls_warning: None, pg_schemas: Vec::new() }
     }
 
     /// Set when the server's identity isn't verified (see [`crate::tls::warning`]).
@@ -229,7 +237,7 @@ impl Database {
         let mut skipped = Vec::new();
         let schema = match &mut self.conn {
             Conn::Sqlite(c) => return sqlite::introspect(c, &mut skipped).map(|s| (s, skipped)),
-            Conn::Postgres(c) => pg::introspect(c, &mut skipped)?,
+            Conn::Postgres(c) => pg::introspect(c, &self.pg_schemas, &mut skipped)?,
             Conn::Mysql(c) => mysqldb::introspect(c, &mut skipped)?,
         };
         let tables = schema.tables_in_dependency_order().into_iter().cloned().collect();
@@ -273,7 +281,7 @@ impl Database {
         let d = self.dialect();
         let mut out = Vec::new();
         for t in &schema.tables {
-            let n = match self.query_value(&format!("SELECT count(*) FROM {}", ddl::quote(&t.name, d)))? {
+            let n = match self.query_value(&format!("SELECT count(*) FROM {}", ddl::quote_table(&t.name, d)))? {
                 Cell::Int(n) => n,
                 other => other.display().parse().unwrap_or(0),
             };
@@ -348,14 +356,50 @@ impl Database {
     /// The migration that turns `current` (introspected from this database)
     /// into `desired`.
     pub fn migration(&mut self, current: &Schema, desired: &Schema) -> Migration {
-        let desired = self.normalize_checks(desired);
-        diff::diff(current, &desired, self.dialect())
+        let (desired, warnings) = self.schema_names(desired);
+        let desired = self.normalize_checks(&desired);
+        let mut m = diff::diff(current, &desired, self.dialect());
+        m.warnings.extend(warnings);
+        m
     }
 
     /// Like [`Database::migration`], written as a Laravel or Rails migration.
     pub fn framework_migration(&mut self, current: &Schema, desired: &Schema, fw: crate::framework::Framework, opts: &crate::framework::Options) -> crate::framework::Generated {
-        let desired = self.normalize_checks(desired);
+        let (desired, _) = self.schema_names(desired);
+        let desired = self.normalize_checks(&desired);
         crate::framework::generate(current, &desired, self.dialect(), fw, opts)
+    }
+
+    /// On Postgres, `schema` with tables named as introspection names them
+    /// (`public.users` is `users` when `public` is the default schema), and a
+    /// warning per schema it uses that this connection doesn't read: its
+    /// tables would be created again on every push.
+    fn schema_names(&mut self, schema: &Schema) -> (Schema, Vec<String>) {
+        let mut out = schema.clone();
+        let Conn::Postgres(c) = &mut self.conn else { return (out, Vec::new()) };
+        let read = pg::read_schemas(c, &self.pg_schemas).unwrap_or_default();
+        let Some(default) = read.first() else { return (out, Vec::new()) };
+        for t in &schema.tables {
+            if let (Some(s), name) = split_qualified(&t.name)
+                && s == default
+                && schema.table(name).is_none()
+            {
+                out.rename_table(&t.name, name);
+            }
+        }
+        let warnings = out
+            .qualifiers()
+            .into_iter()
+            .filter(|s| !read.iter().any(|r| r == s))
+            .map(|s| {
+                format!(
+                    "this connection doesn't read schema {s}, so its tables would be created again on each push: \
+                     add it to the URL's schema= list (schema={},{s})",
+                    read.join(",")
+                )
+            })
+            .collect();
+        (out, warnings)
     }
 
     /// Run a migration's row checks: what existing rows would make it fail,
@@ -1157,8 +1201,50 @@ mod tests {
         assert!(db.introspect().unwrap().tables.is_empty(), "the default schema got the tables");
         let (_, skipped) = db.introspect_with_skipped().unwrap();
         assert!(skipped.iter().any(|s| s.starts_with("schema sdb App (2 tables")), "{skipped:?}");
+
+        // Several schemas: the first is the default, the others' tables have qualified names.
+        db.run("DROP SCHEMA IF EXISTS sdb_billing CASCADE; CREATE SCHEMA sdb_billing").unwrap();
+        let mut both = Database::open(&joined("schema=sdb%20App,sdb_billing")).unwrap();
+        let src = "table parents { id int pk\n name text not null }\ntable kids { id int pk\n parent int -> parents.id }\n\
+                   table sdb_billing.invoices { id int pk autoincrement\n parent int -> parents.id\n status enum('open', 'paid') not null default 'open'\n \
+                   total int check (total >= 0) comment 'cents'\n index (parent) }\n\
+                   table sdb_billing.lines { id int pk\n invoice int not null -> sdb_billing.invoices.id on delete cascade }\n\
+                   table refunds { id int pk\n invoice int -> sdb_billing.invoices.id }";
+        let desired = parse(src).unwrap();
+        let current = both.introspect().unwrap();
+        let m = both.migration(&current, &desired);
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        both.apply_migration(&m).unwrap();
+        let current = both.introspect().unwrap();
+        let mut names: Vec<&str> = current.tables.iter().map(|t| t.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["kids", "parents", "refunds", "sdb_billing.invoices", "sdb_billing.lines"]);
+        assert!(both.migration(&current, &desired).is_empty(), "{}", both.migration(&current, &desired).script());
+        let pulled = parse(&crate::format::format_schema(&current)).unwrap();
+        assert!(both.migration(&current, &pulled).is_empty(), "pulled schema differs");
+        assert_eq!(both.row_counts(&current).unwrap().len(), 5);
+        // A connection that reads only the default schema says what it leaves out, and warns before a push.
+        let (_, skipped) = app.introspect_with_skipped().unwrap();
+        assert!(skipped.iter().any(|s| s.starts_with("schema sdb_billing (2 tables")), "{skipped:?}");
+        let app_current = app.introspect().unwrap();
+        assert!(app.migration(&app_current, &desired).warnings.iter().any(|w| w.contains("schema=sdb App,sdb_billing")));
+        // Moving a table to another schema keeps its rows.
+        both.run("INSERT INTO parents VALUES (1, 'a'); INSERT INTO kids VALUES (7, 1)").unwrap();
+        let moved = parse(&src.replace("table kids {", "table sdb_billing.children was kids {")).unwrap();
+        let m = both.migration(&current, &moved);
+        assert_eq!(m.changes, ["~ table kids -> sdb_billing.children"], "{}", m.script());
+        both.apply_migration(&m).unwrap();
+        let current = both.introspect().unwrap();
+        assert!(both.migration(&current, &moved).is_empty(), "{}", both.migration(&current, &moved).script());
+        assert_eq!(both.query_value("SELECT parent FROM sdb_billing.children WHERE id = 7").unwrap(), Cell::Int(1));
+        let m = both.migration(&current, &Schema::default());
+        both.apply_migration(&m).unwrap();
+        let types = both.query_value("SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = 'sdb_billing' AND t.typtype = 'e'");
+        assert_eq!(types.unwrap(), Cell::Int(0), "enum types left behind");
+        drop(both);
+
         drop(app);
-        db.run("DROP SCHEMA \"sdb App\" CASCADE").unwrap();
+        db.run("DROP SCHEMA \"sdb App\" CASCADE; DROP SCHEMA sdb_billing CASCADE").unwrap();
         let err = Database::open(&joined("schema=nope")).err().expect("a missing schema is an error");
         assert!(format!("{err:#}").contains("schema \"nope\" doesn't exist"), "{err:#}");
     }

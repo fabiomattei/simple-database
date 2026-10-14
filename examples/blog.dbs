@@ -14,6 +14,7 @@
 # table-level:  index (a, b)   unique index name (a, b)   pk (a, b)
 #               fk (a, b) -> table (x, y)  on delete|update <action>
 # table:        table name was old_name comment 'text' { ... }  (was, comment optional)
+#               name may be schema.name (Postgres): table billing.invoices, -> billing.invoices.id
 
 table users comment 'People who can sign in' {
   id          int                                pk autoincrement

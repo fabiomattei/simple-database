@@ -32,6 +32,39 @@ pub fn quote(name: &str, d: Dialect) -> String {
     }
 }
 
+/// A table name, or a name that lives in a table's schema (an enum's type).
+/// On Postgres `billing.invoices` is table `invoices` in schema `billing`;
+/// elsewhere the dot is part of the name.
+pub fn quote_table(name: &str, d: Dialect) -> String {
+    match split_qualified(name) {
+        (Some(schema), table) if d == Dialect::Postgres => format!("{}.{}", quote(schema, d), quote(table, d)),
+        _ => quote(name, d),
+    }
+}
+
+/// `name` (an index) qualified with the schema of `table`, as Postgres needs
+/// it where it isn't given the table (`DROP INDEX`, `ALTER INDEX`).
+pub fn quote_in(table: &str, name: &str, d: Dialect) -> String {
+    match split_qualified(table) {
+        (Some(schema), _) if d == Dialect::Postgres => format!("{}.{}", quote(schema, d), quote(name, d)),
+        _ => quote(name, d),
+    }
+}
+
+/// `CREATE SCHEMA` for the schemas `tables` are in, on Postgres.
+pub fn create_schemas_sql<'a>(tables: impl IntoIterator<Item = &'a str>, d: Dialect) -> Vec<String> {
+    if d != Dialect::Postgres {
+        return Vec::new();
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for s in tables.into_iter().filter_map(|t| split_qualified(t).0) {
+        if !seen.contains(&s) {
+            seen.push(s);
+        }
+    }
+    seen.iter().map(|s| format!("CREATE SCHEMA IF NOT EXISTS {};", quote(s, d))).collect()
+}
+
 pub fn quote_list(cols: &[String], d: Dialect) -> String {
     cols.iter().map(|c| quote(c, d)).collect::<Vec<_>>().join(", ")
 }
@@ -49,12 +82,13 @@ fn string_list_sql(values: &[String], d: Dialect) -> String {
 /// The type of a column. Unlike `type_sql`, it names a Postgres enum's type.
 pub fn column_type_sql(table: &str, c: &Column, d: Dialect) -> String {
     match &c.data_type {
-        DataType::Enum(_) if d == Dialect::Postgres => quote(&enum_type_name(table, &c.name), d),
+        DataType::Enum(_) if d == Dialect::Postgres => quote_table(&enum_type_name(table, &c.name), d),
         t => type_sql(t, d),
     }
 }
 
-/// The Postgres type behind an enum column.
+/// The Postgres type behind an enum column, in the table's schema
+/// (`billing.invoices_status_enum`); quote it with `quote_table`.
 pub fn enum_type_name(table: &str, column: &str) -> String {
     format!("{table}_{column}_enum")
 }
@@ -62,7 +96,7 @@ pub fn enum_type_name(table: &str, column: &str) -> String {
 /// `CREATE TYPE` for a Postgres enum column, named `name`.
 pub fn create_enum_sql(name: &str, values: &[String]) -> String {
     let d = Dialect::Postgres;
-    format!("CREATE TYPE {} AS ENUM ({});", quote(name, d), string_list_sql(values, d))
+    format!("CREATE TYPE {} AS ENUM ({});", quote_table(name, d), string_list_sql(values, d))
 }
 
 /// The type alone. A Postgres enum needs its column's named type
@@ -195,7 +229,7 @@ pub const SQLITE_ENUM: &str = "enum";
 /// Name of a column's check constraint. Postgres picks this name itself;
 /// for MySQL it is set explicitly.
 pub fn check_name(table: &str, column: &str) -> String {
-    format!("{table}_{column}_check")
+    format!("{}_{column}_check", unqualified(table))
 }
 
 /// A named check constraint, as MySQL needs it.
@@ -204,7 +238,17 @@ pub fn check_sql(table: &str, column: &str, expr: &str, d: Dialect) -> String {
 }
 
 pub fn fk_name(table: &str, column: &str) -> String {
-    format!("fk_{table}_{column}")
+    format!("fk_{}_{column}", unqualified(table))
+}
+
+/// Name of the unique constraint on one column, as Postgres picks it.
+pub fn unique_name(table: &str, column: &str) -> String {
+    format!("{}_{column}_key", unqualified(table))
+}
+
+/// Name of the primary key constraint, as Postgres picks it.
+pub fn pkey_name(table: &str) -> String {
+    format!("{}_pkey", unqualified(table))
 }
 
 /// Name of a foreign key over several columns.
@@ -228,7 +272,7 @@ pub fn table_fk_sql(table: &str, fk: &TableForeignKey, d: Dialect) -> String {
         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
         quote(&table_fk_name(table, fk), d),
         quote_list(&fk.columns, d),
-        quote(&fk.table, d),
+        quote_table(&fk.table, d),
         quote_list(&fk.ref_columns, d)
     );
     if fk.on_delete != RefAction::NoAction {
@@ -279,7 +323,7 @@ pub fn create_table_sql(t: &Table, d: Dialect) -> String {
         },
         _ => String::new(),
     };
-    format!("CREATE TABLE {} ({}\n{body}){suffix};", quote(&t.name, d), sqlite_comment(t.comment.as_ref()))
+    format!("CREATE TABLE {} ({}\n{body}){suffix};", quote_table(&t.name, d), sqlite_comment(t.comment.as_ref()))
 }
 
 /// A comment as a SQLite `--` comment holds it: one line, trimmed.
@@ -314,8 +358,8 @@ pub fn create_table_statements(t: &Table, d: Dialect) -> Vec<String> {
 pub fn comment_sql(table: &str, column: Option<&str>, comment: Option<&str>) -> String {
     let d = Dialect::Postgres;
     let target = match column {
-        Some(c) => format!("COLUMN {}.{}", quote(table, d), quote(c, d)),
-        None => format!("TABLE {}", quote(table, d)),
+        Some(c) => format!("COLUMN {}.{}", quote_table(table, d), quote(c, d)),
+        None => format!("TABLE {}", quote_table(table, d)),
     };
     format!("COMMENT ON {target} IS {};", comment.map_or("NULL".into(), |c| string_sql(c, d)))
 }
@@ -325,15 +369,15 @@ pub fn create_index_sql(table: &str, idx: &Index, d: Dialect) -> String {
         "CREATE {}INDEX {} ON {} ({});",
         if idx.unique { "UNIQUE " } else { "" },
         quote(&idx.name, d),
-        quote(table, d),
+        quote_table(table, d),
         quote_list(&idx.columns, d)
     )
 }
 
 pub fn drop_index_sql(table: &str, idx: &Index, d: Dialect) -> String {
     match d {
-        Dialect::Mysql => format!("DROP INDEX {} ON {};", quote(&idx.name, d), quote(table, d)),
-        _ => format!("DROP INDEX {};", quote(&idx.name, d)),
+        Dialect::Mysql => format!("DROP INDEX {} ON {};", quote(&idx.name, d), quote_table(table, d)),
+        _ => format!("DROP INDEX {};", quote_in(table, &idx.name, d)),
     }
 }
 
@@ -398,13 +442,13 @@ pub fn canonical(schema: &Schema, d: Dialect) -> Schema {
 
 /// `ALTER TABLE … ADD` a foreign key of `table`.
 pub fn add_fk_sql(table: &str, fk: &TableForeignKey, d: Dialect) -> String {
-    format!("ALTER TABLE {} ADD {};", quote(table, d), table_fk_sql(table, fk, d))
+    format!("ALTER TABLE {} ADD {};", quote_table(table, d), table_fk_sql(table, fk, d))
 }
 
 /// `ALTER TABLE … DROP` a foreign key of `table`.
 pub fn drop_fk_sql(table: &str, fk: &TableForeignKey, d: Dialect) -> String {
     let what = if d == Dialect::Mysql { "FOREIGN KEY" } else { "CONSTRAINT" };
-    format!("ALTER TABLE {} DROP {what} {};", quote(table, d), quote(&table_fk_name(table, fk), d))
+    format!("ALTER TABLE {} DROP {what} {};", quote_table(table, d), quote(&table_fk_name(table, fk), d))
 }
 
 /// The foreign keys of `tables`, in creation order, that point at a table
@@ -446,7 +490,7 @@ pub fn schema_statements(schema: &Schema, d: Dialect) -> (Vec<String>, Vec<Strin
     let schema = canonical(schema, d);
     let tables = schema.tables_in_dependency_order();
     let forward = forward_keys(&tables, d);
-    let mut out = Vec::new();
+    let mut out = create_schemas_sql(tables.iter().map(|t| t.name.as_str()), d);
     for t in tables {
         out.extend(create_table_statements(&without_keys(t, &forward), d));
         for idx in &t.indexes {
@@ -544,6 +588,32 @@ mod tests {
         // SQLite's comments are one line.
         let c = canonical(&s, Dialect::Sqlite);
         assert_eq!(c.tables[0].columns[0].comment.as_deref(), Some("two lines"));
+    }
+
+    #[test]
+    fn qualifies_tables_in_other_postgres_schemas() {
+        let s = parse(
+            "table billing.invoices { id int pk\n status enum('open', 'paid') check (status <> 'x')\n user_id int -> users.id\n index (user_id) }\n\
+             table users { id int pk\n invoice_id int -> billing.invoices.id }",
+        )
+        .unwrap();
+        let pg = schema_sql(&s, Dialect::Postgres);
+        for want in [
+            "CREATE SCHEMA IF NOT EXISTS billing;",
+            "CREATE TYPE billing.invoices_status_enum AS ENUM ('open', 'paid');",
+            "CREATE TABLE billing.invoices (",
+            "status billing.invoices_status_enum CHECK (status <> 'x')",
+            "CONSTRAINT fk_invoices_user_id FOREIGN KEY (user_id) REFERENCES users (id)",
+            "CREATE INDEX invoices_user_id_idx ON billing.invoices (user_id);",
+            "REFERENCES billing.invoices (id)",
+        ] {
+            assert!(pg.contains(want), "{want}\n{pg}");
+        }
+        assert_eq!(quote_table("Billing.Order", Dialect::Postgres), "\"Billing\".\"Order\"");
+        assert_eq!(drop_index_sql("billing.invoices", &s.tables[0].indexes[0], Dialect::Postgres), "DROP INDEX billing.invoices_user_id_idx;");
+        // Elsewhere the dot is part of the name.
+        let sqlite = schema_sql(&s, Dialect::Sqlite);
+        assert!(sqlite.contains("CREATE TABLE \"billing.invoices\" (") && !sqlite.contains("SCHEMA"), "{sqlite}");
     }
 
     #[test]

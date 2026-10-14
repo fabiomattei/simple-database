@@ -381,14 +381,7 @@ impl Parser {
                 _ => None,
             };
             let columns = self.expect_paren_list("index columns")?;
-            let name = explicit_name.unwrap_or_else(|| {
-                format!(
-                    "{}_{}_{}",
-                    table.name,
-                    columns.join("_"),
-                    if unique { "key" } else { "idx" }
-                )
-            });
+            let name = explicit_name.unwrap_or_else(|| Index::default_name(&table.name, &columns, unique));
             table.indexes.push(Index {
                 name,
                 columns,
@@ -472,7 +465,8 @@ impl Parser {
                 Tok::Arrow => {
                     self.pos += 1;
                     let target = self.expect_word("referenced table.column after '->'")?;
-                    let Some((t, c)) = target.split_once('.') else {
+                    // The column is after the last dot: `-> billing.invoices.id`.
+                    let Some((t, c)) = target.rsplit_once('.') else {
                         return err(line, format!("expected 'table.column' after '->', found '{target}'"));
                     };
                     col.references = Some(ForeignKey {
@@ -508,7 +502,7 @@ impl Parser {
                         },
                         "references" | "ref" => {
                             let t = self.expect_word("referenced table")?;
-                            let (table, column) = match t.split_once('.') {
+                            let (table, column) = match t.rsplit_once('.').filter(|_| !matches!(self.peek(), Tok::Paren(_))) {
                                 Some((t, c)) => (t.to_string(), c.to_string()),
                                 None => match self.next() {
                                     Tok::Paren(c) => (t, c.trim().to_string()),
@@ -748,11 +742,13 @@ pub fn outline(src: &str) -> Vec<OutlineTable> {
 
 /// The line of a `table` or `table.column` location, as `validate` reports them.
 pub fn locate(outline: &[OutlineTable], location: &str) -> Option<usize> {
-    let (table, column) = match location.split_once('.') {
-        Some((t, c)) => (t, Some(c)),
-        None => (location, None),
+    // A table's name may have a dot too (`billing.invoices`).
+    let find = |name: &str| outline.iter().find(|t| t.name.eq_ignore_ascii_case(name));
+    let (t, column) = match (find(location), location.rsplit_once('.')) {
+        (Some(t), _) => (t, None),
+        (None, Some((table, c))) => (find(table)?, Some(c)),
+        (None, None) => return None,
     };
-    let t = outline.iter().find(|t| t.name.eq_ignore_ascii_case(table))?;
     Some(column.and_then(|c| t.columns.iter().find(|x| x.name.eq_ignore_ascii_case(c))).map_or(t.line, |c| c.line))
 }
 
@@ -875,6 +871,8 @@ mod tests {
         assert_eq!(cols, vec!["author", "title", "body"]);
         assert_eq!(o[1].end_line, 12, "unclosed table runs to the end");
         assert_eq!(locate(&o, "users.name"), Some(3));
+        let q = outline("table billing.users {\n  id int\n}");
+        assert_eq!((locate(&q, "billing.users"), locate(&q, "billing.users.id")), (Some(1), Some(2)));
         assert_eq!(locate(&o, "posts"), Some(8));
         assert_eq!(locate(&o, "posts.nope"), Some(8));
         assert_eq!(locate(&o, "nope"), None);

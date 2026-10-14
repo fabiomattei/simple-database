@@ -6,7 +6,7 @@
 //! restore with checks disabled or keys declared only in a `.dbs` let in.
 
 use crate::db::{Cell, Database, QueryResult};
-use crate::ddl::{Dialect, quote};
+use crate::ddl::{Dialect, quote, quote_table};
 use crate::schema::{Schema, TableForeignKey};
 use anyhow::{Result, bail};
 
@@ -55,7 +55,7 @@ const PARENT: &str = "sdb_parent";
 /// column is set (a NULL in any of them means no reference, as in SQL's
 /// default MATCH SIMPLE) and no parent row has those values.
 pub fn orphan_condition(table: &str, fk: &TableForeignKey, schema: &Schema, d: Dialect) -> String {
-    let child = quote(table, d);
+    let child = quote_table(table, d);
     let set = fk.columns.iter().map(|c| format!("{child}.{} IS NOT NULL", quote(c, d)));
     let mut conds: Vec<String> = set.collect();
     // A missing parent table: every set key is an orphan.
@@ -66,7 +66,7 @@ pub fn orphan_condition(table: &str, fk: &TableForeignKey, schema: &Schema, d: D
             .zip(&fk.ref_columns)
             .map(|(c, r)| format!("{PARENT}.{} = {child}.{}", quote(r, d), quote(c, d)))
             .collect();
-        conds.push(format!("NOT EXISTS (SELECT 1 FROM {} {PARENT} WHERE {})", quote(&fk.table, d), matches.join(" AND ")));
+        conds.push(format!("NOT EXISTS (SELECT 1 FROM {} {PARENT} WHERE {})", quote_table(&fk.table, d), matches.join(" AND ")));
     }
     conds.join(" AND ")
 }
@@ -87,7 +87,7 @@ pub fn check_foreign_keys(db: &mut Database, schema: &Schema, sample: usize) -> 
             if let Some(e) = missing(schema, &found) {
                 found.error = Some(e);
             }
-            let from = format!("FROM {} WHERE {}", quote(&t.name, d), found.condition);
+            let from = format!("FROM {} WHERE {}", quote_table(&t.name, d), found.condition);
             match db.query_value(&format!("SELECT count(*) {from}")) {
                 Ok(n) => found.count = count(&n),
                 Err(e) => found.error = Some(format!("{e:#}")),

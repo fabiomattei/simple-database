@@ -283,6 +283,14 @@ pub struct Index {
     pub unique: bool,
 }
 
+impl Index {
+    /// The name of an index the schema doesn't name: `posts_author_id_idx`,
+    /// `users_email_key` (unique), after the table without its schema.
+    pub fn default_name(table: &str, columns: &[String], unique: bool) -> String {
+        format!("{}_{}_{}", unqualified(table), columns.join("_"), if unique { "key" } else { "idx" })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
     pub name: String,
@@ -297,6 +305,22 @@ pub struct Table {
     pub was: Vec<String>,
     /// `comment '...'`; never empty.
     pub comment: Option<String>,
+}
+
+/// `billing.invoices` → (`Some("billing")`, `invoices`). On Postgres the part
+/// before the first dot is the table's schema; elsewhere the dot is just part
+/// of the name, but names derived from a table's (constraints, indexes) use
+/// the part after it everywhere.
+pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
+    match name.split_once('.') {
+        Some((schema, table)) if !schema.is_empty() && !table.is_empty() => (Some(schema), table),
+        _ => (None, name),
+    }
+}
+
+/// The table name without its schema: `billing.invoices` → `invoices`.
+pub fn unqualified(name: &str) -> &str {
+    split_qualified(name).1
 }
 
 /// Records a rename from `old` to `new` in a list of earlier names.
@@ -347,6 +371,17 @@ pub struct Schema {
 impl Schema {
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// The schemas that qualified table names (`billing.invoices`) name, in order of first use.
+    pub fn qualifiers(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for s in self.tables.iter().filter_map(|t| split_qualified(&t.name).0) {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
     }
 
     fn table_mut(&mut self, name: &str) -> Option<&mut Table> {

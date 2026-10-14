@@ -7,7 +7,7 @@
 
 use crate::data::literal;
 use crate::db::{Cell, Database};
-use crate::ddl::{Dialect, quote};
+use crate::ddl::{Dialect, quote, quote_table};
 use crate::schema::Table;
 use anyhow::{Context, Result, bail};
 use std::fs::File;
@@ -413,7 +413,7 @@ pub fn import(db: &mut Database, t: &Table, scan: &Scan) -> Result<u64> {
     }
     let d = db.dialect();
     let cols: Vec<String> = plan.mapping.iter().map(|(_, n)| quote(n, d)).collect();
-    let head = format!("INSERT INTO {} ({}) VALUES\n", quote(&t.name, d), cols.join(", "));
+    let head = format!("INSERT INTO {} ({}) VALUES\n", quote_table(&t.name, d), cols.join(", "));
     let mut rows = RowReader::open(&scan.source, scan.format, false)?;
     rows.columns = scan.columns.clone();
     let mut n = 0;

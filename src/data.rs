@@ -2,7 +2,7 @@
 //! literals for typed values, and staged row changes turned into statements.
 
 use crate::db::Cell;
-use crate::ddl::{Dialect, quote};
+use crate::ddl::{Dialect, quote, quote_table};
 use crate::schema::{DataType, Table};
 use anyhow::{Result, bail};
 
@@ -136,12 +136,12 @@ impl View {
                 }
             }
         };
-        Ok(format!("SELECT * FROM {}{}{order}", quote(&t.name, d), self.where_clause(t, d)?))
+        Ok(format!("SELECT * FROM {}{}{order}", quote_table(&t.name, d), self.where_clause(t, d)?))
     }
 
     /// How many rows match.
     pub fn count_sql(&self, t: &Table, d: Dialect) -> Result<String> {
-        Ok(format!("SELECT count(*) FROM {}{}", quote(&t.name, d), self.where_clause(t, d)?))
+        Ok(format!("SELECT count(*) FROM {}{}", quote_table(&t.name, d), self.where_clause(t, d)?))
     }
 }
 
@@ -244,7 +244,7 @@ impl RowChange {
                 .collect::<Result<Vec<_>>>()?;
             Ok(parts.join(" AND "))
         };
-        let table = quote(&t.name, d);
+        let table = quote_table(&t.name, d);
         Ok(match self {
             RowChange::Update { key, values } => {
                 let sets = values

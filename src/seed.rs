@@ -6,7 +6,7 @@
 //! first, and rows rejected by a constraint are regenerated.
 
 use crate::db::{Cell as Value, Database};
-use crate::ddl::{Dialect, quote};
+use crate::ddl::{Dialect, quote, quote_table};
 use crate::output::Paint;
 use crate::schema::*;
 use anyhow::Result;
@@ -92,8 +92,8 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
     let insert = |rows: &[Vec<Value>]| {
         if columns.is_empty() {
             return match d {
-                Dialect::Mysql => format!("INSERT INTO {} () VALUES ()", quote(&t.name, d)),
-                _ => format!("INSERT INTO {} DEFAULT VALUES", quote(&t.name, d)),
+                Dialect::Mysql => format!("INSERT INTO {} () VALUES ()", quote_table(&t.name, d)),
+                _ => format!("INSERT INTO {} DEFAULT VALUES", quote_table(&t.name, d)),
             };
         }
         let rows: Vec<String> = rows
@@ -102,7 +102,7 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
             .collect();
         format!(
             "INSERT INTO {} ({}) VALUES {}",
-            quote(&t.name, d),
+            quote_table(&t.name, d),
             columns.iter().map(|c| quote(&c.name, d)).collect::<Vec<_>>().join(", "),
             rows.join(", ")
         )
@@ -135,7 +135,7 @@ fn seed_table(db: &mut Database, t: &Table, requested: usize, g: &mut Generator)
     let pk = t.primary_key();
     let mut next_int_key: i64 = match pk.as_slice() {
         [only] if t.column(only).is_some_and(|c| c.data_type.is_integer() && !c.auto_increment) => {
-            let sql = format!("SELECT COALESCE(MAX({}), 0) + 1 FROM {}", quote(only, d), quote(&t.name, d));
+            let sql = format!("SELECT COALESCE(MAX({}), 0) + 1 FROM {}", quote(only, d), quote_table(&t.name, d));
             match db.query_value(&sql)? {
                 Value::Int(n) => n,
                 other => other.display().parse().unwrap_or(1),
@@ -251,7 +251,7 @@ fn existing_rows(db: &mut Database, table: &str, columns: &[String]) -> Result<V
     let sql = format!(
         "SELECT DISTINCT {} FROM {} WHERE {} LIMIT 10000",
         cols.join(", "),
-        quote(table, d),
+        quote_table(table, d),
         cols.iter().map(|c| format!("{c} IS NOT NULL")).collect::<Vec<_>>().join(" AND ")
     );
     let mut results = db.run(&sql)?;

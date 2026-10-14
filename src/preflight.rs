@@ -129,7 +129,7 @@ pub fn row_checks(p: &Plan) -> Vec<RowCheck> {
     for name in &p.altered {
         let Some(td) = p.table_diff(name) else { continue };
         let table = names.table(name).to_string();
-        let from = quote(&table, d);
+        let from = quote_table(&table, d);
         let col = |c: &str| format!("{from}.{}", quote(names.column(name, c), d));
         let existing = |cols: &[String]| cols.iter().all(|c| td.old.column(c).is_some());
         let mut check = |what: String, sql: String| out.push(RowCheck { table: table.clone(), what, sql });
@@ -147,7 +147,7 @@ pub fn row_checks(p: &Plan) -> Vec<RowCheck> {
             let mut conds: Vec<String> = fk.columns.iter().map(|c| format!("{} IS NOT NULL", col(c))).collect();
             // A parent made by this migration has no rows yet.
             if !p.created.contains(&fk.table) {
-                let parent = quote(names.table(&fk.table), d);
+                let parent = quote_table(names.table(&fk.table), d);
                 let matches: Vec<String> = fk
                     .columns
                     .iter()

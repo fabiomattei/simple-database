@@ -160,7 +160,7 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &m
             continue;
         }
         let iname = if origin == "u" {
-            format!("{name}_{}_key", cols.join("_"))
+            format!("{}_{}_key", unqualified(name), cols.join("_"))
         } else {
             iname
         };
@@ -673,7 +673,7 @@ mod tests {
     fn random_schemas_round_trip_through_sqlite() {
         use crate::schema::*;
         use crate::seed::Rng;
-        const NAMES: &[&str] = &["id", "name", "order", "select", "table", "index", "key", "group", "É", "two words", "MixedCase", "a\"b"];
+        const NAMES: &[&str] = &["id", "name", "order", "select", "table", "index", "key", "group", "É", "two words", "MixedCase", "a\"b", "billing.x"];
         let types = [
             DataType::Int, DataType::BigInt, DataType::SmallInt, DataType::Real, DataType::Decimal(8, 2), DataType::Bool,
             DataType::Text, DataType::Varchar(40), DataType::Date, DataType::Time, DataType::Timestamp, DataType::Blob,

@@ -1,7 +1,9 @@
 //! Working with live PostgreSQL databases: introspection and queries.
 //!
-//! Only the current schema is read: normally `public`, or the one a `schema=`
-//! URL parameter names, which `connect` puts first on the `search_path`.
+//! Only the current schema is read: normally `public`, or the schemas a
+//! `schema=` URL parameter lists (`schema=app,billing`), which `connect` makes
+//! the `search_path`. The first is the default: its tables keep plain names,
+//! the others' are qualified (`billing.invoices`).
 
 use crate::db::{Cell, QueryResult, split_statements, strip_outer_parens};
 use crate::schema::*;
@@ -15,10 +17,11 @@ use std::str::FromStr;
 
 /// Connect to a `postgres://` URL. Without a password in the URL,
 /// `PGPASSWORD` is used. TLS is set by the `crate::tls` URL parameters, and
-/// `schema=name` makes that schema the one sdb reads and writes.
-pub fn connect(url: &str) -> Result<Client> {
+/// `schema=a,b` makes those schemas the ones sdb reads and writes, `a` the
+/// default; they are returned (empty without the parameter).
+pub fn connect(url: &str) -> Result<(Client, Vec<String>)> {
     let label = crate::db::redact(url);
-    let (url, schema) = take_schema(url)?;
+    let (url, schemas) = take_schema(url)?;
     let (url, tls) = tls::split_url(&url)?;
     let mut config = postgres::Config::from_str(&url).context("invalid PostgreSQL URL")?;
     if config.get_password().is_none()
@@ -35,33 +38,52 @@ pub fn connect(url: &str) -> Result<Client> {
         }
     };
     let mut client = client.with_context(|| format!("connecting to {label}")).map_err(|e| tls::explain(e, mode))?;
-    if let Some(schema) = schema {
-        if client.query_opt("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema])?.is_none() {
+    for schema in &schemas {
+        if client.query_opt("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[schema])?.is_none() {
             bail!("schema \"{schema}\" doesn't exist in {label}");
         }
-        client.batch_execute(&format!("SET search_path TO \"{}\"", schema.replace('"', "\"\"")))?;
     }
-    Ok(client)
+    if !schemas.is_empty() {
+        let path: Vec<String> = schemas.iter().map(|s| format!("\"{}\"", s.replace('"', "\"\""))).collect();
+        client.batch_execute(&format!("SET search_path TO {}", path.join(", ")))?;
+    }
+    Ok((client, schemas))
 }
 
-/// The URL without its `schema` parameter, and the schema it named.
-fn take_schema(url: &str) -> Result<(String, Option<String>)> {
+/// The URL without its `schema` parameter, and the schemas it lists,
+/// separated by commas (`%2C` is a comma in a name).
+fn take_schema(url: &str) -> Result<(String, Vec<String>)> {
     let Some((base, query)) = url.split_once('?') else {
-        return Ok((url.to_string(), None));
+        return Ok((url.to_string(), Vec::new()));
     };
-    let mut schema = None;
+    let mut schemas = Vec::new();
     let mut rest = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         match pair.split_once('=') {
             Some(("schema", raw)) => {
-                let name = percent_encoding::percent_decode_str(raw).decode_utf8().context("invalid schema value")?;
-                schema = Some(name.into_owned()).filter(|n| !n.is_empty());
+                schemas.clear();
+                for part in raw.split(',') {
+                    let name = percent_encoding::percent_decode_str(part).decode_utf8().context("invalid schema value")?;
+                    let name = name.trim();
+                    if !name.is_empty() && !schemas.iter().any(|s| s == name) {
+                        schemas.push(name.to_string());
+                    }
+                }
             }
             _ => rest.push(pair),
         }
     }
     let url = if rest.is_empty() { base.to_string() } else { format!("{base}?{}", rest.join("&")) };
-    Ok((url, schema))
+    Ok((url, schemas))
+}
+
+/// The schemas sdb reads: those `connect` returned, or else the current one.
+pub fn read_schemas(client: &mut Client, schemas: &[String]) -> Result<Vec<String>> {
+    if !schemas.is_empty() {
+        return Ok(schemas.to_vec());
+    }
+    let current: Option<String> = client.query_one("SELECT current_schema()::text", &[])?.get(0);
+    Ok(current.into_iter().collect())
 }
 
 /// Cancel the query running on the connection `token` came from; `url` is
@@ -77,17 +99,38 @@ pub fn cancel(token: &postgres::CancelToken, url: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- introspection
 
-/// The oids of the current schema's tables, for `relid IN …`.
-const SCHEMA_TABLES: &str = "(SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                              WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p'))";
+/// `s` as a SQL string literal.
+fn literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
 
-/// The tables of the current schema. What a schema can't hold (views,
-/// functions, triggers, types, some constraints and indexes) is described in `skipped`.
-/// Each catalog is read once for all tables: one round trip per table adds up
-/// over a remote connection.
-pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Schema> {
+/// The name sdb gives `rel` (a `name` column) in namespace `ns` (a
+/// `pg_namespace` alias): plain in the default schema, else `schema.name`.
+fn qualified(ns: &str, rel: &str, default: &str) -> String {
+    format!("CASE WHEN {ns}.nspname = {default} THEN {rel}::text ELSE {ns}.nspname::text || '.' || {rel}::text END")
+}
+
+/// The tables of the schemas sdb reads (`read_schemas`; the first is the
+/// default). What a schema can't hold (views, functions, triggers, types,
+/// some constraints and indexes) is described in `skipped`. Each catalog is
+/// read once for all tables: one round trip per table adds up over a remote
+/// connection.
+pub fn introspect(client: &mut Client, schemas: &[String], skipped: &mut Vec<String>) -> Result<Schema> {
+    let schemas = read_schemas(client, schemas)?;
+    let list = format!("ARRAY[{}]::text[]", schemas.iter().map(|s| literal(s)).collect::<Vec<_>>().join(", "));
+    let default = schemas.first().map_or("NULL".to_string(), |s| literal(s));
+    // The oids of the tables read, for `relid IN …`.
+    let in_schemas = format!(
+        "(SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = ANY({list}) AND c.relkind IN ('r', 'p'))"
+    );
+    let name = |ns: &str, rel: &str| qualified(ns, rel, &default);
     let tables = client.query(
-        &format!("SELECT c.oid, c.relname::text, obj_description(c.oid, 'pg_class') FROM pg_class c WHERE c.oid IN {SCHEMA_TABLES} ORDER BY c.oid"),
+        &format!(
+            "SELECT c.oid, {}, obj_description(c.oid, 'pg_class'), c.relname::text \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid IN {in_schemas} ORDER BY c.oid",
+            name("n", "c.relname")
+        ),
         &[],
     )?;
     // The table's oid is each query's last column.
@@ -99,7 +142,7 @@ pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Sche
              (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), \
              a.attrelid \
              FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-             WHERE a.attrelid IN {SCHEMA_TABLES} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attrelid, a.attnum"
+             WHERE a.attrelid IN {in_schemas} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attrelid, a.attnum"
         ),
         7,
     )?;
@@ -107,10 +150,11 @@ pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Sche
         client,
         &format!(
             "SELECT con.contype::text, con.conname::text, {}, \
-             COALESCE((SELECT relname::text FROM pg_class WHERE oid = con.confrelid), ''), {}, \
+             COALESCE((SELECT {} FROM pg_class fc JOIN pg_namespace fn ON fn.oid = fc.relnamespace WHERE fc.oid = con.confrelid), ''), {}, \
              con.confupdtype::text, con.confdeltype::text, pg_get_constraintdef(con.oid), con.conrelid \
-             FROM pg_constraint con WHERE con.conrelid IN {SCHEMA_TABLES} ORDER BY con.conrelid, con.oid",
+             FROM pg_constraint con WHERE con.conrelid IN {in_schemas} ORDER BY con.conrelid, con.oid",
             attnames("con.conkey", "con.conrelid"),
+            name("fn", "fc.relname"),
             attnames("con.confkey", "con.confrelid")
         ),
         8,
@@ -120,7 +164,7 @@ pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Sche
         &format!(
             "SELECT i.relname::text, ix.indisunique, {}, ix.indexprs IS NULL AND ix.indpred IS NULL, ix.indrelid \
              FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
-             WHERE ix.indrelid IN {SCHEMA_TABLES} \
+             WHERE ix.indrelid IN {in_schemas} \
              AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = ix.indexrelid \
                              AND c.conrelid = ix.indrelid AND c.contype IN ('p', 'u', 'x')) \
              ORDER BY ix.indrelid, i.oid",
@@ -131,6 +175,10 @@ pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Sche
     let mut schema = Schema::default();
     for row in tables {
         let oid: u32 = row.get(0);
+        if row.get::<_, String>(3).contains('.') {
+            skipped.push(format!("table {} (a dot in its name would read as a schema)", row.get::<_, String>(1)));
+            continue;
+        }
         let mut t = build_table(
             row.get(1),
             columns.remove(&oid).unwrap_or_default(),
@@ -143,36 +191,41 @@ pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Sche
     }
     // Sequences behind identity and serial columns, and extension objects, belong to something else.
     let others = client.query(
-        "SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'f' THEN 'foreign table' \
-                ELSE 'sequence' END, c.relname::text \
+        &format!("SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'f' THEN 'foreign table' \
+                ELSE 'sequence' END, {} \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = current_schema() AND (c.relkind IN ('v', 'm', 'f') OR (c.relkind = 'S' \
+         WHERE n.nspname = ANY({list}) AND (c.relkind IN ('v', 'm', 'f') OR (c.relkind = 'S' \
            AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype IN ('a', 'i', 'e')))) \
          UNION ALL \
-         SELECT CASE t.typtype WHEN 'e' THEN 'enum type' WHEN 'd' THEN 'domain' ELSE 'range type' END, t.typname::text \
+         SELECT CASE t.typtype WHEN 'e' THEN 'enum type' WHEN 'd' THEN 'domain' ELSE 'range type' END, {} \
          FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
-         WHERE n.nspname = current_schema() AND t.typtype IN ('e', 'd', 'r') \
+         WHERE n.nspname = ANY({list}) AND t.typtype IN ('e', 'd', 'r') \
            AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e') \
            AND NOT (t.typtype = 'e' AND EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
              WHERE a.atttypid = t.oid AND NOT a.attisdropped AND c.relkind IN ('r', 'p') AND c.relnamespace = n.oid)) \
          UNION ALL \
          SELECT CASE p.prokind WHEN 'p' THEN 'procedure' WHEN 'a' THEN 'aggregate' WHEN 'w' THEN 'window function' ELSE 'function' END, \
-                p.proname::text \
+                {} \
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname = current_schema() \
+         WHERE n.nspname = ANY({list}) \
            AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e') \
          UNION ALL \
-         SELECT 'trigger', t.tgname::text || ' on ' || c.relname::text \
+         SELECT 'trigger', t.tgname::text || ' on ' || {} \
          FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = current_schema() AND NOT t.tgisinternal \
+         WHERE n.nspname = ANY({list}) AND NOT t.tgisinternal \
          UNION ALL \
-         SELECT 'schema', n.nspname::text || ' (' || count(*) || ' tables; connect with ?schema=' || n.nspname::text || ' to read it)' \
+         SELECT 'schema', n.nspname::text || ' (' || count(*) || ' tables; add it to the URL''s schema= list to read it)' \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relkind IN ('r', 'p') AND n.nspname IS DISTINCT FROM current_schema() \
+         WHERE c.relkind IN ('r', 'p') AND n.nspname <> ALL({list}) \
            AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%' \
            AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e') \
          GROUP BY n.nspname \
          ORDER BY 1, 2",
+            name("n", "c.relname"),
+            name("n", "t.typname"),
+            name("n", "p.proname"),
+            name("n", "c.relname"),
+        ),
         &[],
     )?;
     for r in others {
@@ -462,12 +515,14 @@ mod tests {
     #[test]
     fn takes_the_schema_parameter() {
         let take = |u: &str| take_schema(u).unwrap();
-        assert_eq!(take("postgres://h/db"), ("postgres://h/db".into(), None));
-        assert_eq!(take("postgres://h/db?schema=app"), ("postgres://h/db".into(), Some("app".into())));
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(take("postgres://h/db"), ("postgres://h/db".into(), vec![]));
+        assert_eq!(take("postgres://h/db?schema=app"), ("postgres://h/db".into(), names(&["app"])));
         assert_eq!(
             take("postgres://h/db?sslmode=require&schema=My%20App&application_name=x"),
-            ("postgres://h/db?sslmode=require&application_name=x".into(), Some("My App".into()))
+            ("postgres://h/db?sslmode=require&application_name=x".into(), names(&["My App"]))
         );
+        assert_eq!(take("postgres://h/db?schema=app,billing,,app,a%2Cb"), ("postgres://h/db".into(), names(&["app", "billing", "a,b"])));
     }
 
     #[test]

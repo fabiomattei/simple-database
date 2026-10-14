@@ -141,7 +141,7 @@ fn is_enum(t: &DataType) -> bool {
 
 /// Drops the Postgres type behind an enum column, if it is there.
 fn drop_enum_sql(table: &str, column: &str) -> String {
-    format!("DROP TYPE IF EXISTS {};", quote(&enum_type_name(table, column), Dialect::Postgres))
+    format!("DROP TYPE IF EXISTS {};", quote_table(&enum_type_name(table, column), Dialect::Postgres))
 }
 
 /// A rename that a `was` hint asks for.
@@ -301,7 +301,7 @@ pub fn alter_statements(td: &TableDiff, d: Dialect) -> Vec<String> {
 
 /// Statements that drop table `t`, and on Postgres the types of its enums.
 pub fn drop_table_statements(t: &Table, d: Dialect) -> Vec<String> {
-    let mut out = vec![format!("DROP TABLE {};", quote(&t.name, d))];
+    let mut out = vec![format!("DROP TABLE {};", quote_table(&t.name, d))];
     if d == Dialect::Postgres {
         out.extend(t.columns.iter().filter(|c| is_enum(&c.data_type)).map(|c| drop_enum_sql(&t.name, &c.name)));
     }
@@ -311,7 +311,11 @@ pub fn drop_table_statements(t: &Table, d: Dialect) -> Vec<String> {
 pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
     let p = plan(old, new, d);
     let mut needs_fk_off = false;
-    let mut body: Vec<String> = p.renames.iter().flat_map(|r| r.statements.clone()).collect();
+    // Schemas that tables are created or renamed into; the old ones are there already.
+    let existing = old.qualifiers();
+    let new_schemas: Vec<&Table> = new.tables.iter().filter(|t| split_qualified(&t.name).0.is_some_and(|s| !existing.contains(&s))).collect();
+    let mut body = create_schemas_sql(new_schemas.iter().map(|t| t.name.as_str()), d);
+    body.extend(p.renames.iter().flat_map(|r| r.statements.clone()));
     let created: Vec<&Table> = p.created.iter().map(|name| p.new.table(name).expect("created table")).collect();
     let forward = forward_keys(&created, d);
     for t in &created {
@@ -466,7 +470,7 @@ fn pg_constraint_names(c: &Column, table: &str, column: &str) -> Vec<String> {
         names.push(check_name(table, column));
     }
     if c.unique {
-        names.push(format!("{table}_{column}_key"));
+        names.push(unique_name(table, column));
     }
     names
 }
@@ -482,9 +486,34 @@ fn mysql_implicit_fk_index(t: &Table, columns: &[String]) -> bool {
 /// Renames a Postgres type if it exists: an enum's type may have another
 /// name when the database wasn't made by sdb.
 fn pg_rename_type(from: &str, to: &str) -> String {
+    let a = quote_table(from, Dialect::Postgres);
+    let steps = pg_move("TYPE", from, to);
+    format!("DO $$ BEGIN IF to_regtype('{}') IS NOT NULL THEN {} END IF; END $$;", a.replace('\'', "''"), steps.join(" "))
+}
+
+/// The Postgres statements that rename `kind` (`TABLE`, `TYPE`) `from` to
+/// `to`, moving it to another schema when they name different ones. A move
+/// to an unqualified name goes to the current schema, by a PL/pgSQL
+/// `EXECUTE` (the caller wraps it in `DO` where needed).
+fn pg_move(kind: &str, from: &str, to: &str) -> Vec<String> {
     let d = Dialect::Postgres;
-    let (a, b) = (quote(from, d), quote(to, d));
-    format!("DO $$ BEGIN IF to_regtype('{}') IS NOT NULL THEN ALTER TYPE {a} RENAME TO {b}; END IF; END $$;", a.replace('\'', "''"))
+    let ((from_schema, from_name), (to_schema, to_name)) = (split_qualified(from), split_qualified(to));
+    let mut at = quote_table(from, d);
+    let mut out = Vec::new();
+    if from_schema != to_schema {
+        out.push(match to_schema {
+            Some(s) => format!("ALTER {kind} {at} SET SCHEMA {};", quote(s, d)),
+            None => format!("EXECUTE format('ALTER {kind} {} SET SCHEMA %I', current_schema());", at.replace('\'', "''")),
+        });
+        at = match to_schema {
+            Some(s) => format!("{}.{}", quote(s, d), quote(from_name, d)),
+            None => quote(from_name, d),
+        };
+    }
+    if from_name != to_name {
+        out.push(format!("ALTER {kind} {at} RENAME TO {};", quote(to_name, d)));
+    }
+    out
 }
 
 /// The MySQL statements that drop the multi-column foreign key `fk` of `t`,
@@ -505,20 +534,26 @@ fn mysql_readd_fk(t: &Table, q: &str, (from, fk): (&str, &TableForeignKey), (to,
 /// and the constraints named after it.
 fn rename_table_sql(t: &Table, from: &str, d: Dialect) -> Vec<String> {
     let to = &t.name;
-    let q = quote(to, d);
-    let mut out = vec![format!("ALTER TABLE {} RENAME TO {q};", quote(from, d))];
+    let q = quote_table(to, d);
+    let mut out = match d {
+        Dialect::Postgres => pg_move("TABLE", from, to)
+            .into_iter()
+            .map(|s| if s.starts_with("EXECUTE") { format!("DO $$ BEGIN {s} END $$;") } else { s })
+            .collect(),
+        _ => vec![format!("ALTER TABLE {} RENAME TO {q};", quote(from, d))],
+    };
     match d {
         Dialect::Sqlite => {}
         Dialect::Postgres => {
             let mut names = Vec::new();
             if !t.primary_key().is_empty() {
-                names.push((format!("{from}_pkey"), format!("{to}_pkey")));
+                names.push((pkey_name(from), pkey_name(to)));
             }
             for c in &t.columns {
                 names.extend(pg_constraint_names(c, from, &c.name).into_iter().zip(pg_constraint_names(c, to, &c.name)));
             }
             names.extend(t.foreign_keys.iter().map(|fk| (table_fk_name(from, fk), table_fk_name(to, fk))));
-            for (a, b) in names {
+            for (a, b) in names.into_iter().filter(|(a, b)| a != b) {
                 out.push(format!("ALTER TABLE {q} RENAME CONSTRAINT {} TO {};", quote(&a, d), quote(&b, d)));
             }
             for c in t.columns.iter().filter(|c| is_enum(&c.data_type)) {
@@ -556,7 +591,7 @@ fn rename_table_sql(t: &Table, from: &str, d: Dialect) -> Vec<String> {
 /// to `to`. `touched` are the columns whose checks mention it.
 fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dialect) -> Vec<String> {
     let tn = &t.name;
-    let q = quote(tn, d);
+    let q = quote_table(tn, d);
     let c = t.column(to).expect("renamed column");
     let rename = format!("ALTER TABLE {q} RENAME COLUMN {} TO {};", quote(from, d), quote(to, d));
     // Multi-column foreign keys named after the column: as they were, and are now.
@@ -738,7 +773,7 @@ fn sqlite_rebuild(td: &TableDiff) -> Vec<String> {
 fn postgres_alter(td: &TableDiff) -> Vec<String> {
     let d = Dialect::Postgres;
     let tn = &td.new.name;
-    let t = quote(tn, d);
+    let t = quote_table(tn, d);
     let mut out = Vec::new();
 
     for fk in &td.dropped_fks {
@@ -748,11 +783,11 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
         out.push(drop_index_sql(tn, i, d));
     }
     for (o, n) in &td.renamed_indexes {
-        out.push(format!("ALTER INDEX {} RENAME TO {};", quote(&o.name, d), quote(&n.name, d)));
+        out.push(format!("ALTER INDEX {} RENAME TO {};", quote_in(tn, &o.name, d), quote(&n.name, d)));
     }
     // The key goes first, so its columns can change, and comes back last.
     if td.pk_changed && !td.old.primary_key().is_empty() {
-        out.push(format!("ALTER TABLE {t} DROP CONSTRAINT {};", quote(&format!("{tn}_pkey"), d)));
+        out.push(format!("ALTER TABLE {t} DROP CONSTRAINT {};", quote(&pkey_name(tn), d)));
     }
     for c in &td.dropped {
         out.push(format!("ALTER TABLE {t} DROP COLUMN {};", quote(&c.name, d)));
@@ -790,11 +825,11 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
             // Through a new type, which works whatever the old one was.
             let name = enum_type_name(tn, &n.name);
             let new = format!("{name}_new");
-            let (qname, qnew) = (quote(&name, d), quote(&new, d));
+            let (qname, qnew) = (quote_table(&name, d), quote_table(&new, d));
             out.push(create_enum_sql(&new, values));
             out.push(format!("ALTER TABLE {t} ALTER COLUMN {col} TYPE {qnew} USING {col}::text::{qnew};"));
             out.push(format!("DROP TYPE IF EXISTS {qname};"));
-            out.push(format!("ALTER TYPE {qnew} RENAME TO {qname};"));
+            out.push(format!("ALTER TYPE {qnew} RENAME TO {};", quote(unqualified(&name), d)));
         } else if o.data_type != n.data_type {
             let ty = type_sql(&n.data_type, d);
             let via = if is_enum(&o.data_type) { "::text" } else { "" };
@@ -818,7 +853,7 @@ fn postgres_alter(td: &TableDiff) -> Vec<String> {
         }
         if o.unique != n.unique {
             // Postgres names inline unique constraints <table>_<column>_key.
-            let cname = quote(&format!("{tn}_{}_key", n.name), d);
+            let cname = quote(&unique_name(tn, &n.name), d);
             if n.unique {
                 out.push(format!("ALTER TABLE {t} ADD CONSTRAINT {cname} UNIQUE ({col});"));
             } else {
@@ -1277,5 +1312,39 @@ mod tests {
             assert_eq!(db.query_value("PRAGMA foreign_keys").unwrap(), crate::db::Cell::Int(1), "foreign keys back on");
             db.execute("INSERT INTO users VALUES (3, 'cy')").expect("the connection is usable after the rollback");
         }
+    }
+
+    #[test]
+    fn creates_and_moves_tables_between_postgres_schemas() {
+        let d = Dialect::Postgres;
+        let old = parse("table users { id int pk }").unwrap();
+        let new = parse("table users { id int pk }\ntable billing.invoices { id int pk\n user_id int -> users.id\n index (user_id) }").unwrap();
+        let m = diff(&old, &new, d);
+        assert_eq!(m.statements[1], "CREATE SCHEMA IF NOT EXISTS billing;", "{}", m.script());
+        assert!(m.statements.iter().any(|s| s.starts_with("CREATE TABLE billing.invoices (")), "{}", m.script());
+        // Once the schema has tables, it isn't made again.
+        let more = parse("table users { id int pk }\ntable billing.invoices { id int pk }\ntable billing.lines { id int pk }").unwrap();
+        assert!(!diff(&new, &more, d).script().contains("CREATE SCHEMA"));
+
+        // A rename can move a table, and its enum type, to another schema.
+        let enums = parse("table users { id int pk\n role enum('a', 'b') unique }").unwrap();
+        let moved = parse("table archive.people was users { id int pk\n role enum('a', 'b') unique }").unwrap();
+        let m = diff(&enums, &moved, d);
+        let script = m.script();
+        for want in [
+            "CREATE SCHEMA IF NOT EXISTS archive;",
+            "ALTER TABLE users SET SCHEMA archive;",
+            "ALTER TABLE archive.users RENAME TO people;",
+            "ALTER TABLE archive.people RENAME CONSTRAINT users_pkey TO people_pkey;",
+            "ALTER TABLE archive.people RENAME CONSTRAINT users_role_key TO people_role_key;",
+            "ALTER TYPE users_role_enum SET SCHEMA archive; ALTER TYPE archive.users_role_enum RENAME TO people_role_enum;",
+        ] {
+            assert!(script.contains(want), "{want}\n{script}");
+        }
+        assert_eq!(m.changes, ["~ table users -> archive.people"]);
+        // Back to the default schema, whichever it is.
+        let back = diff(&moved, &parse("table people was archive.people { id int pk\n role enum('a', 'b') unique }").unwrap(), d).script();
+        assert!(back.contains("DO $$ BEGIN EXECUTE format('ALTER TABLE archive.people SET SCHEMA %I', current_schema()); END $$;"), "{back}");
+        assert!(!back.contains("RENAME CONSTRAINT"), "{back}");
     }
 }

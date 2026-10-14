@@ -1,7 +1,7 @@
 //! Rendering query results.
 
 use crate::db::{Cell, QueryResult};
-use crate::ddl::{Dialect, quote};
+use crate::ddl::{Dialect, quote, quote_table};
 use clap::ValueEnum;
 use comfy_table::{Cell as TCell, Color, ContentArrangement, Table, presets};
 
@@ -261,7 +261,7 @@ pub fn export(r: &QueryResult, format: ExportFormat, table: &str, d: Dialect) ->
         }
         ExportFormat::Sql => {
             let cols: Vec<String> = r.columns.iter().map(|c| quote(c, d)).collect();
-            let head = format!("INSERT INTO {} ({}) VALUES", quote(table, d), cols.join(", "));
+            let head = format!("INSERT INTO {} ({}) VALUES", quote_table(table, d), cols.join(", "));
             r.rows
                 .iter()
                 .map(|row| {

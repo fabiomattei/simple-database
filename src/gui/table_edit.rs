@@ -244,7 +244,7 @@ impl TableEditor {
     /// A self reference still written with the table's or a column's old name,
     /// pointed at the new ones.
     fn own_reference(&self, target: &str, name: &str) -> String {
-        let Some((table, column)) = target.split_once('.') else { return target.to_string() };
+        let Some((table, column)) = target.rsplit_once('.') else { return target.to_string() };
         if Some(table) != self.original.as_deref() && table != name {
             return target.to_string();
         }

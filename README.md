@@ -183,7 +183,7 @@ table tag_votes {
 | Referential actions | `cascade` `set_null` `set_default` `restrict` `no_action` |
 | Defaults | `'text'` `42` `true` `null` `now` `fn()` `(any sql expression)` |
 | Table level | `index [name] (a, b)` `unique index [name] (a, b)` `pk (a, b)` `fk (a, b) -> table (x, y) [on delete <a>] [on update <a>]` (or `foreign key (a, b) references table (x, y)`) |
-| Table header | `table people was users comment 'text' { ... }` (`was` and `comment` are optional) |
+| Table header | `table people was users comment 'text' { ... }` (`was` and `comment` are optional); `table billing.invoices` is in Postgres schema `billing` |
 | Comments | `# ...` or `// ...` (kept in the file only; `comment '...'` goes to the database) |
 
 * **Enums** are a native type on MySQL (`ENUM(...)`) and Postgres (a type named
@@ -196,6 +196,12 @@ table tag_votes {
 * **Comments** become Postgres `COMMENT ON`, MySQL `COMMENT`, and on SQLite a `-- comment` at the end
   of the column's line in `CREATE TABLE` (one line, since SQLite can only keep them in that text).
   `pull` reads them all back.
+* **Postgres schemas**: `table billing.invoices { ... }` is table `invoices` in schema `billing`;
+  refer to it as `-> billing.invoices.id`. Tables in the connection's default schema have no
+  prefix. Constraint and index names leave the schema out (`fk_invoices_user_id`); the enum type is
+  `billing.invoices_status_enum`. `push` creates a missing schema (`CREATE SCHEMA IF NOT EXISTS`),
+  and a rename (`table archive.invoices was billing.invoices`) moves the table with `SET SCHEMA`.
+  On SQLite and MySQL the dot is just part of the table's name.
 
 ## Commands
 
@@ -212,8 +218,13 @@ Any `SCHEMA` argument may be a `.dbs` file, **a SQLite database file or a databa
 
 Without a password in the URL, `PGPASSWORD` or `MYSQL_PWD` is used. PostgreSQL works on the
 current schema (normally `public`); add `schema=name` to the URL for another one
-(`postgres://app@localhost/app?schema=billing`, or the connection's **Options** field). `pull`
-lists the other schemas that hold tables. MySQL needs 8.0.16 or newer for check constraints.
+(`postgres://app@localhost/app?schema=billing`, or the connection's **Options** field). List
+several to pull, diff and push them together: with `schema=public,billing` the tables of `public`
+keep plain names and those of `billing` are qualified (`billing.invoices`; see
+[Postgres schemas](#the-schema-language-dbs)). The first schema listed is the default: unqualified
+names in queries resolve through all of them, in order, and new unqualified tables go there. Every
+schema listed must exist. `pull` lists the other schemas that hold tables, and `push` warns about a
+schema-qualified table in a schema the connection doesn't read. MySQL needs 8.0.16 or newer for check constraints.
 
 TLS uses the same libpq-style URL parameters for both servers:
 

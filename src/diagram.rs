@@ -27,11 +27,20 @@ fn short_type(t: &DataType) -> String {
         .collect()
 }
 
+/// A Mermaid entity name, quoted unless it is a plain word (`"billing.invoices"`).
+fn entity(name: &str) -> String {
+    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "'"))
+    }
+}
+
 fn mermaid(schema: &Schema) -> String {
     let mut out = String::from("erDiagram\n");
     for t in &schema.tables {
         let pk = t.primary_key();
-        out.push_str(&format!("    {} {{\n", t.name));
+        out.push_str(&format!("    {} {{\n", entity(&t.name)));
         for c in &t.columns {
             let mut keys = Vec::new();
             if pk.contains(&c.name) {
@@ -64,8 +73,8 @@ fn mermaid(schema: &Schema) -> String {
             let child = if matches!(cols.as_slice(), [c] if c.unique) { "o|" } else { "o{" };
             out.push_str(&format!(
                 "    {} {parent}--{child} {} : \"{}\"\n",
-                fk.table,
-                t.name,
+                entity(&fk.table),
+                entity(&t.name),
                 fk.columns.join(", ")
             ));
         }

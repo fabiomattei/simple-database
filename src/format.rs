@@ -39,13 +39,7 @@ fn format_table(t: &Table) -> String {
         out.push('\n');
     }
     for idx in &t.indexes {
-        let default_name = format!(
-            "{}_{}_{}",
-            t.name,
-            idx.columns.join("_"),
-            if idx.unique { "key" } else { "idx" }
-        );
-        let name = if idx.name == default_name { String::new() } else { format!("{} ", idx.name) };
+        let name = if idx.name == Index::default_name(&t.name, &idx.columns, idx.unique) { String::new() } else { format!("{} ", idx.name) };
         out.push_str(&format!(
             "  {}index {name}({})\n",
             if idx.unique { "unique " } else { "" },
@@ -430,6 +424,8 @@ mod tests {
             let mut schema = Schema::default();
             let table_names = names(&mut rng, 1, 3);
             for tname in table_names {
+                // A name in another schema.
+                let tname = if rng.chance(0.2) { format!("billing.{tname}") } else { tname };
                 let cols = names(&mut rng, 0, 5);
                 let inline_pk = !cols.is_empty() && rng.chance(0.4);
                 let mut columns = Vec::new();
@@ -467,7 +463,7 @@ mod tests {
                     let unique = rng.chance(0.5);
                     let columns = vec![rng.pick(&cols).clone()];
                     let name = if rng.chance(0.5) {
-                        format!("{tname}_{}_{}", columns[0], if unique { "key" } else { "idx" })
+                        Index::default_name(&tname, &columns, unique)
                     } else {
                         format!("{}_ix", rng.pick(NAMES))
                     };

@@ -1214,8 +1214,9 @@ fn completions(text: &str, cursor: usize, lang: Lang, vocab: &Vocabulary) -> (us
     let mut pool: Vec<Candidate> = Vec::new();
     let mut add = |names: &mut dyn Iterator<Item = String>, kind| pool.extend(names.map(|text| Candidate { text, kind, snippet: None }));
     if start > 0 && chars[start - 1] == '.' {
+        // The qualifier may name a schema too: `billing.invoices.`.
         let mut q = start - 1;
-        while q > 0 && is_ident(chars[q - 1]) {
+        while q > 0 && (is_ident(chars[q - 1]) || (chars[q - 1] == '.' && q > 1 && is_ident(chars[q - 2]))) {
             q -= 1;
         }
         let qualifier: String = chars[q..start - 1].iter().collect();
@@ -1228,6 +1229,10 @@ fn completions(text: &str, cursor: usize, lang: Lang, vocab: &Vocabulary) -> (us
         };
         if let Some(cols) = vocab.columns_of(&table) {
             add(&mut cols.iter().cloned(), Kind::Column);
+        } else {
+            // A schema: its tables.
+            let schema = format!("{table}.");
+            add(&mut vocab.tables.iter().filter_map(|(t, _)| t.strip_prefix(&schema).map(String::from)), Kind::Table);
         }
     } else if lang == Lang::Dbs {
         pool = dbs_candidates(&chars[..start], vocab);
@@ -1554,6 +1559,13 @@ bx");
         assert_eq!((start, names(&c)), (9, vec!["id", "title", "author_id"]));
         let (_, c) = completions("select users.na", 15, Lang::Sql, &v);
         assert_eq!(names(&c), vec!["name"]);
+        // Tables in another schema.
+        let mut v = vocab();
+        v.tables.push(("billing.invoices".into(), vec!["id".into(), "total".into()]));
+        let at = |t: &str, lang| completions(t, t.chars().count(), lang, &v).1;
+        assert_eq!(names(&at("select * from billing.in", Lang::Sql)), vec!["invoices"]);
+        assert_eq!(names(&at("select billing.invoices.to", Lang::Sql)), vec!["total"]);
+        assert_eq!(names(&at("table x {\n  i int -> billing.invoices.", Lang::Dbs)), vec!["id", "total"]);
     }
 
     #[test]

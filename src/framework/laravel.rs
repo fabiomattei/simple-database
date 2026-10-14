@@ -302,7 +302,7 @@ fn create(t: &Table, d: Dialect) -> Vec<String> {
     let checks: Vec<String> = t
         .columns
         .iter()
-        .filter_map(|c| Some(format!("ALTER TABLE {} ADD {};", quote(&t.name, d), check_sql(&t.name, &c.name, c.check.as_ref()?, d))))
+        .filter_map(|c| Some(format!("ALTER TABLE {} ADD {};", quote_table(&t.name, d), check_sql(&t.name, &c.name, c.check.as_ref()?, d))))
         .collect();
     out.extend(sql(&checks));
     out

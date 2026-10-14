@@ -9,7 +9,7 @@
 
 use crate::data::literal;
 use crate::db::{Cell, Database, is_transaction_control, statements_with_lines, strip_sql_comments};
-use crate::ddl::{self, Dialect, quote};
+use crate::ddl::{self, Dialect, quote, quote_table};
 use crate::schema::*;
 use anyhow::{Context, Result, bail};
 use std::io::Write;
@@ -74,7 +74,7 @@ pub fn dump(db: &mut Database, opts: &DumpOptions, out: &mut dyn Write) -> Resul
     }
     for t in &tables {
         let cols: Vec<String> = t.columns.iter().map(|c| quote(&c.name, d)).collect();
-        let head = format!("INSERT INTO {} ({}) VALUES", quote(&t.name, d), cols.join(", "));
+        let head = format!("INSERT INTO {} ({}) VALUES", quote_table(&t.name, d), cols.join(", "));
         let mut pages = Pages::new(t, src);
         let mut n = 0;
         while let Some(rows) = pages.next(db)? {
@@ -104,13 +104,13 @@ pub fn dump(db: &mut Database, opts: &DumpOptions, out: &mut dyn Write) -> Resul
         report.rows += n;
         if d == Dialect::Postgres {
             for c in t.columns.iter().filter(|c| c.auto_increment) {
-                let table = quote(&t.name, d).replace('\'', "''");
+                let table = quote_table(&t.name, d).replace('\'', "''");
                 let col = c.name.replace('\'', "''");
                 writeln!(
                     out,
                     "SELECT setval(pg_get_serial_sequence('{table}', '{col}'), (SELECT max({}) FROM {}));",
                     quote(&c.name, d),
-                    quote(&t.name, d)
+                    quote_table(&t.name, d)
                 )?;
             }
         }
@@ -161,7 +161,7 @@ impl<'a> Pages<'a> {
         }
         let (t, d) = (self.t, self.d);
         let cols: Vec<String> = t.columns.iter().map(|c| quote(&c.name, d)).collect();
-        let mut sql = format!("SELECT {} FROM {}", cols.join(", "), quote(&t.name, d));
+        let mut sql = format!("SELECT {} FROM {}", cols.join(", "), quote_table(&t.name, d));
         let order: Vec<String> = if self.key.is_empty() {
             t.primary_key().iter().map(|c| quote(c, d)).collect()
         } else {
@@ -269,11 +269,11 @@ pub fn restore(db: &mut Database, r: &Restore, clean: bool) -> Result<u64> {
         for t in current.tables_in_dependency_order().into_iter().rev() {
             if r.existing.contains(&t.name) {
                 let cascade = if d == Dialect::Postgres { " CASCADE" } else { "" };
-                stmts.push((format!("DROP TABLE {}{cascade}", quote(&t.name, d)), false));
+                stmts.push((format!("DROP TABLE {}{cascade}", quote_table(&t.name, d)), false));
                 // The dump creates the types of enum columns again.
                 if d == Dialect::Postgres {
                     for c in t.columns.iter().filter(|c| matches!(c.data_type, DataType::Enum(_))) {
-                        stmts.push((format!("DROP TYPE IF EXISTS {}", quote(&ddl::enum_type_name(&t.name, &c.name), d)), false));
+                        stmts.push((format!("DROP TYPE IF EXISTS {}", quote_table(&ddl::enum_type_name(&t.name, &c.name), d)), false));
                     }
                 }
             }
