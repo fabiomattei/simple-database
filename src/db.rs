@@ -1094,11 +1094,39 @@ mod tests {
         drop_all(&mut db);
         live_enums_comments_and_keys(&mut db);
         drop_all(&mut db);
+        live_cycles(&mut db);
+        drop_all(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
         if db.dialect() == Dialect::Postgres {
             let types = db.query_value("SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = current_schema() AND t.typtype = 'e'");
             assert_eq!(types.unwrap(), Cell::Int(0), "enum types left behind");
         }
+    }
+
+    /// Tables whose foreign keys form a cycle are created, dumped and restored
+    /// with rows that point both ways, and dropped (by the caller).
+    fn live_cycles(db: &mut Database) {
+        let src = "table teams { id int pk\n lead_id int -> people.id }\n\
+                   table people { id int pk\n team_id int -> teams.id\n index (team_id) }\n\
+                   table nodes { a int not null\n b int not null\n pa int\n pb int\n pk (a, b)\n \
+                   fk (pa, pb) -> nodes (a, b) }";
+        let desired = parse(src).unwrap();
+        let m = db.migration(&Schema::default(), &desired);
+        db.apply_migration(&m).unwrap_or_else(|e| panic!("{e:#}\n{}", m.script()));
+        let current = db.introspect().unwrap();
+        assert!(db.migration(&current, &desired).is_empty(), "{}", db.migration(&current, &desired).script());
+        for fw in crate::framework::Framework::ALL {
+            assert!(db.framework_migration(&current, &desired, fw, &Default::default()).is_empty(), "{fw:?}");
+        }
+        db.run("INSERT INTO teams VALUES (1, NULL); INSERT INTO people VALUES (7, 1); UPDATE teams SET lead_id = 7").unwrap();
+        let mut dump = Vec::new();
+        crate::dump::dump(db, &Default::default(), &mut dump).unwrap();
+        let dump = String::from_utf8(dump).unwrap();
+        let r = crate::dump::prepare(db, &dump).unwrap();
+        crate::dump::restore(db, &r, true).unwrap_or_else(|e| panic!("{e:#}\n{dump}"));
+        assert_eq!(db.query_value("SELECT lead_id FROM teams").unwrap(), Cell::Int(7));
+        let restored = db.introspect().unwrap();
+        assert!(db.migration(&restored, &desired).is_empty());
     }
 
     /// Enums, comments and multi-column foreign keys are created, changed and

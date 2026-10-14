@@ -46,12 +46,12 @@ fn body(p: &Plan, notes: &mut Notes) -> (Vec<String>, bool) {
             Step::RenameTable { from, to } => vec![format!("Schema::rename({}, {});", s(from), s(to))],
             Step::RenameColumn { table, from, to } => schema_block("table", table, vec![format!("$table->renameColumn({}, {});", s(from), s(to))]),
             Step::Sql(stmts) => sql(&stmts),
-            Step::Create(t) => match create_blocker(t, d) {
+            Step::Create(t) => match create_blocker(&t, d) {
                 Some(why) => {
                     note_sql(notes, &t.name, why);
-                    sql(&create_sql(t, d))
+                    sql(&create_sql(&t, d))
                 }
-                None => create(t, d),
+                None => create(&t, d),
             },
             Step::Alter(td) => match alter_blocker(&td, d) {
                 Some(why) => {

@@ -396,16 +396,70 @@ pub fn canonical(schema: &Schema, d: Dialect) -> Schema {
     Schema { tables: schema.tables.iter().map(|t| canonical_table(t, d)).collect() }
 }
 
-/// Full DDL for a schema, tables in dependency order.
-pub fn schema_sql(schema: &Schema, d: Dialect) -> String {
-    let schema = canonical(schema, d);
+/// `ALTER TABLE … ADD` a foreign key of `table`.
+pub fn add_fk_sql(table: &str, fk: &TableForeignKey, d: Dialect) -> String {
+    format!("ALTER TABLE {} ADD {};", quote(table, d), table_fk_sql(table, fk, d))
+}
+
+/// `ALTER TABLE … DROP` a foreign key of `table`.
+pub fn drop_fk_sql(table: &str, fk: &TableForeignKey, d: Dialect) -> String {
+    let what = if d == Dialect::Mysql { "FOREIGN KEY" } else { "CONSTRAINT" };
+    format!("ALTER TABLE {} DROP {what} {};", quote(table, d), quote(&table_fk_name(table, fk), d))
+}
+
+/// The foreign keys of `tables`, in creation order, that point at a table
+/// later in the list: the keys that close a cycle. Postgres and MySQL refuse
+/// a reference to a table that doesn't exist yet, so these are added once both
+/// do. SQLite accepts it: none there.
+pub fn forward_keys(tables: &[&Table], d: Dialect) -> Vec<(String, TableForeignKey)> {
+    if d == Dialect::Sqlite {
+        return Vec::new();
+    }
     let mut out = Vec::new();
-    for t in schema.tables_in_dependency_order() {
-        out.extend(create_table_statements(t, d));
+    for (i, t) in tables.iter().enumerate() {
+        for fk in t.all_foreign_keys() {
+            if tables[i + 1..].iter().any(|later| later.name == fk.table) {
+                out.push((t.name.clone(), fk));
+            }
+        }
+    }
+    out
+}
+
+/// `t` without the foreign keys in `keys` (as returned by [`forward_keys`]).
+pub fn without_keys(t: &Table, keys: &[(String, TableForeignKey)]) -> Table {
+    let mut t = t.clone();
+    let mine: Vec<&TableForeignKey> = keys.iter().filter(|(n, _)| *n == t.name).map(|(_, fk)| fk).collect();
+    for c in &mut t.columns {
+        if TableForeignKey::of_column(c).is_some_and(|fk| mine.contains(&&fk)) {
+            c.references = None;
+        }
+    }
+    t.foreign_keys.retain(|fk| !mine.contains(&fk));
+    t
+}
+
+/// The statements that create a schema: the tables with their indexes, in
+/// dependency order, then the foreign keys that close a cycle (see
+/// [`forward_keys`]), which need every table to exist.
+pub fn schema_statements(schema: &Schema, d: Dialect) -> (Vec<String>, Vec<String>) {
+    let schema = canonical(schema, d);
+    let tables = schema.tables_in_dependency_order();
+    let forward = forward_keys(&tables, d);
+    let mut out = Vec::new();
+    for t in tables {
+        out.extend(create_table_statements(&without_keys(t, &forward), d));
         for idx in &t.indexes {
             out.push(create_index_sql(&t.name, idx, d));
         }
     }
+    (out, forward.iter().map(|(t, fk)| add_fk_sql(t, fk, d)).collect())
+}
+
+/// Full DDL for a schema, tables in dependency order.
+pub fn schema_sql(schema: &Schema, d: Dialect) -> String {
+    let (mut out, keys) = schema_statements(schema, d);
+    out.extend(keys);
     out.join("\n\n") + "\n"
 }
 
@@ -416,6 +470,21 @@ mod tests {
 
     const SRC: &str = "table posts { id int pk autoincrement\n user_id int not null -> users.id on delete cascade\n published bool default false\n index (user_id) }\n\
                        table users { id int pk autoincrement\n email text unique not null\n created_at timestamp default now }";
+
+    #[test]
+    fn cycles_add_the_closing_key_last() {
+        let s = parse("table a { id int pk\n b_id int -> b.id }\ntable b { id int pk\n a_id int -> a.id\n self_id int -> b.id }").unwrap();
+        for d in [Dialect::Postgres, Dialect::Mysql] {
+            let sql = schema_sql(&s, d);
+            let fk = "FOREIGN KEY (a_id) REFERENCES a (id)";
+            let (create_b, rest) = sql.split_once("CREATE TABLE a").unwrap();
+            assert!(!create_b.contains(fk) && create_b.contains("REFERENCES b (id)"), "{sql}");
+            assert!(rest.trim_end().ends_with(&format!("ALTER TABLE b ADD CONSTRAINT fk_b_a_id {fk};")), "{sql}");
+        }
+        // SQLite takes a reference to a table that comes later.
+        let sql = schema_sql(&s, Dialect::Sqlite);
+        assert!(!sql.contains("ALTER TABLE") && sql.contains("REFERENCES a (id)"), "{sql}");
+    }
 
     #[test]
     fn sqlite_output() {

@@ -151,7 +151,8 @@ pub(crate) enum Step<'a> {
     RenameColumn { table: &'a str, from: &'a str, to: &'a str },
     /// sdb's SQL, run as it is.
     Sql(Vec<String>),
-    Create(&'a Table),
+    /// Without the foreign keys that close a cycle, which follow as `Sql`.
+    Create(Table),
     Alter(TableDiff<'a>),
     Drop(&'a Table),
 }
@@ -177,9 +178,19 @@ pub(crate) fn steps(p: &Plan, renames_constraints: bool) -> Vec<Step<'_>> {
             out.push(Step::Sql(r.statements[1..].to_vec()));
         }
     }
-    out.extend(p.created.iter().filter_map(|t| p.new.table(t)).map(Step::Create));
+    let created: Vec<&Table> = p.created.iter().filter_map(|t| p.new.table(t)).collect();
+    let forward = forward_keys(&created, p.dialect);
+    out.extend(created.iter().map(|t| Step::Create(without_keys(t, &forward))));
+    if !forward.is_empty() {
+        out.push(Step::Sql(forward.iter().map(|(t, fk)| add_fk_sql(t, fk, p.dialect)).collect()));
+    }
     out.extend(p.altered.iter().filter_map(|t| p.table_diff(t)).map(Step::Alter));
-    out.extend(p.dropped.iter().filter_map(|t| p.old.table(t)).map(Step::Drop));
+    let dropped: Vec<&Table> = p.dropped.iter().rev().filter_map(|t| p.old.table(t)).collect();
+    let cyclic = forward_keys(&dropped, p.dialect);
+    if !cyclic.is_empty() {
+        out.push(Step::Sql(cyclic.iter().map(|(t, fk)| drop_fk_sql(t, fk, p.dialect)).collect()));
+    }
+    out.extend(dropped.into_iter().rev().map(Step::Drop));
     out
 }
 

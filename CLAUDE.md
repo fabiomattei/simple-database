@@ -115,6 +115,10 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   A new column modifier also needs a field in `gui/table_edit.rs`, which writes DSL lines and parses them.
 - Foreign key constraints are named `fk_<table>_<column>` (`fk_<table>_<a>_<b>` over several
   columns). Postgres/MySQL migrations rely on that name to drop them.
+- Tables are created in dependency order. On Postgres/MySQL a key that closes a cycle
+  (`ddl::forward_keys`) is left out of its CREATE TABLE and added by `ALTER TABLE` once every
+  table exists: in `schema_sql`, `diff`, framework migrations, and after the rows in `dump`.
+  Dropping tables in a cycle drops that key first. SQLite keeps every key inline.
 - Enums (`DataType::Enum`): MySQL `ENUM(...)`; Postgres a type named `<table>_<column>_enum`
   (`ddl::enum_type_name`, created before the table by `create_table_statements`, dropped with the
   column or table, renamed with them, replaced through `<name>_new` when the values change); SQLite

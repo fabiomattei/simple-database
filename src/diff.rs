@@ -302,18 +302,23 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
     let p = plan(old, new, d);
     let mut needs_fk_off = false;
     let mut body: Vec<String> = p.renames.iter().flat_map(|r| r.statements.clone()).collect();
-    for name in &p.created {
-        let t = p.new.table(name).expect("created table");
-        body.extend(create_table_statements(t, d));
+    let created: Vec<&Table> = p.created.iter().map(|name| p.new.table(name).expect("created table")).collect();
+    let forward = forward_keys(&created, d);
+    for t in &created {
+        body.extend(create_table_statements(&without_keys(t, &forward), d));
         for idx in &t.indexes {
             body.push(create_index_sql(&t.name, idx, d));
         }
     }
+    body.extend(forward.iter().map(|(t, fk)| add_fk_sql(t, fk, d)));
     for name in &p.altered {
         let td = p.table_diff(name).expect("altered table");
         needs_fk_off |= d == Dialect::Sqlite && sqlite_needs_rebuild(&td);
         body.extend(alter_statements(&td, d));
     }
+    // Tables in a cycle can't be dropped while the other still points at them.
+    let dropped: Vec<&Table> = p.dropped.iter().rev().map(|name| p.old.table(name).expect("dropped table")).collect();
+    body.extend(forward_keys(&dropped, d).iter().map(|(t, fk)| drop_fk_sql(t, fk, d)));
     for name in &p.dropped {
         body.extend(drop_table_statements(p.old.table(name).expect("dropped table"), d));
     }
@@ -975,6 +980,24 @@ mod tests {
 
     const OLD: &str = "table users { id int pk autoincrement\n name text\n legacy text }\n table logs { id int pk }";
     const NEW: &str = "table users { id int pk autoincrement\n name text not null default ''\n email text\n index (email) }\n table posts { id int pk\n user_id int -> users.id }";
+
+    #[test]
+    fn cycles_are_created_and_dropped_in_two_steps() {
+        let cyc = parse("table a { id int pk\n b_id int -> b.id }\ntable b { id int pk\n a_id int -> a.id }\ntable c { id int pk }").unwrap();
+        let empty = Schema::default();
+        let pg = diff(&empty, &cyc, Dialect::Postgres).statements;
+        let add = pg.iter().position(|s| s == "ALTER TABLE b ADD CONSTRAINT fk_b_a_id FOREIGN KEY (a_id) REFERENCES a (id);").unwrap();
+        assert!(pg.iter().rposition(|s| s.starts_with("CREATE TABLE")).unwrap() < add, "{pg:#?}");
+        let pg = diff(&cyc, &empty, Dialect::Postgres).statements;
+        assert_eq!(pg[1], "ALTER TABLE b DROP CONSTRAINT fk_b_a_id;", "{pg:#?}");
+        let my = diff(&cyc, &empty, Dialect::Mysql).statements;
+        assert_eq!(my[0], "ALTER TABLE b DROP FOREIGN KEY fk_b_a_id;", "{my:#?}");
+        // Dropping only one table of the cycle drops the other's key through its diff.
+        let only_a = parse("table a { id int pk\n b_id int }\ntable c { id int pk }").unwrap();
+        assert!(!diff(&cyc, &only_a, Dialect::Postgres).statements.iter().any(|s| s.contains("DROP CONSTRAINT fk_b")));
+        let sqlite = diff(&empty, &cyc, Dialect::Sqlite).script();
+        assert!(!sqlite.contains("ALTER TABLE"), "{sqlite}");
+    }
 
     #[test]
     fn identical_schemas_produce_no_changes() {

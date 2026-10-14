@@ -55,11 +55,20 @@ pub fn dump(db: &mut Database, opts: &DumpOptions, out: &mut dyn Write) -> Resul
     writeln!(out, "-- sdb dump of {}", db.label())?;
     writeln!(out, "-- dialect: {}, {} table(s)", dialect_name(d), tables.len())?;
     writeln!(out, "-- restore with: sdb restore FILE --db TARGET")?;
+    // Foreign keys that close a cycle come after the rows, which may need them off.
+    let (create, cyclic) = ddl::schema_statements(&schema, d);
     if !opts.data_only {
-        writeln!(out, "\n{}", ddl::schema_sql(&schema, d).trim_end())?;
+        writeln!(out, "\n{}", create.join("\n\n"))?;
     }
     let mut report = DumpReport { tables: tables.len(), rows: 0 };
+    let keys = |out: &mut dyn Write| -> Result<()> {
+        if !opts.data_only && !cyclic.is_empty() {
+            writeln!(out, "\n{}", cyclic.join("\n"))?;
+        }
+        Ok(())
+    };
     if opts.schema_only {
+        keys(out)?;
         return Ok(report);
     }
     for t in &tables {
@@ -99,6 +108,7 @@ pub fn dump(db: &mut Database, opts: &DumpOptions, out: &mut dyn Write) -> Resul
             }
         }
     }
+    keys(out)?;
     Ok(report)
 }
 

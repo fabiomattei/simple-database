@@ -243,7 +243,7 @@ certificate comes from a private CA, pass it with `sslrootcert`:
 | `sdb check SCHEMA` | Validate, and lint the design: missing primary keys, unindexed foreign keys, FK type mismatches, `SET NULL` on `NOT NULL` columns, etc. |
 | `sdb check [SCHEMA] --db app.db [--sample 5]` | Find rows whose foreign key points at a row that doesn't exist (see below) |
 | `sdb fmt SCHEMA [-w]` | Reformat with aligned columns |
-| `sdb sql SCHEMA -d sqlite\|postgres\|mysql` | Generate DDL (tables in dependency order) |
+| `sdb sql SCHEMA -d sqlite\|postgres\|mysql` | Generate DDL (tables in dependency order; on Postgres/MySQL a foreign key cycle is closed with `ALTER TABLE` at the end) |
 | `sdb diagram SCHEMA -f mermaid\|dot` | ER diagram: paste Mermaid into GitHub/GitLab markdown, or `\| dot -Tsvg > er.svg` |
 | `sdb diff FROM TO -d DIALECT [-o file]` | Summary of changes + migration SQL |
 | `sdb diff FROM TO -d DIALECT -f laravel\|rails [--name NAME] [--rails-version 8.0] [-o dir]` | The same changes as a Laravel or Rails migration (see [Framework migrations](#framework-migrations)) |
