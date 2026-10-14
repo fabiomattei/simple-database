@@ -10,7 +10,7 @@ use crate::safety::{self, Kind, SafeMode};
 use crate::schema::*;
 use crate::{mysqldb, pg, sqlite};
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +31,8 @@ pub struct Database {
     tls_warning: Option<String>,
     /// Postgres: the schemas a `schema=` URL parameter lists, the default first.
     pg_schemas: Vec<String>,
+    /// The database's own functions that may write (see [`Database::writing_functions`]).
+    writing_functions: HashSet<String>,
 }
 
 /// Stops what a [`Database`] is running, from another thread.
@@ -123,6 +125,7 @@ impl Database {
         let mut db = Database::new(conn, label, via);
         db.tls_warning = crate::tls::warning(target);
         db.pg_schemas = pg_schemas;
+        db.load_writing_functions();
         Ok(db)
     }
 
@@ -133,7 +136,7 @@ impl Database {
 
     fn new(conn: Conn, label: String, via: CancelVia) -> Database {
         let cancel = Arc::new(Canceller { requested: AtomicBool::new(false), via });
-        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel, tls_warning: None, pg_schemas: Vec::new() }
+        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel, tls_warning: None, pg_schemas: Vec::new(), writing_functions: HashSet::new() }
     }
 
     /// Set when the server's identity isn't verified (see [`crate::tls::warning`]).
@@ -186,7 +189,37 @@ impl Database {
 
     /// The statements in `sql` the safe mode wants confirmed before they run.
     pub fn needs_confirmation(&self, sql: &str) -> Vec<(String, Kind)> {
-        self.safe_mode.confirmations(sql)
+        self.safe_mode.confirmations(sql, &self.writing_functions)
+    }
+
+    /// Lowercased names of the database's own functions that may write, so
+    /// that `SELECT f()` asks for confirmation like any write: Postgres
+    /// volatile functions outside the system and extensions, MySQL stored
+    /// functions not declared `NO SQL` or `READS SQL DATA`. Read on connect,
+    /// on introspection and after SQL that mentions a function. Read-only
+    /// mode doesn't use them: the server's read-only session stops their
+    /// writes, and most of them (volatile being Postgres' default) only read.
+    pub fn writing_functions(&self) -> &HashSet<String> {
+        &self.writing_functions
+    }
+
+    /// Re-read [`Database::writing_functions`]; on failure keep the last list.
+    fn load_writing_functions(&mut self) {
+        let found = match &mut self.conn {
+            Conn::Sqlite(_) => return,
+            Conn::Postgres(c) => pg::writing_functions(c),
+            Conn::Mysql(c) => mysqldb::writing_functions(c),
+        };
+        if let Ok(names) = found {
+            self.writing_functions = names;
+        }
+    }
+
+    /// After running `sql`: re-read the writing functions if it may have created, changed or dropped one.
+    fn after_run(&mut self, sql: &str) {
+        if self.dialect() != Dialect::Sqlite && safety::words(sql).iter().any(|w| w == "function") {
+            self.load_writing_functions();
+        }
     }
 
     /// Whether the safe mode wants writes confirmed (any write, not just dangerous ones).
@@ -235,6 +268,7 @@ impl Database {
     /// kinds sdb doesn't model (e.g. `view active_users`).
     pub fn introspect_with_skipped(&mut self) -> Result<(Schema, Vec<String>)> {
         let mut skipped = Vec::new();
+        self.load_writing_functions();
         let schema = match &mut self.conn {
             Conn::Sqlite(c) => return sqlite::introspect(c, &mut skipped).map(|s| (s, skipped)),
             Conn::Postgres(c) => pg::introspect(c, &self.pg_schemas, &mut skipped)?,
@@ -252,11 +286,13 @@ impl Database {
     /// Like [`Database::run`], but keep at most `max_rows` rows of each result set.
     pub fn run_limited(&mut self, sql: &str, max_rows: usize) -> Result<Vec<QueryResult>> {
         self.guard(sql)?;
-        match &mut self.conn {
+        let results = match &mut self.conn {
             Conn::Sqlite(c) => sqlite::run_limited(c, sql, max_rows),
             Conn::Postgres(c) => pg::run_limited(c, sql, max_rows),
             Conn::Mysql(c) => mysqldb::run_limited(c, sql, max_rows),
-        }
+        };
+        self.after_run(sql);
+        results
     }
 
     /// Execute statements, discarding any rows.
@@ -267,6 +303,7 @@ impl Database {
             Conn::Postgres(c) => c.batch_execute(sql)?,
             Conn::Mysql(c) => mysql::prelude::Queryable::query_drop(c.as_mut(), sql)?,
         }
+        self.after_run(sql);
         Ok(())
     }
 
@@ -1026,6 +1063,51 @@ mod tests {
                 assert!(res.is_err(), "{var}: {res:?}");
             }
             assert!(started.elapsed() < std::time::Duration::from_secs(10), "{var} was not cancelled");
+        }
+    }
+
+    /// A user function that may write asks for confirmation; one declared read-only doesn't.
+    /// Only the declarations matter, so no table is needed (other live tests drop every table).
+    #[test]
+    fn server_functions_that_write_need_confirmation() {
+        let setup: [(&str, &[&str], &[&str]); 2] = [
+            (
+                "SDB_TEST_POSTGRES",
+                &[
+                    "CREATE OR REPLACE FUNCTION sdb_fn_logs() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+                    "CREATE OR REPLACE FUNCTION \"Sdb_Fn_Reads\"() RETURNS int LANGUAGE sql STABLE AS 'SELECT 1'",
+                ],
+                &["DROP FUNCTION sdb_fn_logs()", "DROP FUNCTION \"Sdb_Fn_Reads\"()"],
+            ),
+            (
+                "SDB_TEST_MYSQL",
+                &[
+                    "DROP FUNCTION IF EXISTS sdb_fn_logs",
+                    "DROP FUNCTION IF EXISTS Sdb_Fn_Reads",
+                    // DETERMINISTIC: binary logging refuses a function without it.
+                    "CREATE FUNCTION sdb_fn_logs() RETURNS int DETERMINISTIC MODIFIES SQL DATA RETURN 1",
+                    "CREATE FUNCTION Sdb_Fn_Reads() RETURNS int DETERMINISTIC READS SQL DATA RETURN 1",
+                ],
+                &["DROP FUNCTION sdb_fn_logs", "DROP FUNCTION Sdb_Fn_Reads"],
+            ),
+        ];
+        for (var, create, drop) in setup {
+            let Ok(url) = std::env::var(var) else { continue };
+            let mut db = Database::open(&url).unwrap();
+            for sql in create {
+                db.execute(sql).unwrap();
+            }
+            assert!(db.writing_functions().contains("sdb_fn_logs"), "{var}: {:?}", db.writing_functions());
+            assert!(!db.writing_functions().contains("sdb_fn_reads"), "{var}");
+            assert!(!db.writing_functions().contains("now"), "{var}: system functions are left out");
+            db.set_safe_mode(SafeMode::Confirm).unwrap();
+            assert_eq!(db.needs_confirmation("SELECT sdb_fn_logs()").len(), 1, "{var}");
+            assert!(db.needs_confirmation("SELECT Sdb_Fn_Reads(), now()").is_empty(), "{var}");
+            db.set_safe_mode(SafeMode::Off).unwrap();
+            for sql in drop {
+                db.execute(sql).unwrap();
+            }
+            assert!(!db.writing_functions().contains("sdb_fn_logs"), "{var}: re-read after DROP FUNCTION");
         }
     }
 

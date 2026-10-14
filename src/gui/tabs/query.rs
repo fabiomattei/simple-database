@@ -260,7 +260,7 @@ impl App {
     /// Run the editor's SQL, asking first if the connection's safe mode wants it.
     fn request_run(&mut self) {
         let Some(db) = &self.db else { return };
-        let asks = db.safe_mode.confirmations(&self.query);
+        let asks = db.safe_mode.confirmations(&self.query, &db.writing_functions);
         if asks.is_empty() {
             self.run_query();
         } else {
@@ -300,9 +300,12 @@ impl App {
                     elapsed_ms: elapsed.as_secs_f64() * 1000.0,
                     error: results.as_ref().err().cloned(),
                 };
-                (results, elapsed, entry)
+                (results, elapsed, entry, conn.writing_functions().clone())
             },
-            |app, (results, elapsed, entry)| {
+            |app, (results, elapsed, entry, writing_functions)| {
+                if let Some(db) = &mut app.db {
+                    db.writing_functions = writing_functions;
+                }
                 let wrote = results.as_ref().is_ok_and(|rs| rs.iter().any(|r| r.changes.is_some()));
                 // Show the last statement that returned rows, else the last one.
                 let selected = results.as_ref().map_or(0, |rs| {

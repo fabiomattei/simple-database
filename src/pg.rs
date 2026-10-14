@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::tls::{self, SslMode};
 use postgres::config::SslMode as PgSslMode;
 use postgres::{Client, NoTls, Row, SimpleQueryMessage, types::Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use std::str::FromStr;
 
@@ -108,6 +108,19 @@ fn literal(s: &str) -> String {
 /// `pg_namespace` alias): plain in the default schema, else `schema.name`.
 fn qualified(ns: &str, rel: &str, default: &str) -> String {
     format!("CASE WHEN {ns}.nspname = {default} THEN {rel}::text ELSE {ns}.nspname::text || '.' || {rel}::text END")
+}
+
+/// The lowercased names of the database's own functions that may write, in
+/// any schema: volatile ones (Postgres refuses writes in a stable or
+/// immutable function), leaving out the system's and extensions'.
+pub fn writing_functions(client: &mut Client) -> Result<HashSet<String>> {
+    let rows = client.query(
+        "SELECT DISTINCT lower(p.proname::text) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.provolatile = 'v' AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e')",
+        &[],
+    )?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
 /// The tables of the schemas sdb reads (`read_schemas`; the first is the

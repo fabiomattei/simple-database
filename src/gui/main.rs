@@ -34,7 +34,7 @@ use simple_database::seed::{self, TableReport};
 use simple_database::sqlite;
 use simple_database::validate::{self, Issue};
 use simple_database::{format, STARTER_SCHEMA};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -258,6 +258,8 @@ struct Db {
     dialect: Dialect,
     /// Mirrors the connection's mode (which is what refuses writes), to ask the user.
     safe_mode: SafeMode,
+    /// Mirrors `Database::writing_functions`, for the confirmations.
+    writing_functions: HashSet<String>,
     schema: Schema,
     /// What the schema leaves out (views, triggers, …), for Pull.
     skipped: Vec<String>,
@@ -697,6 +699,7 @@ impl App {
         let Opened { conn, schema, skipped, counts } = opened;
         let (label, dialect, safe_mode) = (conn.label().to_string(), conn.dialect(), conn.safe_mode());
         let tls_warning = conn.tls_warning().map(str::to_string);
+        let writing_functions = conn.writing_functions().clone();
         match &tls_warning {
             Some(w) => self.set_status(format!("Connected to {label}, but {w}"), true),
             None => self.set_status(format!("Connected to {label}"), false),
@@ -719,7 +722,7 @@ impl App {
         self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None });
+        self.db = Some(Db { worker, label, dialect, safe_mode, writing_functions, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;
@@ -818,12 +821,13 @@ impl App {
             |conn| {
                 let (schema, skipped) = conn.introspect_with_skipped()?;
                 let counts = conn.row_counts(&schema)?;
-                anyhow::Ok((schema, skipped, counts))
+                anyhow::Ok((schema, skipped, counts, conn.writing_functions().clone()))
             },
             |app, res| {
                 let Some(db) = &mut app.db else { return };
                 match res {
-                    Ok((schema, skipped, counts)) => {
+                    Ok((schema, skipped, counts, writing_functions)) => {
+                        db.writing_functions = writing_functions;
                         if schema != db.schema {
                             db.migration = None;
                             db.framework_migration = None;

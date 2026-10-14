@@ -97,7 +97,7 @@ impl App {
             self.set_status(format!("{} has no SQL statements", path.display()), true);
             return;
         }
-        let asks = db.safe_mode.confirmations(&sql).into_iter().map(|(s, k)| (s, if let simple_database::safety::Kind::Dangerous(why) = k { Some(why) } else { None }))
+        let asks = db.safe_mode.confirmations(&sql, &db.writing_functions).into_iter().map(|(s, k)| (s, if let simple_database::safety::Kind::Dangerous(why) = k { Some(why) } else { None }))
             .collect();
         self.dialog = Some(Dialog::RunScript(Box::new(ScriptState {
             path,

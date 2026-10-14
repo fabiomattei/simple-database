@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use mysql::consts::ColumnType;
 use mysql::prelude::Queryable;
 use crate::tls::{self, SslMode};
+use std::collections::HashSet;
 use mysql::{ClientIdentity, Conn, DriverError, Opts, OptsBuilder, SslOpts, Value};
 
 /// Character set number MySQL reports for binary data.
@@ -64,6 +65,18 @@ pub fn cancel(url: &str, id: u32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- introspection
+
+/// The lowercased names of the stored functions that may write, in any
+/// database: all but those declared `NO SQL` or `READS SQL DATA` (MySQL
+/// takes the declaration on trust).
+pub fn writing_functions(conn: &mut Conn) -> Result<HashSet<String>> {
+    let names: Vec<String> = conn.query(
+        "SELECT DISTINCT LOWER(ROUTINE_NAME) FROM information_schema.ROUTINES WHERE ROUTINE_TYPE = 'FUNCTION' \
+         AND ROUTINE_SCHEMA NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema') \
+         AND SQL_DATA_ACCESS NOT IN ('NO SQL', 'READS SQL DATA')",
+    )?;
+    Ok(names.into_iter().collect())
+}
 
 /// The tables of the database. What a schema can't hold (views, triggers,
 /// routines, events, some keys, checks and indexes) is described in `skipped`.

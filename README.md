@@ -319,8 +319,12 @@ Each saved connection has a safe mode, set in the app or with `sdb conn add --sa
 
 A statement counts as a write by what it calls too: `SELECT nextval(...)`, `setval`, `lo_import`,
 `load_extension` and other built-in functions that write are writes, and `pg_terminate_backend`,
-`pg_cancel_backend` or `lo_unlink` are dangerous. Functions you wrote yourself can't be told apart
-from reads; in `read-only` mode the server stops them.
+`pg_cancel_backend` or `lo_unlink` are dangerous, also when the name is quoted. So are calls to the
+database's own functions that may write: on PostgreSQL every `VOLATILE` function (the default) outside
+the system schemas and extensions, on MySQL every stored function not declared `NO SQL` or
+`READS SQL DATA`. Declare a function `STABLE` / `READS SQL DATA` and `confirm` stops asking about it.
+sdb reads the list on connect, when it reads the schema and after SQL that mentions a function.
+`read-only` mode doesn't refuse these calls: the server's read-only session stops whatever they write.
 
 The app shows the mode under the database name and asks in a dialog that lists the statements.
 The CLI asks on the terminal; `-y` answers yes. `push` always asks unless `-y`.

@@ -3,6 +3,7 @@
 
 use crate::db::split_statements;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// How careful to be with a connection, set per saved connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
@@ -45,12 +46,14 @@ impl SafeMode {
         matches!((self, kind), (SafeMode::Warn, Kind::Dangerous(_)) | (SafeMode::Confirm, Kind::Write | Kind::Dangerous(_)))
     }
 
-    /// The statements in `sql` this mode wants confirmed before they run.
-    pub fn confirmations(self, sql: &str) -> Vec<(String, Kind)> {
+    /// The statements in `sql` this mode wants confirmed before they run;
+    /// `writers` are the database's own functions that may write
+    /// (`Database::writing_functions`).
+    pub fn confirmations(self, sql: &str, writers: &HashSet<String>) -> Vec<(String, Kind)> {
         if !matches!(self, SafeMode::Warn | SafeMode::Confirm) {
             return vec![];
         }
-        classify_all(sql).into_iter().filter(|(_, k)| self.asks(k)).collect()
+        classify_all_with(sql, writers).into_iter().filter(|(_, k)| self.asks(k)).collect()
     }
 }
 
@@ -78,7 +81,7 @@ const READ_PRAGMAS: [&str; 9] = [
 ];
 
 /// Functions that write, or act on the server, from inside any statement, a SELECT included.
-/// Functions the user wrote can write too; only the server's read-only mode stops those.
+/// Functions the user wrote can write too: [`classify_with`] takes their names from the database.
 const WRITING_FUNCTIONS: [&str; 24] = [
     // Postgres
     "nextval", "setval", "lo_import", "lo_export", "lo_create", "lo_creat", "lo_from_bytea", "lo_put",
@@ -103,22 +106,33 @@ const DANGEROUS_FUNCTIONS: [(&str, &str); 6] = [
 /// Classify one statement. Unknown statements count as writes. A function
 /// call that writes makes a read a write; a dangerous one makes anything dangerous.
 pub fn classify(stmt: &str) -> Kind {
+    classify_with(stmt, &HashSet::new())
+}
+
+/// Like [`classify`], also counting a call to one of `writers` (lowercased
+/// names of the database's own functions that may write) as a write.
+pub fn classify_with(stmt: &str, writers: &HashSet<String>) -> Kind {
     let scanned = scan(stmt);
-    let kind = classify_scanned(stmt, &scanned);
-    let calls = scanned.iter().filter(|s| stmt[s.at..].trim_start_matches(|c: char| c.is_alphanumeric() || c == '_').trim_start().starts_with('('));
+    let kind = classify_scanned(stmt, &scanned, writers);
     let mut writes = false;
-    for call in calls {
-        let name = call.text.as_str();
+    for name in calls(stmt) {
+        let name = name.as_str();
         if let Some((_, why)) = DANGEROUS_FUNCTIONS.iter().find(|(f, _)| *f == name) {
             return Kind::Dangerous(format!("{name}() {why}"));
         }
         // Postgres `pg_stat_reset`, `pg_stat_reset_shared`, … clear statistics.
-        writes |= WRITING_FUNCTIONS.contains(&name) || name.starts_with("pg_stat_reset");
+        writes |= WRITING_FUNCTIONS.contains(&name) || name.starts_with("pg_stat_reset") || name == "set_config" || writers.contains(name);
     }
     if writes && kind == Kind::Read { Kind::Write } else { kind }
 }
 
-fn classify_scanned(stmt: &str, scanned: &[Word]) -> Kind {
+/// The lowercased names of the functions `stmt` calls, quoted ones included;
+/// a qualified `s.f(…)` gives `f`.
+fn calls(stmt: &str) -> Vec<String> {
+    scan_with(stmt, true).into_iter().filter(|w| stmt[w.end..].trim_start().starts_with('(')).map(|w| w.text).collect()
+}
+
+fn classify_scanned(stmt: &str, scanned: &[Word], writers: &HashSet<String>) -> Kind {
     let w: Vec<&str> = scanned.iter().map(|s| s.text.as_str()).collect();
     let has = |x: &str| w.contains(&x);
     // A WHERE in a subquery doesn't limit an UPDATE or DELETE.
@@ -126,7 +140,7 @@ fn classify_scanned(stmt: &str, scanned: &[Word]) -> Kind {
     // The statement a WITH or EXPLAIN ANALYZE wraps, classified on its own.
     let wrapped = || {
         let main = scanned.iter().skip(1).find(|s| s.depth == 0 && STATEMENTS.contains(&s.text.as_str()));
-        main.map(|s| classify(&stmt[s.at..]))
+        main.map(|s| classify_with(&stmt[s.at..], writers))
     };
     // `READ WRITE` or a `*_read_only` setting would lift the server-side read-only mode.
     let lifts_read_only = w.windows(2).any(|p| p == ["read", "write"]) || w.iter().any(|x| x.ends_with("read_only"));
@@ -173,8 +187,13 @@ fn classify_scanned(stmt: &str, scanned: &[Word]) -> Kind {
 
 /// The statements in `sql` with their kinds.
 pub fn classify_all(sql: &str) -> Vec<(String, Kind)> {
+    classify_all_with(sql, &HashSet::new())
+}
+
+/// [`classify_all`] with [`classify_with`].
+pub fn classify_all_with(sql: &str, writers: &HashSet<String>) -> Vec<(String, Kind)> {
     split_statements(sql).into_iter().map(|s| {
-        let k = classify(&s);
+        let k = classify_with(&s, writers);
         (s, k)
     }).collect()
 }
@@ -184,14 +203,20 @@ pub(crate) fn words(stmt: &str) -> Vec<String> {
     scan(stmt).into_iter().map(|w| w.text).collect()
 }
 
-/// A word of a statement, with how deep in parentheses it is and its byte offset.
+/// A word of a statement, with how deep in parentheses it is and its byte range.
 pub(crate) struct Word {
     pub(crate) text: String,
     pub(crate) depth: usize,
     pub(crate) at: usize,
+    pub(crate) end: usize,
 }
 
 pub(crate) fn scan(stmt: &str) -> Vec<Word> {
+    scan_with(stmt, false)
+}
+
+/// [`scan`], with `quoted` also giving `"quoted"` and `` `quoted` `` identifiers as words.
+fn scan_with(stmt: &str, quoted: bool) -> Vec<Word> {
     let chars: Vec<(usize, char)> = stmt.char_indices().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -200,7 +225,8 @@ pub(crate) fn scan(stmt: &str) -> Vec<Word> {
     let mut i = 0;
     let flush = |cur: &mut String, out: &mut Vec<Word>, start: usize, depth: usize| {
         if !cur.is_empty() {
-            out.push(Word { text: std::mem::take(cur).to_ascii_lowercase(), depth, at: start });
+            let end = start + cur.len();
+            out.push(Word { text: std::mem::take(cur).to_ascii_lowercase(), depth, at: start, end });
         }
     };
     while i < chars.len() {
@@ -224,6 +250,7 @@ pub(crate) fn scan(stmt: &str) -> Vec<Word> {
         }
         if matches!(c, '\'' | '"' | '`') {
             flush(&mut cur, &mut out, start, depth);
+            let mut name = String::new();
             i += 1;
             while i < chars.len() {
                 if chars[i].1 == '\\' && c == '\'' {
@@ -232,14 +259,20 @@ pub(crate) fn scan(stmt: &str) -> Vec<Word> {
                 }
                 if chars[i].1 == c {
                     if chars.get(i + 1).map(|&(_, c)| c) == Some(c) {
+                        name.push(c);
                         i += 2;
                         continue;
                     }
                     break;
                 }
+                name.push(chars[i].1);
                 i += 1;
             }
             i += 1;
+            if quoted && c != '\'' {
+                let end = chars.get(i).map_or(stmt.len(), |&(at, _)| at);
+                out.push(Word { text: name.to_lowercase(), depth, at, end });
+            }
             continue;
         }
         if c.is_alphanumeric() || c == '_' {
@@ -333,7 +366,11 @@ mod tests {
         dangerous("INSERT INTO t SELECT lo_unlink(oid) FROM l");
         dangerous("select 1 where PG_CANCEL_BACKEND(42)");
         read("SELECT nextval FROM t");
-        read("SELECT 'nextval(1)', \"setval\"(x) FROM t");
+        read("SELECT 'nextval(1)', \"setval\" FROM t");
+        // A quoted name is still a call.
+        write("SELECT \"nextval\"('s')");
+        write("SELECT pg_catalog.\"setval\" ('s', 1)");
+        write("SELECT `SET_CONFIG`('transaction_read_only', 'off', true)");
         read("SELECT currval('s'), pg_stat_get_live_tuples(1)");
 
         // Pragmas set with the call form too.
@@ -378,6 +415,22 @@ mod tests {
     }
 
     #[test]
+    fn functions_the_database_says_write_are_writes() {
+        let writers: HashSet<String> = ["audit_touch".to_string(), "mixedcase".to_string()].into();
+        let with = |s: &str| classify_with(s, &writers);
+        assert_eq!(with("SELECT audit_touch(1)"), Kind::Write);
+        assert_eq!(with("select app.AUDIT_TOUCH(id) from t"), Kind::Write);
+        assert_eq!(with(r#"SELECT "app"."MixedCase"()"#), Kind::Write);
+        assert_eq!(with("WITH x AS (SELECT audit_touch(1)) SELECT * FROM x"), Kind::Write);
+        assert_eq!(with("SELECT audit_touch FROM t"), Kind::Read);
+        assert_eq!(with("SELECT 'audit_touch()' FROM t"), Kind::Read);
+        assert_eq!(with("SELECT other(1)"), Kind::Read);
+        assert_eq!(classify("SELECT audit_touch(1)"), Kind::Read);
+        assert_eq!(SafeMode::Confirm.confirmations("SELECT audit_touch(1); SELECT 1", &writers).len(), 1);
+        assert!(SafeMode::Confirm.confirmations("SELECT audit_touch(1)", &HashSet::new()).is_empty());
+    }
+
+    #[test]
     fn words_skip_comments_and_quotes() {
         assert_eq!(words("Select a, 'b c' FROM \"D e\" -- f\n/* g */ WHERE `h` = 1"), ["select", "a", "from", "where", "1"]);
         assert_eq!(words(r"SELECT 'it\'s' , x"), ["select", "x"]);
@@ -391,10 +444,11 @@ mod tests {
     #[test]
     fn confirmations_follow_the_mode() {
         let sql = "SELECT 1; INSERT INTO t VALUES (1); DELETE FROM t";
-        assert!(SafeMode::Off.confirmations(sql).is_empty());
-        assert!(SafeMode::ReadOnly.confirmations(sql).is_empty());
-        assert_eq!(SafeMode::Warn.confirmations(sql).len(), 1);
-        assert_eq!(SafeMode::Confirm.confirmations(sql).len(), 2);
+        let none = HashSet::new();
+        assert!(SafeMode::Off.confirmations(sql, &none).is_empty());
+        assert!(SafeMode::ReadOnly.confirmations(sql, &none).is_empty());
+        assert_eq!(SafeMode::Warn.confirmations(sql, &none).len(), 1);
+        assert_eq!(SafeMode::Confirm.confirmations(sql, &none).len(), 2);
     }
 
     #[test]
