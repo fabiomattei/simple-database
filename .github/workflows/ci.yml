@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The live round-trip tests drop every table in these scratch databases.
+  SDB_TEST_POSTGRES: postgres://sdb:sdb@localhost:5432/sdb
+  SDB_TEST_MYSQL: mysql://sdb:sdb@127.0.0.1:3306/sdb
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sdb
+          POSTGRES_PASSWORD: sdb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sdb"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: sdb
+          MYSQL_USER: sdb
+          MYSQL_PASSWORD: sdb
+          MYSQL_DATABASE: sdb
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -psdb"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests (SQLite, PostgreSQL, MySQL)
+        run: cargo test

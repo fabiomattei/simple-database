@@ -393,9 +393,14 @@ desktop app: `main.rs` (window, tabs), `er.rs` (diagram canvas), `grid.rs` (resu
 `diff.rs`, `diagram.rs`, `format.rs`; `seed.rs` (fake data); `db.rs` (live connections), which
 dispatches to `sqlite.rs`, `pg.rs` and `mysqldb.rs` (introspection & queries); `shell.rs`, `output.rs`.
 
-The PostgreSQL and MySQL round-trip tests run only when they get a scratch database (all of its
-tables are dropped):
+Unit tests live in each module's `mod tests`; `tests/cli.rs` runs the `sdb` binary end to end
+(init → push → seed → dump → restore → pull, migrations, error exits) in a temporary directory.
+The PostgreSQL and MySQL tests (round trips in `db.rs`, the CLI pipeline in `tests/cli.rs`) run
+only when they get a scratch database (all of its tables are dropped):
 
 ```sh
 SDB_TEST_POSTGRES=postgres://sdb:sdb@localhost:5432/sdb SDB_TEST_MYSQL=mysql://sdb:sdb@127.0.0.1:3306/sdb cargo test
 ```
+
+CI (`.github/workflows/ci.yml`) runs `cargo clippy --all-targets -D warnings` and `cargo test`
+with PostgreSQL 17 and MySQL 8.4 service containers, so the server tests always run there.

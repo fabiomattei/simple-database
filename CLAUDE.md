@@ -10,12 +10,14 @@ MySQL databases, seeds fake data and runs SQL. The README documents the DSL, eve
 
 ```sh
 cargo build                     # target/debug/sdb (CLI) and target/debug/sdb-gui (desktop app)
-cargo test                      # unit tests live in each core module's `mod tests`
+cargo test                      # unit tests in each module's `mod tests`; tests/cli.rs runs the sdb binary end to end
 cargo clippy --all-targets      # keep at zero warnings
 cargo run --bin sdb-gui -- schema.dbs app.db --tab diagram
 ```
 
-- `cargo test` and `cargo clippy` do **not** rebuild the binaries. Run `cargo build` before
+- CI (`.github/workflows/ci.yml`) runs clippy with `-D warnings` and `cargo test` with Postgres and
+  MySQL service containers (`SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` set), so server tests must pass too.
+- `cargo test` and `cargo clippy` do **not** rebuild the binaries (`tests/cli.rs` does build `sdb`). Run `cargo build` before
   manual end-to-end checks, or you are testing a stale binary.
 - The first build (and any release build) is slow, 1–2 minutes, because of eframe/wgpu. Every
   binary pulls in all package dependencies.
