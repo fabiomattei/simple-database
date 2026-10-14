@@ -130,6 +130,7 @@ impl App {
         });
         ui.add_space(4.0);
         let schema = self.diagram_schema(&db_schema);
+        self.er.row_counts = self.db.as_ref().map(|d| d.counts.iter().cloned().collect()).unwrap_or_default();
         if let Some(action) = self.er.ui(ui, &schema, editable, &browsable) {
             self.diagram_action(action, &schema);
         }

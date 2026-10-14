@@ -24,6 +24,8 @@ pub struct ErView {
     dragging: Option<String>,
     /// Table highlighted from outside (e.g. the sidebar).
     pub selected: Option<String>,
+    /// Rows per table of the open database, shown in the box titles.
+    pub row_counts: HashMap<String, i64>,
     fit_requested: bool,
     /// Tables left out of the diagram and its exports.
     hidden: HashSet<String>,
@@ -206,6 +208,14 @@ impl ErView {
             .collect()
     }
 
+    /// A box's title: the table name, plus its row count when known.
+    fn title(&self, t: &Table) -> String {
+        match self.row_counts.get(&t.name) {
+            Some(n) => format!("{} ({n})", t.name),
+            None => t.name.clone(),
+        }
+    }
+
     /// `full` is the whole schema; hidden tables are left out here. With
     /// `editable`, double-clicks, the context menu and the column handles
     /// return the changes the user asks for. `browsable` are the tables of
@@ -240,7 +250,7 @@ impl ErView {
 
         // Measure boxes in world units (zoom 1).
         let before = std::mem::take(&mut self.sizes);
-        let sizes: HashMap<String, Vec2> = full.tables.iter().map(|t| (t.name.clone(), box_size(&painter, t))).collect();
+        let sizes: HashMap<String, Vec2> = full.tables.iter().map(|t| (t.name.clone(), box_size(&painter, &self.title(t), t))).collect();
         // A box that grew (a column added, a longer name) pushes its neighbors aside.
         let grown: HashSet<String> = schema
             .tables
@@ -446,7 +456,7 @@ impl ErView {
             painter.text(
                 header.center(),
                 Align2::CENTER_CENTER,
-                &t.name,
+                self.title(t),
                 FontId::proportional(fs * 1.05),
                 visuals.strong_text_color(),
             );
@@ -674,7 +684,7 @@ impl ErView {
                 r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" dominant-baseline="central" font-size="13.6" font-weight="bold" fill="{text}">{}</text>"#,
                 min.x + w / 2.0,
                 min.y + HEADER_H / 2.0,
-                xml_escape(&t.name)
+                xml_escape(&self.title(t))
             );
             let pk = t.primary_key();
             for c in &t.columns {
@@ -840,9 +850,9 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-fn box_size(painter: &egui::Painter, t: &Table) -> Vec2 {
+fn box_size(painter: &egui::Painter, title: &str, t: &Table) -> Vec2 {
     let measure = |s: String, font: FontId| painter.layout_no_wrap(s, font, Color32::WHITE).size().x;
-    let title = measure(t.name.clone(), FontId::proportional(13.65)) + PAD_X * 2.0;
+    let title = measure(title.to_string(), FontId::proportional(13.65)) + PAD_X * 2.0;
     let rows = t
         .columns
         .iter()
