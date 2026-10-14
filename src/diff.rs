@@ -416,6 +416,13 @@ fn apply_renames(mut old: Schema, new: &Schema, d: Dialect, changes: &mut Vec<St
 /// `expr` with the identifier `old` (bare or quoted) renamed to `new`;
 /// string literals are left alone.
 fn rename_ident(expr: &str, old: &str, new: &str) -> String {
+    rename_idents(expr, |word, quoted| (if quoted { word == old } else { word.eq_ignore_ascii_case(old) }).then(|| new.to_string()))
+}
+
+/// `expr` with each identifier `rename(word, quoted)` gives a name for
+/// renamed to it, all at once; string literals are left alone. A quoted
+/// identifier keeps its quotes, a bare one is replaced by the text given.
+pub(crate) fn rename_idents(expr: &str, rename: impl Fn(&str, bool) -> Option<String>) -> String {
     let chars: Vec<char> = expr.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -425,7 +432,10 @@ fn rename_ident(expr: &str, old: &str, new: &str) -> String {
             let end = (i + 1..chars.len()).find(|&j| chars[j] == c).unwrap_or(chars.len());
             let inner: String = chars[(i + 1).min(end)..end].iter().collect();
             out.push(c);
-            out.push_str(if c != '\'' && inner == old { new } else { &inner });
+            match rename(&inner, true).filter(|_| c != '\'') {
+                Some(n) => out.push_str(&n),
+                None => out.push_str(&inner),
+            }
             if end < chars.len() {
                 out.push(c);
             }
@@ -433,7 +443,10 @@ fn rename_ident(expr: &str, old: &str, new: &str) -> String {
         } else if c.is_alphanumeric() || c == '_' || c == '$' {
             let end = (i..chars.len()).find(|&j| !(chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '$')).unwrap_or(chars.len());
             let word: String = chars[i..end].iter().collect();
-            out.push_str(if word.eq_ignore_ascii_case(old) { new } else { &word });
+            match rename(&word, false) {
+                Some(n) => out.push_str(&n),
+                None => out.push_str(&word),
+            }
             i = end;
         } else {
             out.push(c);

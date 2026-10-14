@@ -109,8 +109,15 @@ impl Names<'_> {
         self.0.iter().find(|r| r.table.as_deref() == Some(table) && r.to == name).map_or(name, |r| r.from.as_str())
     }
 
-    fn renames_columns_of(&self, table: &str) -> bool {
-        self.0.iter().any(|r| r.table.as_deref() == Some(table))
+    /// A check expression of `table`, which names columns as they will be,
+    /// with the current names.
+    fn expr(&self, table: &str, expr: &str, d: Dialect) -> String {
+        let renamed = self.0.iter().filter(|r| r.table.as_deref() == Some(table));
+        let renamed: Vec<&Rename> = renamed.collect();
+        crate::diff::rename_idents(expr, |word, quoted| {
+            let r = renamed.iter().find(|r| if quoted { r.to == word } else { r.to.eq_ignore_ascii_case(word) })?;
+            Some(if quoted { r.from.clone() } else { quote(&r.from, d) })
+        })
     }
 }
 
@@ -169,12 +176,10 @@ pub fn row_checks(p: &Plan) -> Vec<RowCheck> {
             if n.unique && !o.unique {
                 check(format!("repeat a value of {}, which becomes unique", n.name), duplicates(std::slice::from_ref(&n.name)));
             }
-            // The expression names columns as they will be.
             if let Some(expr) = &n.check
                 && o.check != n.check
-                && !names.renames_columns_of(name)
             {
-                check(format!("fail the new check on {}: {expr}", n.name), count(format!("NOT ({expr})")));
+                check(format!("fail the new check on {}: {expr}", n.name), count(format!("NOT ({})", names.expr(name, expr, d))));
             }
             if n.references.is_some()
                 && o.references != n.references
@@ -216,6 +221,23 @@ fn type_violation(o: &DataType, n: &DataType, c: &str, d: Dialect) -> Option<(St
         }
         Decimal(p, s) if is_numeric(o) => {
             (int_digits(o).is_none_or(|x| x > p - s)).then(|| (format!("abs({c}) >= 1{}", "0".repeat((p - s) as usize)), format!("too large for {n}")))
+        }
+        // MySQL (strict) refuses text that isn't a number, or is one out of range.
+        _ if d == Dialect::Mysql && matches!(o, Text | Varchar(_) | Custom(_)) && (is_numeric(n) || *n == Bool) => {
+            let digits = "[0-9]+([.][0-9]*)?|[.][0-9]+";
+            let pattern = if is_numeric(n) && !is_int(n) { format!("({digits})([eE][-+]?[0-9]+)?") } else { "[0-9]+".into() };
+            let mut cond = format!("NOT ({c} REGEXP '^[[:space:]]*[-+]?({pattern})[[:space:]]*$')");
+            let number = format!("CAST({c} AS DECIMAL(65, 30))");
+            match n {
+                Bool => cond.push_str(&format!(" OR {number} NOT BETWEEN -128 AND 127")),
+                Decimal(p, s) => cond.push_str(&format!(" OR abs({number}) >= 1{}", "0".repeat((p - s) as usize))),
+                _ => {
+                    if let Some((lo, hi)) = int_range(n) {
+                        cond.push_str(&format!(" OR {number} NOT BETWEEN {lo} AND {hi}"));
+                    }
+                }
+            }
+            Some((format!("({cond})"), format!("that isn't a number that fits {n}")))
         }
         // Postgres 16+ can tell whether text converts; older servers fail the check, which is skipped.
         _ if d == Dialect::Postgres && matches!(o, Text | Varchar(_) | Custom(_)) && !matches!(n, Custom(_)) => Some((
@@ -271,7 +293,7 @@ mod tests {
     fn checks_use_the_current_names() {
         let old = parse("table p { id int pk }\ntable t { id int pk\n a text\n b int\n c int }").unwrap();
         let new = parse(
-            "table parents was p { id int pk }\ntable things was t { id int pk\n a varchar(5) not null\n bee int unique was b\n \
+            "table parents was p { id int pk }\ntable things was t { id int pk\n a varchar(5) not null\n bee int unique was b check (bee > 0)\n \
              c int -> parents.id check (c > 0) }",
         )
         .unwrap();
@@ -286,6 +308,8 @@ mod tests {
                     "repeat a value of bee, which becomes unique".into(),
                     "SELECT coalesce(sum(n), 0) FROM (SELECT count(*) AS n FROM t WHERE t.b IS NOT NULL GROUP BY t.b HAVING count(*) > 1) sdb_dup".into()
                 ),
+                ("fail the new check on bee: bee > 0".into(), "SELECT count(*) FROM t WHERE NOT (b > 0)".into()),
+                ("fail the new check on c: c > 0".into(), "SELECT count(*) FROM t WHERE NOT (c > 0)".into()),
                 (
                     "have c pointing at no row of parents".into(),
                     "SELECT count(*) FROM t WHERE t.c IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p sdb_parent WHERE sdb_parent.id = t.c)".into()
@@ -293,5 +317,20 @@ mod tests {
             ]
         );
         assert!(row_checks(&p).iter().all(|c| c.table == "t"));
+    }
+
+    #[test]
+    fn mysql_checks_that_text_is_a_number() {
+        let my = Dialect::Mysql;
+        let (cond, what) = type_violation(&Text, &Int, "t.a", my).unwrap();
+        assert_eq!(what, "that isn't a number that fits int");
+        assert_eq!(
+            cond,
+            "(NOT (t.a REGEXP '^[[:space:]]*[-+]?([0-9]+)[[:space:]]*$') OR CAST(t.a AS DECIMAL(65, 30)) NOT BETWEEN -2147483648 AND 2147483647)"
+        );
+        let (cond, _) = type_violation(&Varchar(9), &Decimal(6, 2), "t.a", my).unwrap();
+        assert!(cond.contains("[eE]") && cond.ends_with(" OR abs(CAST(t.a AS DECIMAL(65, 30))) >= 10000)"), "{cond}");
+        assert!(type_violation(&Text, &Real, "t.a", my).is_some());
+        assert!(type_violation(&Text, &Date, "t.a", my).is_none());
     }
 }

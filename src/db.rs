@@ -1167,19 +1167,19 @@ mod tests {
     fn live_preflight(db: &mut Database) {
         let v1 = parse(
             "table owners { id int pk }\ntable items { id int pk\n name text\n qty bigint\n code text\n kind text\n \
-             owner_id int\n score int\n num text }",
+             owner_id int\n score int\n num text\n lvl int }",
         )
         .unwrap();
         let m = db.migration(&Schema::default(), &v1);
         db.apply_migration(&m).unwrap();
         db.run(
-            "INSERT INTO owners VALUES (1); INSERT INTO items VALUES (1, NULL, 5000000000, 'abcdefgh', 'x', 99, -1, 'x'), \
-             (2, 'n', 1, 'abc', 'a', 1, 1, '1'), (3, 'n', 2, 'abc', 'b', NULL, 1, NULL)",
+            "INSERT INTO owners VALUES (1); INSERT INTO items VALUES (1, NULL, 5000000000, 'abcdefgh', 'x', 99, -1, 'x', 5), \
+             (2, 'n', 1, 'abc', 'a', 1, 1, ' 1 ', 1), (3, 'n', 2, 'abc', 'b', NULL, 1, NULL, 1)",
         )
         .unwrap();
         let v2 = parse(
             "table owners { id int pk }\ntable items { id int pk\n name text not null\n qty int\n code varchar(5) unique\n \
-             kind enum('a', 'b')\n owner_id int -> owners.id\n score int check (score >= 0)\n num int }",
+             kind enum('a', 'b')\n owner_id int -> owners.id\n score int check (score >= 0)\n num int\n level int was lvl check (level < 3) }",
         )
         .unwrap();
         let current = db.introspect().unwrap();
@@ -1187,6 +1187,7 @@ mod tests {
         let mut problems = db.preflight(&m);
         problems.sort();
         let mut expected = vec![
+            "1 row(s) of items fail the new check on level",
             "1 row(s) of items fail the new check on score",
             "1 row(s) of items have NULL in name, which becomes NOT NULL",
             "1 row(s) of items have owner_id pointing at no row of owners",
@@ -1197,9 +1198,11 @@ mod tests {
             Dialect::Sqlite => {}
             d => {
                 expected.extend(["1 row(s) of items have code longer than 5 characters", "1 row(s) of items have qty outside the int range"]);
-                if d == Dialect::Postgres {
-                    expected.push("1 row(s) of items have num that doesn't convert to int");
-                }
+                expected.push(if d == Dialect::Postgres {
+                    "1 row(s) of items have num that doesn't convert to int"
+                } else {
+                    "1 row(s) of items have num that isn't a number that fits int"
+                });
             }
         }
         expected.sort();
