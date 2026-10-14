@@ -224,27 +224,37 @@ impl DataTabs {
         let mut close = None;
         egui::ScrollArea::horizontal().id_salt("data_tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let p = crate::theme::palette(ui);
                 for (i, v) in self.views.iter().enumerate() {
                     let name = v.table.as_deref().unwrap_or_default();
                     let pending = v.pending() > 0;
-                    let text = if pending { format!("• {name}") } else { name.to_owned() };
-                    let tab = ui.selectable_label(i == self.active, text);
-                    if tab.clicked() {
-                        self.active = i;
-                    }
-                    if tab.middle_clicked() && !pending {
-                        close = Some(i);
-                    }
-                    let x = ui
-                        .add_enabled(!pending, egui::Button::new(RichText::new("✖").small()).frame(false))
-                        .on_hover_text("Close")
-                        .on_disabled_hover_text("Save or discard the changes to this table first");
-                    if x.clicked() {
-                        close = Some(i);
-                    }
-                    ui.separator();
+                    let on = i == self.active;
+                    let frame = egui::Frame::new()
+                        .fill(if on { p.well } else { egui::Color32::TRANSPARENT })
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin { left: 10, right: 4, top: 2, bottom: 2 });
+                    frame.show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let text = if pending { format!("• {name}") } else { name.to_owned() };
+                        let text = if on { RichText::new(text) } else { RichText::new(text).weak() };
+                        let tab = ui.add(egui::Label::new(text).selectable(false).sense(egui::Sense::click()));
+                        if tab.clicked() {
+                            self.active = i;
+                        }
+                        if tab.middle_clicked() && !pending {
+                            close = Some(i);
+                        }
+                        let x = ui
+                            .add_enabled(!pending, egui::Button::new(RichText::new("✖").small().weak()).frame_when_inactive(false))
+                            .on_hover_text("Close")
+                            .on_disabled_hover_text("Save or discard the changes to this table first");
+                        if x.clicked() {
+                            close = Some(i);
+                        }
+                    });
                 }
-                ui.menu_button("➕", |ui| {
+                ui.menu_button("+", |ui| {
                     egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                         for (t, n) in tables {
                             if ui.button(format!("{t}  ({n})")).clicked() {
@@ -329,34 +339,51 @@ impl DataView {
         });
         let can_edit = !read_only && has_key;
 
+        let all = tables.iter().find(|(t, _)| *t == current).map_or(0, |(_, n)| *n as usize);
+        let hint = if read_only {
+            "🔒 Read-only connection: editing is off"
+        } else if !has_key && table.is_some() && self.result().is_some() {
+            "No primary key: rows can be added, not edited or deleted"
+        } else if self.result().is_some() {
+            "Double-click a cell to edit · right-click for more · click row numbers to select"
+        } else {
+            ""
+        };
+        // Row range and pages at the bottom, as in a document window.
+        egui::Panel::bottom("data_footer")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 4)))
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(hint).small().weak());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(!pending, |ui| {
+                            if ui.add_enabled(self.page + 1 < pages, egui::Button::new("▶").frame_when_inactive(false)).on_hover_text("Next page").clicked() {
+                                self.page += 1;
+                                self.reset();
+                                action = Some(DataAction::Load);
+                            }
+                            ui.label(format!("{} / {pages}", self.page + 1));
+                            if ui.add_enabled(self.page > 0, egui::Button::new("◀").frame_when_inactive(false)).on_hover_text("Previous page").clicked() {
+                                self.page -= 1;
+                                self.reset();
+                                action = Some(DataAction::Load);
+                            }
+                        })
+                        .response
+                        .on_disabled_hover_text(locked);
+                        ui.add_space(8.0);
+                        let shown = self.result().map_or(0, |r| r.rows.len());
+                        let first = if shown == 0 { 0 } else { self.page * PAGE_SIZE + 1 };
+                        let range = format!("{first}–{} of {} rows", self.page * PAGE_SIZE + shown, self.total);
+                        let filtered = !(self.view.filters.is_empty() && self.view.where_sql.trim().is_empty());
+                        let text = if filtered { format!("{range} (filtered from {all})") } else { range };
+                        ui.label(RichText::new(text).weak());
+                    });
+                });
+            });
+
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(!pending, |ui| {
-                if ui.add_enabled(self.page > 0, egui::Button::new("◀")).clicked() {
-                    self.page -= 1;
-                    self.reset();
-                    action = Some(DataAction::Load);
-                }
-                ui.label(format!("page {} of {pages}", self.page + 1));
-                if ui.add_enabled(self.page + 1 < pages, egui::Button::new("▶")).clicked() {
-                    self.page += 1;
-                    self.reset();
-                    action = Some(DataAction::Load);
-                }
-                let all = tables.iter().find(|(t, _)| *t == current).map_or(0, |(_, n)| *n as usize);
-                let count = if self.view.filters.is_empty() && self.view.where_sql.trim().is_empty() {
-                    format!("{} rows", self.total)
-                } else {
-                    format!("{} of {all} rows", self.total)
-                };
-                ui.label(RichText::new(count).weak());
-                ui.separator();
-                if ui.button("⟳").on_hover_text("Reload").clicked() {
-                    self.reset();
-                    action = Some(DataAction::Load);
-                }
-            })
-            .response
-            .on_disabled_hover_text(locked);
             let n = self.view.filters.len() + usize::from(!self.view.where_sql.trim().is_empty());
             let label = if n > 0 { format!("🔍 Filter ({n})") } else { "🔍 Filter".into() };
             ui.toggle_value(&mut self.show_filters, label);
@@ -405,6 +432,13 @@ impl DataView {
             {
                 action = Some(DataAction::Query(format!("{sql};")));
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let reload = ui.add_enabled(!pending, egui::Button::new("⟳")).on_hover_text("Reload").on_disabled_hover_text(locked);
+                if reload.clicked() {
+                    self.reset();
+                    action = Some(DataAction::Load);
+                }
+            });
         });
 
         if self.show_filters
@@ -456,14 +490,7 @@ impl DataView {
         if let Some(e) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, format!("✖ {e}"));
         }
-        if read_only {
-            ui.label(RichText::new("🔒 Read-only connection: editing is off").small().weak());
-        } else if !has_key && table.is_some() && self.result().is_some() {
-            ui.label(RichText::new("This table has no primary key: you can add rows, but not edit or delete them").small().weak());
-        } else if self.result().is_some() {
-            ui.label(RichText::new("Double-click a cell to edit · right-click for more · click row numbers to select").small().weak());
-        }
-        ui.separator();
+        ui.add_space(2.0);
 
         match &self.out {
             Some(Err(e)) => {
@@ -630,7 +657,7 @@ impl DataView {
         }
         let n = r.rows.len();
         let total_rows = n + self.staged.inserted.len();
-        let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 8.0;
         let weak = ui.visuals().weak_text_color();
         let edited_bg = ui.visuals().warn_fg_color.gamma_multiply(0.18);
         let deleted_bg = ui.visuals().error_fg_color.gamma_multiply(0.15);
@@ -668,16 +695,18 @@ impl DataView {
             }
             tb.header(row_h + 2.0, |mut header| {
                 header.col(|ui| {
-                    ui.label(RichText::new("#").weak());
+                    crate::theme::header_cell(ui);
+                    crate::theme::row_number(ui, RichText::new("#").weak());
                 });
                 for c in &r.columns {
                     header.col(|ui| {
+                        crate::theme::header_cell(ui);
                         let arrow = match &sort {
                             Some((s, desc)) if s == c => if *desc { " ⏷" } else { " ⏶" },
                             _ => "",
                         };
                         let key = if pk.contains(c) { "🔑" } else { "" };
-                        let label = egui::Label::new(RichText::new(format!("{key}{c}{arrow}")).strong()).sense(egui::Sense::click());
+                        let label = egui::Label::new(crate::theme::header_text(format!("{key}{c}{arrow}"))).sense(egui::Sense::click());
                         let resp = ui.add(label).on_hover_text("Click to sort · right-click to fit the columns to their content");
                         if resp.clicked() {
                             sort_by = Some(c.clone());
@@ -698,7 +727,7 @@ impl DataView {
                         } else {
                             RichText::new((self.page * PAGE_SIZE + i + 1).to_string()).weak().monospace()
                         };
-                        let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                        let resp = crate::theme::row_number(ui, text);
                         if resp.clicked() {
                             select = Some((i, ui.input(|inp| inp.modifiers.command || inp.modifiers.shift)));
                         }

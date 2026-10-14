@@ -1,3 +1,4 @@
 # LF everywhere, Windows checkouts included: examples/blog.dbs is compiled in
 # with include_str!, and tests compare sdb's \n output with files as checked out.
 * text=auto eol=lf
+*.ttf binary

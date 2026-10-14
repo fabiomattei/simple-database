@@ -15,6 +15,7 @@ mod highlight;
 mod panels;
 mod table_edit;
 mod tabs;
+mod theme;
 mod window;
 mod worker;
 
@@ -25,7 +26,7 @@ use simple_database::parser::{self, ParseError};
 use simple_database::schema::Schema;
 use simple_database::connections::{SafeMode, Store};
 use simple_database::db::{self, Database, QueryResult};
-use simple_database::diff::{Migration, TableChange, TableDrift};
+use simple_database::diff::{Migration, TableDrift};
 use simple_database::framework::{Framework, Generated};
 use simple_database::dump;
 use simple_database::history::QueryLog;
@@ -70,6 +71,7 @@ struct Settings {
     hide_outline: bool,
     show_preview: bool,
     hide_history: bool,
+    hide_sidebar: bool,
     /// The Migrate tab's format: 0 SQL, 1 Laravel, 2 Rails.
     migrate_format: u8,
     /// Read from older settings only: Data tabs now live in their own file, shared by all windows.
@@ -366,12 +368,17 @@ struct App {
     allow_close: bool,
     /// Saved connections (re-read from disk before every change).
     conns: Store,
+    show_sidebar: bool,
+    sidebar_view: panels::SidebarView,
+    /// The sidebar's filter over tables and connections.
+    sidebar_filter: String,
     /// To wake the UI from background threads.
     ctx: egui::Context,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
+        theme::install(&cc.egui_ctx);
         let settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
@@ -425,6 +432,9 @@ impl App {
             dialog: None,
             allow_close: false,
             conns: Store::default(),
+            show_sidebar: !settings.hide_sidebar,
+            sidebar_view: panels::SidebarView::Tables,
+            sidebar_filter: String::new(),
             ctx: cc.egui_ctx.clone(),
         };
         match Store::load() {
@@ -914,56 +924,25 @@ impl eframe::App for App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         self.handle_shortcuts(&ctx);
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        let p = theme::palette(ui);
+        let (before, mut show_sidebar) = (self.show_sidebar, self.show_sidebar);
         egui::Panel::left("sidebar")
             .resizable(true)
-            .default_size(210.0)
-            .min_size(150.0)
-            .show(ui, |ui| self.sidebar(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            let changed = self.db.as_ref().and_then(|db| db.drift.as_ref()).map(|d| {
-                let count = |c: TableChange| d.tables.iter().filter(|t| t.change == c).count();
-                (count(TableChange::Created), count(TableChange::Altered) + count(TableChange::Renamed), count(TableChange::Dropped))
-            });
-            ui.horizontal(|ui| {
-                let has_db = self.db.is_some();
-                for (tab, label, needs_db) in [
-                    (Tab::Schema, "✏ Schema", false),
-                    (Tab::Diagram, "🔗 Diagram", false),
-                    (Tab::Sql, "⌨ SQL", false),
-                    (Tab::Migrate, "⬆ Migrate", false),
-                    (Tab::Query, "▶ Query", true),
-                    (Tab::Data, "📋 Data", true),
-                    (Tab::Seed, "🌱 Seed", true),
-                ] {
-                    let text = if needs_db && !has_db { RichText::new(label).weak() } else { RichText::new(label) };
-                    match changed {
-                        Some((new, altered, dropped)) if tab == Tab::Migrate && new + altered + dropped > 0 => {
-                            let mut job = egui::text::LayoutJob::default();
-                            let style = ui.style().clone();
-                            text.append_to(&mut job, &style, egui::FontSelection::Default, egui::Align::Center);
-                            RichText::new(format!(" {}", new + altered + dropped)).strong().color(warn_color(ui)).append_to(
-                                &mut job,
-                                &style,
-                                egui::FontSelection::Default,
-                                egui::Align::Center,
-                            );
-                            let parts: Vec<String> = [(new, "new"), (altered, "changed"), (dropped, "to drop")]
-                                .into_iter()
-                                .filter(|(n, _)| *n > 0)
-                                .map(|(n, what)| format!("{n} {what}"))
-                                .collect();
-                            ui.selectable_value(&mut self.tab, tab, job)
-                                .on_hover_text(format!("Tables that differ from the database: {}", parts.join(", ")));
-                        }
-                        _ => {
-                            ui.selectable_value(&mut self.tab, tab, text);
-                        }
-                    }
-                }
-            });
-            ui.separator();
+            .default_size(230.0)
+            .min_size(170.0)
+            .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 0 }))
+            .show_collapsible(ui, &mut show_sidebar, |ui| self.sidebar(ui));
+        // The sidebar's own button wins over a drag of its edge.
+        if self.show_sidebar == before {
+            self.show_sidebar = show_sidebar;
+        }
+        egui::Panel::top("toolbar")
+            .frame(egui::Frame::new().fill(p.content).inner_margin(egui::Margin { left: 14, right: 12, top: 8, bottom: 8 }))
+            .show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::new().fill(p.content).inner_margin(egui::Margin::symmetric(12, 4)))
+            .show(ui, |ui| self.status_bar(ui));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.content).inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 4 })).show(ui, |ui| {
             match self.tab {
                 Tab::Schema => self.tab_schema(ui),
                 Tab::Diagram => self.tab_diagram(ui),
@@ -999,6 +978,7 @@ impl eframe::App for App {
             hide_outline: !self.show_outline,
             show_preview: self.show_preview,
             hide_history: !self.show_history,
+            hide_sidebar: !self.show_sidebar,
             migrate_format: match self.migrate_format {
                 None => 0,
                 Some(Framework::Laravel) => 1,

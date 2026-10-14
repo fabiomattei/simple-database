@@ -1,6 +1,6 @@
 //! Modal dialogs: confirmations, import, restore, scripts, help and the like.
 
-use crate::{App, Dialog, OpenFrom, QueryOutput, Tab, Write, error_color, ok_color, warn_color, conns, grid, highlight::{self, Lang}, table_edit};
+use crate::{App, Dialog, OpenFrom, QueryOutput, Tab, Write, db_title, error_color, ok_color, warn_color, conns, grid, highlight::{self, Lang}, table_edit, theme};
 use eframe::egui::{self, RichText};
 use simple_database::ddl::Dialect;
 use simple_database::connections::SafeMode;
@@ -463,49 +463,123 @@ impl App {
                 let mut pick: Option<String> = None;
                 let mut new_conn = false;
                 let mut open_file = false;
+                let mut new_file = false;
                 let mut skip = false;
-                let resp = egui::Modal::new(egui::Id::new("welcome")).show(ctx, |ui| {
-                    ui.set_width(460.0);
-                    ui.heading("Welcome to sdb");
-                    ui.label("Which database do you want to work with?");
-                    ui.add_space(8.0);
-                    if let Some(t) = &last {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Last session:").weak());
-                            ui.label(RichText::new(t).strong());
-                            if ui.button("Reopen").clicked() {
-                                pick = Some(t.clone());
-                            }
+                let p = theme::palette_for_ctx(ctx);
+                let screen = ctx.content_rect();
+                let size = egui::vec2((screen.width() - 80.0).clamp(560.0, 920.0), (screen.height() - 80.0).clamp(380.0, 580.0));
+                let frame = egui::Frame::new()
+                    .fill(p.content)
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .stroke(ctx.global_style().visuals.window_stroke)
+                    .shadow(ctx.global_style().visuals.window_shadow);
+                let resp = egui::Modal::new(egui::Id::new("welcome")).frame(frame).show(ctx, |ui| {
+                    let (full, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    let left_w = (size.x * 0.36).clamp(240.0, 320.0);
+                    let left = egui::Rect::from_min_size(full.min, egui::vec2(left_w, size.y));
+                    let right = egui::Rect::from_min_max(egui::pos2(left.right(), full.top()), full.max);
+                    ui.painter().rect_filled(left, egui::CornerRadius { nw: 14, sw: 14, ne: 0, se: 0 }, p.sidebar);
+                    ui.painter().vline(left.right(), left.y_range(), egui::Stroke::new(1.0, p.separator));
+
+                    // Left: the app and what to start with.
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(left.shrink2(egui::vec2(18.0, 22.0))), |ui| {
+                        let (logo, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+                        ui.painter().rect_filled(logo, egui::CornerRadius::same(14), p.accent);
+                        theme::paint_glyph(ui.painter(), theme::Glyph::Database, logo.center(), 2.0, egui::Color32::WHITE);
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Welcome to sdb").font(theme::bold(22.0)));
+                        ui.label(RichText::new("Pick a database to work with, or start a new one.").color(p.muted));
+                        ui.add_space(16.0);
+                        let green = egui::Color32::from_rgb(0x34, 0xc7, 0x59);
+                        let orange = egui::Color32::from_rgb(0xff, 0x9f, 0x0a);
+                        new_conn = theme::card(ui, theme::Glyph::Plus, p.accent, "New connection…", "PostgreSQL, MySQL or SQLite")
+                            .on_hover_text("Fill in a connection and save it")
+                            .clicked();
+                        open_file = theme::card(ui, theme::Glyph::Folder, orange, "Open SQLite file…", "A .db, .sqlite or .sqlite3 file").clicked();
+                        new_file = theme::card(ui, theme::Glyph::Database, green, "New SQLite database…", "An empty file to push a schema into").clicked();
+                        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                            ui.label(RichText::new("Help → Example schema shows a sample schema to start from.").small().color(p.muted));
+                            ui.add_space(4.0);
+                            skip = ui
+                                .add(egui::Button::new("Continue without a database").min_size(egui::vec2(ui.available_width(), 30.0)))
+                                .clicked();
                         });
-                        ui.add_space(6.0);
-                    }
-                    ui.label(RichText::new("SAVED CONNECTIONS").small().strong().weak());
-                    if self.conns.connections.is_empty() {
-                        ui.label(RichText::new("No saved connections yet.").weak());
-                    }
-                    let mut list: Vec<&simple_database::connections::Connection> = self.conns.connections.iter().collect();
-                    list.sort_by_key(|c| (!c.favorite, std::cmp::Reverse(c.last_used), c.name.to_lowercase()));
-                    egui::ScrollArea::vertical().id_salt("welcome_conns").max_height(260.0).show(ui, |ui| {
-                        for c in list {
-                            ui.horizontal(|ui| {
-                                conns::color_dot(ui, c.color);
+                    });
+
+                    // Right: saved connections, as large rows.
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(right.shrink2(egui::vec2(20.0, 20.0))), |ui| {
+                        let search_id = egui::Id::new("welcome_search");
+                        let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Connections").font(theme::bold(17.0)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.set_max_width(220.0);
+                                theme::search_field(ui, &mut search, "Search");
+                            });
+                        });
+                        ui.data_mut(|d| d.insert_temp(search_id, search.clone()));
+                        ui.add_space(10.0);
+                        let needle = search.trim().to_lowercase();
+                        let mut list: Vec<&simple_database::connections::Connection> = self
+                            .conns
+                            .connections
+                            .iter()
+                            .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle) || c.summary().to_lowercase().contains(&needle))
+                            .collect();
+                        list.sort_by_key(|c| (!c.favorite, std::cmp::Reverse(c.last_used), c.name.to_lowercase()));
+                        egui::ScrollArea::vertical().id_salt("welcome_conns").auto_shrink([false, false]).show(ui, |ui| {
+                            // The last session, unless it is one of the saved connections listed anyway.
+                            if let Some(t) = &last
+                                && needle.is_empty()
+                                && !t.strip_prefix('@').is_some_and(|n| self.conns.get(n).is_some())
+                            {
+                                theme::section(ui, "Last session");
+                                if theme::card(ui, theme::Glyph::Arrow, p.accent, &db_title(t), t).on_hover_text("Reopen").clicked() {
+                                    pick = Some(t.clone());
+                                }
+                                ui.add_space(6.0);
+                            }
+                            let mut section = None;
+                            for c in list {
+                                let title = if c.favorite { "Favorites" } else { "Saved" };
+                                if section != Some(title) {
+                                    theme::section(ui, title);
+                                    section = Some(title);
+                                }
+                                let tint = conns::to_color32(c.color).unwrap_or(p.accent);
                                 let star = if c.favorite { "★ " } else { "" };
-                                if ui.button(format!("{star}{}", c.name)).on_hover_text(c.summary()).clicked() {
+                                let is_last = last.as_deref() == Some(&format!("@{}", c.name));
+                                let mut sub = format!("{} · {}", c.kind.label(), c.summary());
+                                if is_last {
+                                    sub = format!("Last used · {sub}");
+                                }
+                                if c.safe_mode != SafeMode::Off {
+                                    sub = format!("{sub} · {}", c.safe_mode.label());
+                                }
+                                let card = theme::card(ui, theme::Glyph::Database, tint, &format!("{star}{}", c.name), &sub);
+                                if card.on_hover_text(format!("Connect to {}", c.summary())).clicked() {
                                     pick = Some(format!("@{}", c.name));
                                 }
-                                ui.label(RichText::new(c.kind.label()).small().weak());
-                            });
-                        }
+                            }
+                            if self.conns.connections.is_empty() {
+                                ui.add_space(size.y * 0.15);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(RichText::new("No saved connections yet").font(theme::bold(15.0)));
+                                    ui.label(RichText::new("New connection… on the left adds one.").color(p.muted));
+                                });
+                            } else if !needle.is_empty() && section.is_none() {
+                                ui.label(RichText::new("No connection matches the search.").color(p.muted));
+                            }
+                        });
                     });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        new_conn = ui.button(RichText::new("➕ New connection…").strong()).clicked();
-                        open_file = ui.button("Open SQLite file…").clicked();
-                        skip = ui.button("Continue without a database").clicked();
-                    });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Help → Example schema shows a sample schema to start from.").small().weak());
                 });
+                if new_file {
+                    self.dialog = None;
+                    if let Some(p) = rfd::FileDialog::new().add_filter("SQLite database", &["db"]).set_file_name("app.db").save_file() {
+                        self.open_db_at(&p.to_string_lossy(), Some(Tab::Migrate));
+                    }
+                    return;
+                }
                 if let Some(t) = pick {
                     self.dialog = None;
                     self.open_db(&t);

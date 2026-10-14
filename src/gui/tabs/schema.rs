@@ -17,18 +17,17 @@ impl App {
 
         egui::Panel::top("schema_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(self.file_label());
+                ui.toggle_value(&mut self.show_outline, "Outline").on_hover_text("List tables and columns; click to jump");
+                ui.toggle_value(&mut self.show_preview, "Preview").on_hover_text("Show the generated SQL next to the editor");
+                ui.separator();
+                let hint = format!("Align columns, keeping comments ({})", ctx.format_shortcut(&format_key));
+                if ui.button("Format").on_hover_text(hint).clicked() {
+                    self.format_schema_text();
+                }
+                if ui.button("Syntax help").clicked() {
+                    self.dialog = Some(Dialog::Syntax);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Syntax help").clicked() {
-                        self.dialog = Some(Dialog::Syntax);
-                    }
-                    let hint = format!("Align columns, keeping comments ({})", ctx.format_shortcut(&format_key));
-                    if ui.button("Format").on_hover_text(hint).clicked() {
-                        self.format_schema_text();
-                    }
-                    ui.separator();
-                    ui.toggle_value(&mut self.show_preview, "Preview").on_hover_text("Show the generated SQL next to the editor");
-                    ui.toggle_value(&mut self.show_outline, "Outline").on_hover_text("List tables and columns; click to jump");
                     ui.label(RichText::new("Ctrl+F find · Ctrl+/ comment · Alt+Up/Down move · Ctrl+click go to").weak().small());
                 });
             });

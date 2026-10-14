@@ -64,7 +64,7 @@ pub fn result_grid(ui: &mut egui::Ui, id: egui::Id, r: &QueryResult) {
         return;
     }
     let null_color = ui.visuals().weak_text_color();
-    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 8.0;
 
     // Per result shape, so a different query starts from its own widths.
     let key = id.with((&r.columns, r.rows.len()));
@@ -85,11 +85,13 @@ pub fn result_grid(ui: &mut egui::Ui, id: egui::Id, r: &QueryResult) {
         table
             .header(row_h + 2.0, |mut header| {
                 header.col(|ui| {
-                    ui.label(RichText::new("#").weak());
+                    crate::theme::header_cell(ui);
+                    crate::theme::row_number(ui, RichText::new("#").weak());
                 });
                 for c in &r.columns {
                     header.col(|ui| {
-                        ui.add(egui::Label::new(RichText::new(c).strong()).sense(egui::Sense::click()))
+                        crate::theme::header_cell(ui);
+                        ui.add(egui::Label::new(crate::theme::header_text(c)).sense(egui::Sense::click()))
                             .on_hover_text("Right-click to fit the columns to their content")
                             .context_menu(|ui| fit_columns_button(ui, key));
                     });
@@ -99,7 +101,7 @@ pub fn result_grid(ui: &mut egui::Ui, id: egui::Id, r: &QueryResult) {
                 body.rows(row_h, r.rows.len(), |mut row| {
                     let i = row.index();
                     row.col(|ui| {
-                        ui.label(RichText::new((i + 1).to_string()).weak().monospace());
+                        crate::theme::row_number(ui, RichText::new((i + 1).to_string()).weak().monospace());
                     });
                     for cell in &r.rows[i] {
                         row.col(|ui| {
@@ -116,10 +118,7 @@ pub fn result_grid(ui: &mut egui::Ui, id: egui::Id, r: &QueryResult) {
     });
 }
 
+/// Numbers in a grid: the text color, as in a spreadsheet.
 pub fn number_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(0xb5, 0xce, 0xa8)
-    } else {
-        Color32::from_rgb(0x09, 0x86, 0x58)
-    }
+    ui.visuals().text_color()
 }

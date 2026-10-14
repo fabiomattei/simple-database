@@ -76,7 +76,8 @@ Binaries:
 | `src/main.rs` | `sdb` clap CLI; `load_schema` accepts a `.dbs` file **or** a SQLite file (detected by magic header) |
 | `src/gui/main.rs` | `sdb-gui`: `App` state and its types, `Settings` persisted via eframe storage, connecting and the worker plumbing (`db_run`, `poll_background`), shortcuts, the `eframe::App` impl. The rest of `App` is split into `impl App` blocks in other files; methods called across them are `pub(crate)` |
 | `src/gui/tabs/*.rs` | One file per tab (`schema`, `diagram`, `sql`, `migrate`, `query`, `data`, `seed`): its `tab_*` method and the actions that belong to it (e.g. `migration_for`, `run_query`, `load_data`) |
-| `src/gui/panels.rs` | Menu bar, sidebar and status bar. The sidebar's table list merges the schema file's and the database's tables, marked from `App::table_drift` (one comparison queued at a time, cached in `Db::drift`; also the Migrate tab's badge) |
+| `src/gui/theme.rs` | The look: `install` sets fonts (Inter, bundled from `assets/fonts`, egui's fonts as fallback for symbols) and the light/dark `Visuals` (macOS style: grey sidebar, white content, blue accent). `palette` gives the chrome colors; widgets for the chrome: `segmented`, `pill` / `pill_with`, `list_row`, `card` (the welcome window's large buttons), `search_field`, `section`, painted icons (`paint_glyph`, `table_icon`, `database_icon`, `paint_lock`, `sidebar_button`), grid `header_cell` / `row_number`. Use these instead of hard-coded colors |
+| `src/gui/panels.rs` | Menu bar, toolbar (title, segmented tab switcher, database pill), sidebar (Tables / Connections views, filter, footer) and status bar. The sidebar's table list merges the schema file's and the database's tables, marked from `App::table_drift` (one comparison queued at a time, cached in `Db::drift`; also the Migrate tab's badge) |
 | `src/gui/dialogs.rs` | The modal `Dialog`s |
 | `src/gui/file_menu.rs` | File menu actions on the database: dump, restore, run SQL file, check foreign keys (`Dialog::Integrity`) |
 | `src/gui/er.rs` | ER diagram canvas painted by hand (drag, pan, zoom). `ErAction::OpenData` opens a table in the Data tab (`App::open_table_data`, shared with the sidebar). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
@@ -159,7 +160,8 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   `egui::Panel::top/bottom/left(..).show(ui, ..)` and `CentralPanel::default().show(ui, ..)`;
   `MenuBar::new().ui(..)`; `ui.fonts_mut(..)` for layout. Check the crate source under
   `~/.cargo/registry/src/` before assuming older egui APIs.
-- egui's bundled fonts lack many symbols (▦ ▤ ◈ → showed as boxes). Check new icons on screen.
+- egui's bundled fonts lack many symbols (▦ ▤ ◈ → showed as boxes, 🔓 as a key). Check new icons on screen; simple icons are painted in `theme.rs`.
+- `MenuBar` takes all the width it is given: in a resizable panel that grows the panel every frame. Give it a bounded space (see `sidebar`, `toolbar`). The same goes for anything sized `f32::INFINITY` in the sidebar.
 - Code editors don't wrap lines (column selection maps the pointer to line/column by x
   position), so put them in a `ScrollArea::both`.
 - Read-only code goes through `highlight::code_view`, which forces a non-justified, non-wrapping

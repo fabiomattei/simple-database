@@ -23,7 +23,14 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | **Data** | Browse and edit tables, each in its own tab, 200 rows per page (see below) |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
 
-The sidebar lists the tables of the schema file and of the open database in one list, with
+The window follows the light or dark system theme (View menu to override). The toolbar shows what
+is open (table, query or schema file), the tab switcher, and the open database: click it for
+connections; the lock shows the [safe mode](#safe-mode) and ⟳ reads the database again. The
+sidebar (hide it with the button next to the menus) has a **Filter** box and two views:
+**Tables** and **Connections** (saved connections, favorites first, plus **Open file…**,
+**New…** and **Manage…**).
+
+The **Tables** view lists the tables of the schema file and of the open database in one list, with
 row counts. Once both are there, each table is marked by how the file differs from the
 database: **+** new, **~** changed, **→** renamed, **−** only in the database (Push drops it).
 The **Migrate** tab shows how many tables differ. Clicking a table moves the caret to it in the
@@ -32,7 +39,7 @@ for the others (**Open data**, **Show in schema**, **Show in diagram**, **Show t
 **Copy name**).
 
 The **Data** tab edits rows in place. Each table opens in its own tab (click it in the sidebar,
-use **➕** next to the tabs, or **Browse data** in the Diagram), and every tab keeps its page,
+use **+** next to the tabs, or **Browse data** in the Diagram), and every tab keeps its page,
 filters and unsaved changes while you look at another; a tab with changes waiting is marked •
 and can't be closed until they're saved or discarded. The open tabs are remembered per database and come
 back the next time you open it. Click a column header to sort (again to reverse, a third
@@ -48,9 +55,9 @@ and everything runs in one transaction. An update or delete that no longer match
 row (someone changed it meanwhile) rolls all of it back. Editing needs a primary key; tables
 without one can only get new rows. **Import…** inserts a CSV, TSV, JSON or JSON Lines file
 (preview and column mapping first; see `sdb import`), and **Export** saves every row that
-matches the filters.
+matches the filters. The bar under the grid shows the rows on the page and moves between pages.
 
-**File → Connections…** (Ctrl+K, or **Connections…** in the sidebar) manages saved
+**File → Connections…** (Ctrl+K, the database button in the toolbar, or **Manage…** in the sidebar's Connections view) manages saved
 connections (see [Saved connections](#saved-connections)). The list on the left has a search
 box (it matches name, host, database, user, type and group), **Favorites**, the five most
 **Recent** connections, and the rest in collapsible groups. Double-click a connection to
@@ -61,13 +68,15 @@ certificate files. **Import URL** fills the form from a pasted URL. **Detected i
 databases described next to the schema file or in the working directory (see `sdb conn
 detect`); click one to fill the form. **Test** connects without opening the database,
 **Connect** saves the form and connects (with an empty name it connects without saving), and
-**Duplicate** and **Delete** do what they say. Favorites and recent connections are also
-listed in the sidebar while no database is open. When a connection fails, for example because
+**Duplicate** and **Delete** do what they say. Saved connections are also
+listed in the sidebar's **Connections** view; click one to connect. When a connection fails, for example because
 a password is missing, the dialog opens with the error.
 
-At startup, unless a database is given on the command line, the app asks which database to
-use: reopen the last session's, connect to a saved connection, create a **New connection**,
-open a SQLite file, or continue without one. A new schema starts empty; **Help → Example
+At startup, unless a database is given on the command line, a welcome window asks which database to
+use. On the right, saved connections are large rows (favorites first, with a search box); one click
+connects, and the last session's database is listed when it isn't a saved one. On the left are
+**New connection…**, **Open SQLite file…**, **New SQLite database…** and **Continue without a
+database**. A new schema starts empty; **Help → Example
 schema** shows a sample blog schema and can open it in the editor.
 
 Each window works with one database, and its title names it. With a database already open,
@@ -545,7 +554,7 @@ cargo clippy --all-targets
 ```
 
 Source layout: `src/lib.rs` is the shared core and `src/main.rs` the CLI. `src/gui/` is the
-desktop app: `main.rs` (app state, window), `tabs/` (one file per tab), `panels.rs` (menu bar, sidebar, status bar), `dialogs.rs`, `file_menu.rs`, `er.rs` (diagram canvas), `er_layout.rs` (table placement), `grid.rs` (result grid),
+desktop app: `main.rs` (app state, window), `tabs/` (one file per tab), `panels.rs` (menu bar, toolbar, sidebar, status bar), `theme.rs` (colors, fonts, chrome widgets), `dialogs.rs`, `file_menu.rs`, `er.rs` (diagram canvas), `er_layout.rs` (table placement), `grid.rs` (result grid),
 `editor.rs` (code editor: line numbers, commands, find/replace, column selection, autocomplete), `highlight.rs` (syntax colors). Core modules: `parser.rs` (DSL) → `schema.rs` (model) → `validate.rs`, `ddl.rs`,
 `diff.rs`, `diagram.rs`, `format.rs`; `seed.rs` (fake data); `db.rs` (live connections), which
 dispatches to `sqlite.rs`, `pg.rs` and `mysqldb.rs` (introspection & queries); `shell.rs`, `output.rs`.
