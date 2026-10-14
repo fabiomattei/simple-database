@@ -38,9 +38,12 @@ pub fn run(db: Database) -> Result<()> {
         timer: true,
     };
     let mut rl = DefaultEditor::new()?;
-    let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".sdb_history"));
-    if let Some(h) = &history {
-        let _ = rl.load_history(h);
+    let history = crate::connections::config_dir().join("shell_history");
+    if rl.load_history(&history).is_err() {
+        // Older versions kept it in ~/.sdb_history, which only worked where HOME is set.
+        if let Some(home) = std::env::var_os("HOME") {
+            let _ = rl.load_history(&std::path::PathBuf::from(home).join(".sdb_history"));
+        }
     }
 
     let mode = match shell.db.safe_mode() {
@@ -80,10 +83,23 @@ pub fn run(db: Database) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    if let Some(h) = &history {
-        let _ = rl.save_history(h);
-    }
+    save_history(&mut rl, &history);
     Ok(())
+}
+
+/// Save the line history, readable only by the owner on Unix: statements can hold secrets.
+/// (rustyline creates a new file 0600, but keeps the mode of one that exists.)
+fn save_history(rl: &mut DefaultEditor, path: &std::path::Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if rl.save_history(path).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 impl Shell {

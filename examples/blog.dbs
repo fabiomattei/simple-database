@@ -3,6 +3,7 @@
 # column syntax:  name  type  [modifiers...]
 #   types:      int bigint smallint real decimal(p,s) bool text varchar(n)
 #               date time timestamp blob uuid json
+#               others as written, quoted if several words: "int unsigned"
 #   modifiers:  pk  autoincrement  unique  not null  default <value>
 #               check (<expr>)  -> table.column  on delete|update <action>
 #               was <old_name>  (renamed: migrations rename instead of drop + add)

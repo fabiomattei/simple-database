@@ -13,9 +13,10 @@ pub fn format_schema(schema: &Schema) -> String {
 }
 
 fn format_table(t: &Table) -> String {
-    let name_w = t.columns.iter().map(|c| c.name.len()).max().unwrap_or(0);
-    let types: Vec<String> = t.columns.iter().map(|c| c.data_type.to_string()).collect();
-    let type_w = types.iter().map(|s| s.len()).max().unwrap_or(0);
+    // Widths in characters, as `format!` pads.
+    let name_w = t.columns.iter().map(|c| c.name.chars().count()).max().unwrap_or(0);
+    let types: Vec<String> = t.columns.iter().map(|c| type_text(&c.name, &c.data_type)).collect();
+    let type_w = types.iter().map(|s| s.chars().count()).max().unwrap_or(0);
 
     let mut out = format!("table {}{} {{\n", t.name, was(&t.was));
     for (c, ty) in t.columns.iter().zip(&types) {
@@ -82,6 +83,16 @@ fn modifiers(c: &Column) -> Vec<String> {
         m.push(was.trim_start().to_string());
     }
     m
+}
+
+/// The type of `column` as the DSL writes it. Types that wouldn't parse back
+/// as written are quoted: MySQL's `"int unsigned"`, or `"enum('a')"` on a
+/// column called `index`, which would read as an index.
+pub fn type_text(column: &str, t: &DataType) -> String {
+    let text = t.to_string();
+    let plain = parse(&format!("table t {{ {column} {text} }}"))
+        .is_ok_and(|s| s.tables[0].columns.first().is_some_and(|c| c.data_type == *t));
+    if plain { text } else { format!("\"{}\"", text.replace('"', "\"\"")) }
 }
 
 /// ` was a` or ` was (a, b)`; empty without earlier names.
@@ -232,15 +243,34 @@ fn code_part(line: &str) -> Option<&str> {
 fn split_column(line: &str) -> Option<(&str, String, &str)> {
     let code = code_part(line)?;
     let (name, after) = code.split_once(char::is_whitespace)?;
-    if name.contains('(') || ["index", "unique", "pk", "primary"].contains(&name.to_ascii_lowercase().as_str()) {
+    let after = after.trim_start();
+    // Table-level items, told apart from columns named like them as `parse_table_item` does.
+    let word = after.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).next().unwrap_or("");
+    let paren_after_word = after[word.len()..].trim_start().starts_with('(');
+    let constraint = match name.to_ascii_lowercase().as_str() {
+        "pk" => after.starts_with('('),
+        "unique" => after.starts_with('(') || word.eq_ignore_ascii_case("index"),
+        "primary" => word.eq_ignore_ascii_case("key") && paren_after_word,
+        "index" => after.starts_with('(') || (!word.is_empty() && paren_after_word && matches!(DataType::parse(word), DataType::Custom(_))),
+        _ => false,
+    };
+    if name.contains('(') || constraint {
         return None;
     }
-    let after = after.trim_start();
     let offset = code.len() - after.len();
     let mut ty = String::new();
     let mut depth = 0;
     let mut end = after.len();
+    // A quoted type such as `"int unsigned"` is one piece.
+    let mut quoted = false;
     for (i, c) in after.char_indices() {
+        if c == '"' && (i == 0 || quoted) {
+            quoted = !quoted;
+        }
+        if quoted {
+            ty.push(c);
+            continue;
+        }
         if depth == 0 && c.is_whitespace() {
             // `decimal (10, 2)`: the arguments still belong to the type.
             let next = after[i..].trim_start();
@@ -336,5 +366,108 @@ mod tests {
         new.tables[0].columns[0].unique = true;
         assert_eq!(patch(hinted, &new), "table a was old {\n  x  int  pk unique was y\n}\n");
     }
-}
 
+    /// Random schemas of the kind the parser produces, and the custom types
+    /// introspection reports, must survive `format_schema` and `parse`.
+    #[test]
+    fn random_schemas_round_trip() {
+        use crate::seed::Rng;
+        const NAMES: &[&str] = &[
+            "id", "name", "user_id", "date", "time", "text", "json", "type", "key", "order", "select",
+            "table", "was", "on", "not", "null", "check", "default", "pk", "primary", "unique", "index",
+            "_x", "a1", "É", "createdAt",
+        ];
+        const TYPES: &[&str] = &[
+            "int", "bigint", "smallint", "real", "decimal(10,2)", "bool", "text", "varchar(40)", "date",
+            "time", "timestamp", "blob", "uuid", "json", "geometry", "citext", "character(10)",
+            "enum('a', 'b,c')", "int unsigned", "time with time zone", "integer[]", "bit varying(5)",
+            "decimal(8,2) unsigned",
+        ];
+        const EXPRS: &[&str] = &[
+            "1 + 2", "lower('A')", "gen_random_uuid()", "x || ')'", "a in ('b', 'c''d')", "\"q\" > 0",
+            "(a)", "n between 1 and 9", "s <> '#' and s <> '//'", "current_date",
+        ];
+        const STRINGS: &[&str] = &["", "it's", "a, b; c", "# not a comment", "// nor this", "{ }", "->", "\"", "x\ny", "(", "é"];
+        const NUMBERS: &[&str] = &["0", "-1", "3.14", "1e3", "1."];
+        const ACTIONS: [RefAction; 5] =
+            [RefAction::NoAction, RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault, RefAction::Restrict];
+
+        let mut rng = Rng(42);
+        // `lo..=hi` distinct names.
+        let names = |rng: &mut Rng, lo: i64, hi: i64| {
+            let n = rng.range(lo, hi) as usize;
+            let mut out: Vec<String> = Vec::new();
+            while out.len() < n {
+                let name = rng.pick(NAMES).to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            out
+        };
+        let mut failures = Vec::new();
+        for _ in 0..2000 {
+            let mut schema = Schema::default();
+            let table_names = names(&mut rng, 1, 3);
+            for tname in table_names {
+                let cols = names(&mut rng, 0, 5);
+                let inline_pk = !cols.is_empty() && rng.chance(0.4);
+                let mut columns = Vec::new();
+                for (i, cname) in cols.iter().enumerate() {
+                    let mut c = Column::new(cname.clone(), DataType::parse(rng.pick(TYPES)));
+                    c.primary_key = inline_pk && i == 0;
+                    c.auto_increment = c.primary_key && rng.chance(0.5);
+                    c.unique = rng.chance(0.2);
+                    c.nullable = !c.primary_key && rng.chance(0.6);
+                    c.default = match rng.range(0, 7) {
+                        0 => Some(DefaultValue::Null),
+                        1 => Some(DefaultValue::Bool(rng.chance(0.5))),
+                        2 => Some(DefaultValue::Number(rng.pick(NUMBERS).to_string())),
+                        3 => Some(DefaultValue::String(rng.pick(STRINGS).to_string())),
+                        4 => Some(DefaultValue::Now),
+                        5 => Some(DefaultValue::Expr(rng.pick(EXPRS).to_string())),
+                        _ => None,
+                    };
+                    c.check = rng.chance(0.2).then(|| rng.pick(EXPRS).to_string());
+                    if rng.chance(0.25) {
+                        c.references = Some(ForeignKey {
+                            table: rng.pick(NAMES).to_string(),
+                            column: rng.pick(NAMES).to_string(),
+                            on_delete: *rng.pick(&ACTIONS),
+                            on_update: *rng.pick(&ACTIONS),
+                        });
+                    }
+                    c.was = names(&mut rng, 0, 2);
+                    columns.push(c);
+                }
+                let composite_pk = if !inline_pk && cols.len() >= 2 && rng.chance(0.3) { cols[..2].to_vec() } else { vec![] };
+                let mut indexes = Vec::new();
+                for _ in 0..if cols.is_empty() { 0 } else { rng.range(0, 2) } {
+                    let unique = rng.chance(0.5);
+                    let columns = vec![rng.pick(&cols).clone()];
+                    let name = if rng.chance(0.5) {
+                        format!("{tname}_{}_{}", columns[0], if unique { "key" } else { "idx" })
+                    } else {
+                        format!("{}_ix", rng.pick(NAMES))
+                    };
+                    indexes.push(Index { name, columns, unique });
+                }
+                let was = names(&mut rng, 0, 2);
+                schema.tables.push(Table { name: tname, columns, composite_pk, indexes, was });
+            }
+            let printed = format_schema(&schema);
+            match parse(&printed) {
+                Ok(back) if back == schema => {
+                    // `align` works line by line and leaves text with multi-line strings alone.
+                    let expected = (!printed.contains("x\ny")).then_some(printed.as_str());
+                    if align(&printed).as_deref() != expected {
+                        failures.push(format!("align changes it:\n{printed}\n{:?}", align(&printed)));
+                    }
+                }
+                Ok(_) => failures.push(format!("parses differently:\n{printed}")),
+                Err(e) => failures.push(format!("{e}:\n{printed}")),
+            }
+        }
+        assert!(failures.is_empty(), "{} of 2000 failed, e.g.\n{}", failures.len(), failures[..failures.len().min(3)].join("\n"));
+    }
+}

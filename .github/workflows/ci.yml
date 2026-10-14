@@ -7,13 +7,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The live round-trip tests drop every table in these scratch databases.
-  SDB_TEST_POSTGRES: postgres://sdb:sdb@localhost:5432/sdb
-  SDB_TEST_MYSQL: mysql://sdb:sdb@127.0.0.1:3306/sdb
 
 jobs:
   test:
+    name: Linux (SQLite, PostgreSQL, MySQL)
     runs-on: ubuntu-latest
+    env:
+      # The live round-trip tests drop every table in these scratch databases.
+      SDB_TEST_POSTGRES: postgres://sdb:sdb@localhost:5432/sdb
+      SDB_TEST_MYSQL: mysql://sdb:sdb@127.0.0.1:3306/sdb
     services:
       postgres:
         image: postgres:17-alpine
@@ -44,4 +46,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests (SQLite, PostgreSQL, MySQL)
+        run: cargo test
+
+  # Service containers only run on Linux runners, so the server tests skip
+  # themselves here. Clippy runs per OS: `#[cfg(not(unix))]` code is only
+  # checked on Windows.
+  portable:
+    name: ${{ matrix.os }} (SQLite)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
         run: cargo test

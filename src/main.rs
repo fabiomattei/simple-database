@@ -282,7 +282,23 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Fmt { schema, write } => {
-            let text = format::format_schema(&load_schema(&schema)?);
+            let s = load_schema(&schema)?;
+            let source = (schema.is_file() && !sqlite::is_sqlite_file(&schema))
+                .then(|| std::fs::read_to_string(&schema))
+                .transpose()?;
+            if write && source.is_none() {
+                bail!("{} is a database, not a schema file; --write would overwrite it", schema.display());
+            }
+            // Re-align the text as written, keeping its comments, when `align` can.
+            let text = match source.as_deref().map(|src| (src, format::align(src))) {
+                Some((_, Some(aligned))) => aligned,
+                Some((src, None)) if write && (src.contains('#') || src.contains("//")) => bail!(
+                    "{} can't be re-aligned in place, and reprinting it would drop its comments; \
+                     run without --write to see the reprinted schema",
+                    schema.display()
+                ),
+                _ => format::format_schema(&s),
+            };
             if write {
                 std::fs::write(&schema, text)?;
                 println!("Formatted {}", schema.display());

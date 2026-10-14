@@ -46,6 +46,7 @@ pub fn print_reports(reports: &[TableReport]) {
 const MAX_CONSECUTIVE_FAILURES: usize = 50;
 
 pub fn seed(db: &mut Database, opts: &SeedOptions) -> Result<Vec<TableReport>> {
+    db.ensure_writable()?;
     let schema = db.introspect()?;
     for name in opts.only.iter().chain(opts.counts.keys()) {
         anyhow::ensure!(schema.table(name).is_some(), "no such table: {name}");
@@ -229,7 +230,7 @@ fn literal(v: &Value, ty: &DataType, d: Dialect) -> String {
 // ---------------------------------------------------------------- randomness
 
 /// SplitMix64: tiny, fast and good enough for fake data. Seedable so runs are reproducible.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
     fn next_u64(&mut self) -> u64 {
@@ -241,7 +242,7 @@ impl Rng {
     }
 
     /// Uniform integer in `lo..=hi`.
-    fn range(&mut self, lo: i64, hi: i64) -> i64 {
+    pub(crate) fn range(&mut self, lo: i64, hi: i64) -> i64 {
         if hi <= lo {
             return lo;
         }
@@ -252,11 +253,11 @@ impl Rng {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn chance(&mut self, p: f64) -> bool {
+    pub(crate) fn chance(&mut self, p: f64) -> bool {
         self.f64() < p
     }
 
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+    pub(crate) fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
         &xs[self.range(0, xs.len() as i64 - 1) as usize]
     }
 }

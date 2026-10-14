@@ -176,4 +176,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(ago(100, 100 + 7200), "2 h ago");
     }
+
+    #[test]
+    fn caps_clears_and_keeps_history_private() {
+        let dir = std::env::temp_dir().join(format!("sdb-history-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut log = QueryLog::load_from(&dir).unwrap();
+        let entry = |i: usize| Entry { sql: format!("SELECT {i}"), database: "a.db".into(), at: i as u64, ..Default::default() };
+        log.history = (0..MAX_HISTORY + 19).map(entry).collect();
+        log.record(entry(MAX_HISTORY + 19)).unwrap();
+        let log2 = QueryLog::load_from(&dir).unwrap();
+        assert_eq!(log2.history.len(), MAX_HISTORY);
+        assert_eq!(log2.history[0].sql, "SELECT 20", "the oldest go first");
+        assert_eq!(log2.search("select 519")[0].at, 519);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("history.json")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "history can hold secrets");
+        }
+        log.clear_history().unwrap();
+        assert!(QueryLog::load_from(&dir).unwrap().history.is_empty());
+
+        log.save_query("x", "SELECT 1").unwrap();
+        log.remove_query("x").unwrap();
+        assert!(QueryLog::load_from(&dir).unwrap().saved.is_empty());
+
+        // Fields added later default when an older file lacks them; a broken file is an error.
+        std::fs::write(dir.join("history.json"), r#"{"entries": [{"sql": "SELECT 1"}]}"#).unwrap();
+        assert_eq!(QueryLog::load_from(&dir).unwrap().history[0].database, "");
+        std::fs::write(dir.join("queries.json"), "{").unwrap();
+        assert!(QueryLog::load_from(&dir).unwrap_err().to_string().contains("queries.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ago_reads_naturally() {
+        assert_eq!(ago(100, 100), "just now");
+        assert_eq!(ago(100, 159), "just now");
+        assert_eq!(ago(100, 160), "1 min ago");
+        assert_eq!(ago(0, 3599), "59 min ago");
+        assert_eq!(ago(0, 86_400 * 3), "3 d ago");
+        assert_eq!(ago(200, 100), "just now", "a clock that went back");
+    }
 }

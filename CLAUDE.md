@@ -6,6 +6,8 @@ in a small DSL (`.dbs`). The tool validates them, generates DDL for SQLite/Postg
 ER diagrams, diffs schemas into migrations, dumps and restores databases, pushes to and pulls from live SQLite, PostgreSQL and
 MySQL databases, seeds fake data and runs SQL. The README documents the DSL, every CLI command and every GUI tab.
 
+**It must build and work on macOS, Linux and Windows**, both binaries. See [Cross-platform](#cross-platform).
+
 ## Commands
 
 ```sh
@@ -15,16 +17,17 @@ cargo clippy --all-targets      # keep at zero warnings
 cargo run --bin sdb-gui -- schema.dbs app.db --tab diagram
 ```
 
-- CI (`.github/workflows/ci.yml`) runs clippy with `-D warnings` and `cargo test` with Postgres and
-  MySQL service containers (`SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` set), so server tests must pass too.
+- CI (`.github/workflows/ci.yml`) runs clippy with `-D warnings` and `cargo test` on Linux with
+  Postgres and MySQL service containers (`SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` set), so server
+  tests must pass too, and on macOS and Windows without them (SQLite only).
 - `cargo test` and `cargo clippy` do **not** rebuild the binaries (`tests/cli.rs` does build `sdb`). Run `cargo build` before
   manual end-to-end checks, or you are testing a stale binary.
 - The first build (and any release build) is slow, 1–2 minutes, because of eframe/wgpu. Every
   binary pulls in all package dependencies.
 - Do manual end-to-end runs in a scratch directory, e.g.
   `sdb init && sdb push schema.dbs --db app.db -y && sdb seed --db app.db`.
-- Stop a running app with `pkill -x sdb-gui`. `pkill -f sdb-gui` also matches, and kills, the
-  shell whose command line contains it.
+- Stop a running app with `pkill -x sdb-gui` (macOS, Linux) or `taskkill /IM sdb-gui.exe /F`
+  (Windows). `pkill -f sdb-gui` also matches, and kills, the shell whose command line contains it.
 
 ## Architecture
 
@@ -38,8 +41,8 @@ Core library (`src/`, exported from `lib.rs`):
 | Module | Role |
 |---|---|
 | `lib.rs` | Module list plus `STARTER_SCHEMA` (`include_str!` of `examples/blog.dbs`) |
-| `parser.rs` | `.dbs` DSL → `Schema`. Hand-written tokenizer: `(...)` groups become one raw `Paren` token, and newline, `,` and `;` all end a statement. `outline` / `locate`: lenient table/column → line scan for the editor, works on text that doesn't parse |
-| `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Pull). `align` re-aligns columns in place keeping comments (GUI Format); it returns `None` unless the result parses to the same schema. `patch` rewrites only the changed tables of a text (SQL tab and Diagram edits → schema text); `patch_renamed` also reprints renamed tables in place |
+| `parser.rs` | `.dbs` DSL → `Schema`. Hand-written tokenizer: `(...)` groups become one raw `Paren` token, and newline, `,` and `;` all end a statement. A quoted type is taken as written (`"int unsigned"`). `outline` / `locate`: lenient table/column → line scan for the editor, works on text that doesn't parse |
+| `format.rs` | `Schema` → `.dbs` text (`pull`, shell `.schema`, GUI Pull); `type_text` quotes types that wouldn't parse back. `align` re-aligns columns in place keeping comments (`fmt`, GUI Format); it returns `None` unless the result parses to the same schema. `patch` rewrites only the changed tables of a text (SQL tab and Diagram edits → schema text); `patch_renamed` also reprints renamed tables in place |
 | `validate.rs` | Errors (unusable schema) and warnings (design lint); `print_issues` is the CLI's ANSI printer |
 | `ddl.rs` | `Dialect` enum and all CREATE/DROP SQL; `quote()` quotes only when needed; `canonical()` = the schema as a dialect reports it back |
 | `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change. `apply_renames` first turns `was` hints (`Table::was` / `Column::was`) into RENAMEs, including the constraints named after the old names; `canonical` strips the hints |
@@ -57,7 +60,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `mysqldb.rs` | MySQL via the `mysql` crate (pure Rust, rustls): `information_schema` introspection; checks are parsed from `SHOW CREATE TABLE` |
 | `tls.rs` | TLS for both servers from libpq-style URL parameters (`sslmode`, default `prefer`; `sslrootcert`, `sslcert`, `sslkey`). `split_url` strips them before the URL reaches the driver; `client_config` builds the rustls config |
 | `seed.rs` | Fake data. Seedable SplitMix64 RNG (no `rand` crate), heuristics based on column names, retries on constraint errors |
-| `shell.rs` | CLI REPL (rustyline) and its `.meta` commands |
+| `shell.rs` | CLI REPL (rustyline) and its `.meta` commands; line history in `config_dir()/shell_history`, 0600 on Unix |
 | `output.rs` | CLI table / csv / json / markdown rendering (comfy-table 8: `load_style`, not `load_preset`); `export` to files (adds TSV, JSONL, HTML, SQL INSERTs) |
 
 Binaries:
@@ -96,8 +99,8 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   push on an up-to-date database reports no changes. This is why SQLite DDL emits specific
   declared types (`BOOLEAN`, `VARCHAR(n)`, `DECIMAL(p,s)`, `TIMESTAMP`) instead of only the
   affinity types. It is also why bare-word default expressions are lowercased in both the parser
-  and introspection. Test: `sqlite::tests::introspection_round_trips_generated_ddl`.
-- **Round-trip with the DSL**: `parse(format_schema(s)) == s`. Test: `format::tests::round_trips`.
+  and introspection. Tests: `sqlite::tests::introspection_round_trips_generated_ddl` and `random_schemas_round_trip_through_sqlite` (names that need quoting).
+- **Round-trip with the DSL**: `parse(format_schema(s)) == s`, and `align` leaves `format_schema` output alone. Tests: `format::tests::round_trips` and `random_schemas_round_trip` (keyword names, multi-word types, odd defaults). Add new DSL features to its generator.
 - **Any DSL change** touches `parser.rs` (parse), `format.rs` (print), the round-trip tests and
   the `examples/blog.dbs` header. It usually also touches `ddl.rs`, `diff.rs`, `sqlite.rs`
   introspection, the README syntax table and the keyword lists in `gui/highlight.rs` (which also feed autocomplete).
@@ -151,16 +154,47 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   `self.dialog`, and remove the hook afterwards.
 - The Migrate tab diffs in the open database's dialect (`Database::migration`), whatever
   dialect the SQL tab shows. Saved settings keep server URLs without the password.
-- **Checking it visually on this machine** (GNOME Wayland, no xdotool/Xvfb):
+- **Checking it visually.** Use `--tab schema|diagram|sql|migrate|query|data|seed` to reach each
+  screen, and pass files explicitly. On macOS, `screencapture -x out.png` captures the screen (the
+  terminal needs the Screen Recording permission). On Windows there is no scripted recipe; ask the
+  user for a screenshot. On Linux (GNOME Wayland, no xdotool/Xvfb):
   1. Run it under XWayland: `env -u WAYLAND_DISPLAY target/debug/sdb-gui schema.dbs app.db --tab <tab> &`.
   2. Find the window by matching `_NET_WM_PID` against the ids in
      `xprop -root _NET_CLIENT_LIST`.
   3. Capture with `import -window <id> out.png`, then kill the process.
-  4. Use `--tab schema|diagram|sql|migrate|query|data|seed` to reach each screen.
 
   Don't inject input with XTest. Under Wayland it goes through the compositor's remote-desktop
   permission and pops up a prompt for the user. Clicks and drags therefore can't be automated
   here, so verify button actions through the library code they call.
+
+## Cross-platform
+
+Supported: macOS, Linux and Windows. CI builds, lints and tests on all three; only Linux has the
+Postgres/MySQL servers. Locally you can only check your own OS: `cargo check --target` for
+another doesn't work, because the bundled SQLite and wgpu build C code for the target. So keep
+code portable by construction, and let CI confirm it:
+
+- **Paths**: `Path` / `PathBuf` and `join`, never a hard-coded `/` or `\`. Temporary files go in
+  `std::env::temp_dir()`, never `/tmp`. Display paths with `.display()`.
+- **Per-user files** go through `connections::config_dir()`: `SDB_CONFIG_DIR`, else `%APPDATA%\sdb`
+  on Windows, else `$XDG_CONFIG_HOME/sdb`, else `~/.config/sdb` (macOS too). Don't read `HOME`
+  directly: Windows doesn't set it. (The shell only falls back to an old `~/.sdb_history`.)
+- **Unix-only APIs** (`std::os::unix`, file modes) sit behind `#[cfg(unix)]`, with the other
+  platforms handled explicitly (`#[cfg(not(unix))]`), as in `connections::write_file`. Secrets and
+  history are private through mode 0600 on Unix, and through the per-user `%APPDATA%` on Windows.
+- **Line endings**: `.gitattributes` keeps the repository LF on every checkout (`blog.dbs` is
+  compiled in, and tests compare `\n` output). Files written on Windows have CRLF: readers of
+  schemas, SQL scripts and CSV/TSV must accept `\r\n` (the tokenizers treat `\r` as
+  whitespace); sdb writes `\n`.
+- **Keyboard shortcuts** in the GUI use `Modifiers::COMMAND` / `modifiers.command` (Cmd on macOS,
+  Ctrl elsewhere), not `ctrl`, unless the key really is Ctrl on every platform.
+- **No external programs**: don't shell out to `sh`, `which`, `open`, `xdg-open` and the like.
+  Use crates that cover all three (e.g. `rfd` for file dialogs).
+- **Terminal output** uses ANSI colors, which Windows 10+ terminals render. Don't rely on a Unix
+  terminal for anything else (signals, `isatty` tricks, raw mode outside rustyline).
+- **Tests** follow the same rules: build paths with `join` and `temp_dir()`, wrap Unix-only
+  assertions (file modes) in `#[cfg(unix)]`. `tests/cli.rs` sets `HOME` and `SDB_CONFIG_DIR` to
+  its scratch directory.
 
 ## Conventions
 

@@ -2,7 +2,7 @@
 //! columns as a grid and produces the whole changed schema.
 
 use eframe::egui::{self, Pos2, RichText};
-use simple_database::parser;
+use simple_database::{format, parser};
 use simple_database::schema::{RefAction, Schema, Table, note_rename};
 use simple_database::validate::{self, Severity};
 
@@ -56,7 +56,7 @@ impl TableEditor {
             .map(|c| Row {
                 original: Some(c.name.clone()),
                 name: c.name.clone(),
-                ty: c.data_type.to_string(),
+                ty: format::type_text(&c.name, &c.data_type),
                 pk: c.primary_key,
                 not_null: !c.nullable,
                 unique: c.unique,
@@ -214,7 +214,7 @@ impl TableEditor {
             .tables
             .iter()
             .filter(|t| Some(&t.name) != self.original.as_ref())
-            .flat_map(|t| t.columns.iter().map(move |c| (format!("{}.{}", t.name, c.name), c.data_type.to_string())));
+            .flat_map(|t| t.columns.iter().map(move |c| (format!("{}.{}", t.name, c.name), format::type_text(&c.name, &c.data_type))));
         own.chain(others).collect()
     }
 

@@ -189,7 +189,12 @@ fn parse_default(raw: &str, ty: &DataType) -> DefaultValue {
     if s.starts_with('(') && s.ends_with(')') {
         return DefaultValue::Expr(s[1..s.len() - 1].trim().to_string());
     }
-    DefaultValue::Expr(s.to_ascii_lowercase())
+    // Bare words are lowercased, as the parser does; anything else may hold
+    // string literals, so it stays as written.
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return DefaultValue::Expr(s.to_ascii_lowercase());
+    }
+    DefaultValue::Expr(s.to_string())
 }
 
 /// Split `s` on `sep` occurring outside parentheses and quotes.
@@ -231,10 +236,10 @@ fn column_checks(create_sql: &str) -> Vec<(String, String)> {
         if is_constraint {
             continue;
         }
-        let col = first.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string();
-        let upper = item.to_ascii_uppercase();
-        let Some(pos) = upper.find("CHECK") else { continue };
-        let rest = &item[pos + 5..];
+        let (col, rest) = leading_ident(item);
+        // The CHECK keyword, not the word inside a string, a name or another expression.
+        let Some(kw) = crate::safety::scan(rest).into_iter().find(|w| w.depth == 0 && w.text == "check") else { continue };
+        let rest = &rest[kw.at + 5..];
         let Some(start) = rest.find('(') else { continue };
         let mut depth = 0;
         let mut end = None;
@@ -260,6 +265,33 @@ fn column_checks(create_sql: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The leading identifier of a column definition, unquoted, and the rest.
+fn leading_ident(item: &str) -> (String, &str) {
+    let close = match item.chars().next() {
+        Some('"') => '"',
+        Some('`') => '`',
+        Some('[') => ']',
+        _ => {
+            let end = item.find(char::is_whitespace).unwrap_or(item.len());
+            return (item[..end].to_string(), &item[end..]);
+        }
+    };
+    let mut name = String::new();
+    let mut chars = item.char_indices().skip(1).peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == close {
+            // A doubled quote stands for itself.
+            if close != ']' && chars.next_if(|&(_, n)| n == close).is_some() {
+                name.push(c);
+                continue;
+            }
+            return (name, &item[i + 1..]);
+        }
+        name.push(c);
+    }
+    (name, "")
 }
 
 /// The original CREATE statement(s) for a table and its indexes.
@@ -427,6 +459,26 @@ mod tests {
     }
 
     #[test]
+    fn finds_checks_by_keyword() {
+        let sql = r#"CREATE TABLE t (
+            checked BOOLEAN DEFAULT 0,
+            note TEXT DEFAULT 'check (x)',
+            "two words" TEXT CHECK ("two words" <> ''),
+            "a""b" INT CHECK (("a""b") > 0),
+            [c] INT check(c < 9),
+            CHECK (checked IN (0, 1))
+        )"#;
+        assert_eq!(
+            column_checks(sql),
+            [
+                ("two words".to_string(), r#""two words" <> ''"#.to_string()),
+                ("a\"b".into(), r#"("a""b") > 0"#.into()),
+                ("c".into(), "c < 9".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn runs_mixed_statements() {
         let conn = Connection::open_in_memory().unwrap();
         let r = run(&conn, "CREATE TABLE t (a, b); INSERT INTO t VALUES (1, 'x'), (2, NULL); SELECT * FROM t").unwrap();
@@ -435,5 +487,105 @@ mod tests {
         assert_eq!(r[2].columns, vec!["a", "b"]);
         assert_eq!(r[2].rows.len(), 2);
         assert!(matches!(r[2].rows[1][1], Cell::Null));
+    }
+
+    /// Random valid schemas, with names that need quoting, come back from
+    /// SQLite exactly as they went in.
+    #[test]
+    fn random_schemas_round_trip_through_sqlite() {
+        use crate::schema::*;
+        use crate::seed::Rng;
+        const NAMES: &[&str] = &["id", "name", "order", "select", "table", "index", "key", "group", "É", "two words", "MixedCase", "a\"b"];
+        let types = [
+            DataType::Int, DataType::BigInt, DataType::SmallInt, DataType::Real, DataType::Decimal(8, 2), DataType::Bool,
+            DataType::Text, DataType::Varchar(40), DataType::Date, DataType::Time, DataType::Timestamp, DataType::Blob,
+            DataType::Uuid, DataType::Json,
+        ];
+        let actions = [RefAction::NoAction, RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault, RefAction::Restrict];
+
+        let mut rng = Rng(7);
+        let mut failures = Vec::new();
+        for round in 0..300 {
+            let mut schema = Schema::default();
+            for t in 0..rng.range(1, 4) {
+                let tname = format!("{}{t}", rng.pick(NAMES));
+                let mut names: Vec<String> = Vec::new();
+                while names.len() < rng.range(1, 5) as usize {
+                    let n = rng.pick(NAMES).to_string();
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+                let composite = names.len() >= 2 && rng.chance(0.3);
+                let mut columns = Vec::new();
+                for (i, cname) in names.iter().enumerate() {
+                    let mut c = Column::new(cname.clone(), rng.pick(&types).clone());
+                    if i == 0 && !composite {
+                        c.data_type = DataType::Int;
+                        c.primary_key = true;
+                        c.nullable = false;
+                        c.auto_increment = rng.chance(0.5);
+                    } else {
+                        c.nullable = (composite && i < 2) || rng.chance(0.6);
+                        c.unique = rng.chance(0.2);
+                        c.default = match (&c.data_type, rng.range(0, 3)) {
+                            (_, 0) => None,
+                            (DataType::Bool, _) => Some(DefaultValue::Bool(rng.chance(0.5))),
+                            (t, _) if t.is_integer() => Some(DefaultValue::Number("-3".into())),
+                            (DataType::Real | DataType::Decimal(..), _) => Some(DefaultValue::Number("1.5".into())),
+                            (DataType::Timestamp, _) => Some(DefaultValue::Now),
+                            (DataType::Text | DataType::Varchar(_), 1) => Some(DefaultValue::String("it's, \"x\"".into())),
+                            (DataType::Text | DataType::Varchar(_), _) => Some(DefaultValue::Expr("lower('A')".into())),
+                            _ => None,
+                        };
+                        if rng.chance(0.2) {
+                            c.check = Some("1 < 2".into());
+                        }
+                        // Reference the single-column key of an earlier table.
+                        let targets: Vec<&Table> = schema.tables.iter().filter(|t| t.composite_pk.is_empty()).collect();
+                        if !targets.is_empty() && rng.chance(0.4) {
+                            let target = rng.pick(&targets);
+                            c.data_type = DataType::Int;
+                            c.default = None;
+                            c.references = Some(ForeignKey {
+                                table: target.name.clone(),
+                                column: target.columns[0].name.clone(),
+                                on_delete: *rng.pick(&actions),
+                                on_update: *rng.pick(&actions),
+                            });
+                        }
+                    }
+                    columns.push(c);
+                }
+                let composite_pk = if composite { names[..2].to_vec() } else { vec![] };
+                let mut indexes = Vec::new();
+                if names.len() >= 2 && rng.chance(0.5) {
+                    let unique = rng.chance(0.5);
+                    let cols = vec![names[names.len() - 1].clone()];
+                    let name = format!("{tname}_{}_{}", cols[0], if unique { "key" } else { "idx" });
+                    indexes.push(Index { name, columns: cols, unique });
+                }
+                schema.tables.push(Table { name: tname, columns, composite_pk, indexes, was: vec![] });
+            }
+            let sql = schema_sql(&schema, Dialect::Sqlite);
+            let conn = Connection::open_in_memory().unwrap();
+            if let Err(e) = conn.execute_batch(&sql) {
+                failures.push(format!("round {round}: {e}\n{sql}"));
+                continue;
+            }
+            let mut skipped = Vec::new();
+            let pulled = introspect(&conn, &mut skipped).unwrap();
+            if pulled != schema || !skipped.is_empty() {
+                let mut diff = format!("{} tables -> {}", schema.tables.len(), pulled.tables.len());
+                for (a, b) in schema.tables.iter().zip(&pulled.tables).filter(|(a, b)| a != b) {
+                    diff = match a.columns.iter().zip(&b.columns).find(|(x, y)| x != y) {
+                        Some((x, y)) => format!("column\n  {x:?}\n  {y:?}"),
+                        None => format!("table\n  {:?} {:?}\n  {:?} {:?}", a.composite_pk, a.indexes, b.composite_pk, b.indexes),
+                    };
+                }
+                failures.push(format!("round {round}: {skipped:?}\n{sql}\n{diff}"));
+            }
+        }
+        assert!(failures.is_empty(), "{} of 300 failed, e.g.\n{}", failures.len(), failures[..failures.len().min(2)].join("\n"));
     }
 }

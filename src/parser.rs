@@ -416,11 +416,18 @@ impl Parser {
 
     fn parse_column(&mut self) -> Result<Column, ParseError> {
         let name = self.expect_word("column name")?;
-        let mut type_str = self.expect_word(&format!("type for column '{name}'"))?;
-        if let Tok::Paren(args) = self.peek().clone() {
+        let type_str = if let Tok::Str(quoted) = self.peek().clone() {
+            // A quoted type is taken as written: `"int unsigned"`.
             self.pos += 1;
-            type_str = format!("{type_str}({args})");
-        }
+            quoted
+        } else {
+            let mut type_str = self.expect_word(&format!("type for column '{name}'"))?;
+            if let Tok::Paren(args) = self.peek().clone() {
+                self.pos += 1;
+                type_str = format!("{type_str}({args})");
+            }
+            type_str
+        };
         let mut col = Column::new(name, DataType::parse(&type_str));
 
         loop {

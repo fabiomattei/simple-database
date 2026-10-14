@@ -150,7 +150,7 @@ table post_tags {
 
 | | |
 |---|---|
-| Types | `int bigint smallint real decimal(p,s) bool text varchar(n) date time timestamp blob uuid json` (anything else is passed through verbatim) |
+| Types | `int bigint smallint real decimal(p,s) bool text varchar(n) date time timestamp blob uuid json` (anything else is passed through verbatim; quote a type of several words: `"int unsigned"`) |
 | Column modifiers | `pk` `autoincrement` `unique` `not null` `null` `default <v>` `check (<expr>)` `-> table.col` (or `references table(col)`) `on delete <a>` `on update <a>` `was <old>` (or `was (a, b)`) |
 | Referential actions | `cascade` `set_null` `set_default` `restrict` `no_action` |
 | Defaults | `'text'` `42` `true` `null` `now` `fn()` `(any sql expression)` |
@@ -320,7 +320,7 @@ sdb diff prod_snapshot.dbs schema.dbs -d postgres -o migrations/002.sql
 `.tables` `.schema [t]` `.sql [t]` `.ddl <dialect>` `.diagram [mermaid|dot]` `.check`
 `.seed [rows] [tables...]` `.mode table|csv|json|markdown` `.timer on|off` `.read file.sql` `.help` `.quit`
 
-Statements end with `;` and may span lines. History is saved to `~/.sdb_history`.
+Statements end with `;` and may span lines. History is saved to `shell_history` in the same folder as [saved connections](#saved-connections), readable only by you.
 
 ## Seeding fake data
 

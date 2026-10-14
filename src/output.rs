@@ -32,12 +32,17 @@ pub fn render(r: &QueryResult, format: OutputFormat) -> String {
                 t.load_style(presets::UTF8_FULL_CONDENSED);
                 t.set_content_arrangement(ContentArrangement::Dynamic);
             }
-            t.set_header(r.columns.iter().map(|c| TCell::new(c).fg(Color::Cyan)));
+            // A Markdown cell must stay on one line, and `|` would end it.
+            let text = |s: String| match format {
+                OutputFormat::Markdown => s.replace('|', "\\|").replace("\r\n", "<br>").replace(['\n', '\r'], "<br>"),
+                _ => s,
+            };
+            t.set_header(r.columns.iter().map(|c| TCell::new(text(c.clone())).fg(Color::Cyan)));
             for row in &r.rows {
                 t.add_row(row.iter().map(|c| match c {
                     Cell::Null if format == OutputFormat::Table => TCell::new("NULL").fg(Color::DarkGrey),
                     _ if c.is_number() => TCell::new(c.display()).set_alignment(comfy_table::CellAlignment::Right),
-                    _ => TCell::new(c.display()),
+                    _ => TCell::new(text(c.display())),
                 }));
             }
             let footer = if format == OutputFormat::Table {
@@ -48,12 +53,12 @@ pub fn render(r: &QueryResult, format: OutputFormat) -> String {
             format!("{t}{footer}")
         }
         OutputFormat::Csv => {
-            let mut out = csv_line(r.columns.iter().cloned());
+            let mut out = csv_line(r.columns.iter().cloned().map(Some));
             for row in &r.rows {
                 out.push('\n');
                 out.push_str(&csv_line(row.iter().map(|c| match c {
-                    Cell::Null => String::new(),
-                    _ => c.display(),
+                    Cell::Null => None,
+                    _ => Some(c.display()),
                 })));
             }
             out
@@ -198,14 +203,13 @@ pub fn export(r: &QueryResult, format: ExportFormat, table: &str, d: Dialect) ->
     out
 }
 
-fn csv_line(fields: impl Iterator<Item = String>) -> String {
+/// One CSV line. NULL is an empty field and an empty string is `""`, as `import` reads them.
+fn csv_line(fields: impl Iterator<Item = Option<String>>) -> String {
     fields
-        .map(|f| {
-            if f.contains([',', '"', '\n', '\r']) {
-                format!("\"{}\"", f.replace('"', "\"\""))
-            } else {
-                f
-            }
+        .map(|f| match f {
+            None => String::new(),
+            Some(f) if f.is_empty() || f.contains([',', '"', '\n', '\r']) => format!("\"{}\"", f.replace('"', "\"\"")),
+            Some(f) => f,
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -231,5 +235,40 @@ mod tests {
             export(&r, ExportFormat::Sql, "order", Dialect::Mysql),
             "INSERT INTO `order` (id, name) VALUES (1, 'a<b>, \"c\"');\nINSERT INTO `order` (id, name) VALUES (2, NULL);\n"
         );
+    }
+
+    fn result(columns: &[&str], rows: Vec<Vec<Cell>>) -> QueryResult {
+        QueryResult { columns: columns.iter().map(|c| c.to_string()).collect(), rows, changes: None, truncated: false }
+    }
+
+    #[test]
+    fn renders_formats() {
+        let r = result(&["n", "s"], vec![vec![Cell::Real(1.5), Cell::Text("x".into())], vec![Cell::Null, Cell::Text("é".into())]]);
+        let table = render(&r, OutputFormat::Table);
+        assert!(table.contains("NULL") && table.ends_with("(2 rows)"), "{table}");
+        assert_eq!(render(&r, OutputFormat::Csv), "n,s\n1.5,x\n,é");
+        assert_eq!(render(&r, OutputFormat::Json), "[\n  {\n    \"n\": 1.5,\n    \"s\": \"x\"\n  },\n  {\n    \"n\": null,\n    \"s\": \"é\"\n  }\n]");
+        assert_eq!(render(&result(&["a"], vec![]), OutputFormat::Json), "[]");
+        assert_eq!(render(&result(&["a"], vec![]), OutputFormat::Csv), "a");
+        let changed = QueryResult { changes: Some(1), ..result(&[], vec![]) };
+        assert_eq!(render(&changed, OutputFormat::Json), "1 row affected");
+    }
+
+    #[test]
+    fn csv_tells_empty_text_from_null() {
+        // `import` reads an empty field as NULL and "" as an empty string.
+        let r = result(&["a", "b"], vec![vec![Cell::Text(String::new()), Cell::Null]]);
+        assert_eq!(render(&r, OutputFormat::Csv), "a,b\n\"\",");
+        let rows = crate::import::parse(&render(&r, OutputFormat::Csv), crate::import::ImportFormat::Csv).unwrap();
+        assert_eq!(rows.rows, [[Cell::Text(String::new()), Cell::Null]]);
+    }
+
+    #[test]
+    fn markdown_cells_stay_in_their_column() {
+        let r = result(&["a|b"], vec![vec![Cell::Text("x | y\nz".into())]]);
+        let md = render(&r, OutputFormat::Markdown);
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3, "{md}");
+        assert!(lines.iter().all(|l| l.matches('|').count() - l.matches("\\|").count() == 2), "{md}");
     }
 }

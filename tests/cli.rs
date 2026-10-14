@@ -21,14 +21,28 @@ impl Scratch {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sdb"))
+        self.run_with_input(args, "")
+    }
+
+    /// Runs `sdb` with `input` on stdin (closed when empty, so prompts answer no).
+    fn run_with_input(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sdb"))
             .args(args)
             .current_dir(&self.0)
             .env("SDB_CONFIG_DIR", self.0.join("config"))
+            // The shell still reads an old ~/.sdb_history.
+            .env("HOME", &self.0)
             .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .stdin(if input.is_empty() { Stdio::null() } else { Stdio::piped() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input.as_bytes()).unwrap();
+        }
+        child.wait_with_output().unwrap()
     }
 
     /// Runs `sdb` and returns stdout and stderr together; panics unless it succeeds.
@@ -150,6 +164,183 @@ fn bad_input_fails_with_a_reason() {
     assert!(out.contains("line 2"), "{out}");
     assert_eq!(s.count("app.db", "tags"), 0, "the transaction was rolled back");
     s.fails(&["query", "--db", "missing.db", "SELECT 1"]);
+}
+
+#[test]
+fn fmt_sql_diagram_and_diff() {
+    let s = Scratch::new("text");
+    s.ok(&["init", "schema.dbs"]);
+    let original = std::fs::read_to_string(s.path("schema.dbs")).unwrap();
+    // The starter schema is already formatted, comments included.
+    s.ok(&["fmt", "schema.dbs", "--write"]);
+    assert_eq!(std::fs::read_to_string(s.path("schema.dbs")).unwrap(), original);
+
+    std::fs::write(s.path("messy.dbs"), "# keep me\ntable t {\n id int pk\n   long_name   text not null # and me\n}\n").unwrap();
+    let printed = s.ok(&["fmt", "messy.dbs"]);
+    assert!(printed.contains("  id         int   pk\n  long_name  text  not null # and me"), "{printed}");
+    assert!(std::fs::read_to_string(s.path("messy.dbs")).unwrap().contains("   long_name"), "stdout only without --write");
+    s.fails(&["fmt", "missing.dbs"]);
+    // A database prints as a schema, but is never overwritten.
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    assert!(s.ok(&["fmt", "app.db"]).contains("table post_tags"));
+    s.fails(&["fmt", "app.db", "--write"]);
+    assert!(s.ok(&["query", "--db", "app.db", "SELECT count(*) FROM users"]).contains('0'));
+
+    assert!(s.ok(&["sql", "schema.dbs", "-d", "mysql"]).contains("AUTO_INCREMENT"));
+    s.ok(&["sql", "schema.dbs", "-d", "postgres", "-o", "pg.sql"]);
+    assert!(std::fs::read_to_string(s.path("pg.sql")).unwrap().contains("REFERENCES users"));
+    assert!(s.ok(&["diagram", "schema.dbs"]).contains("erDiagram"));
+    assert!(s.ok(&["diagram", "schema.dbs", "-f", "dot"]).contains("digraph"));
+
+    std::fs::copy(s.path("schema.dbs"), s.path("new.dbs")).unwrap();
+    s.edit("new.dbs", "  title       text       not null", "  title text not null\n  views int not null default 0");
+    let out = s.ok(&["diff", "schema.dbs", "new.dbs", "-d", "postgres", "-o", "migration.sql"]);
+    assert!(out.contains("+ column posts.views"), "{out}");
+    let sql = std::fs::read_to_string(s.path("migration.sql")).unwrap();
+    assert!(sql.contains("ALTER TABLE posts ADD COLUMN views INTEGER NOT NULL DEFAULT 0;"), "{sql}");
+}
+
+#[test]
+fn query_exec_and_import() {
+    let s = Scratch::new("data");
+    s.ok(&["init", "schema.dbs"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+
+    // Every output format.
+    s.ok(&["query", "--db", "app.db", "INSERT INTO tags (name) VALUES ('rust'), ('sql')"]);
+    let q = "SELECT id, name FROM tags ORDER BY id";
+    assert_eq!(s.ok(&["query", "--db", "app.db", q, "-f", "csv"]), "id,name\n1,rust\n2,sql\n");
+    let json = s.ok(&["query", "--db", "app.db", q, "-f", "json"]);
+    assert!(json.contains(r#""name": "rust""#), "{json}");
+    assert!(s.ok(&["query", "--db", "app.db", q, "-f", "markdown"]).contains("|  1 | rust |"));
+    assert!(s.ok(&["query", "--db", "app.db", q]).contains("rust"));
+
+    // Scripts: from stdin, with --continue past a failure, and the exit status.
+    let out = s.run_with_input(&["exec", "-", "--db", "app.db", "-f", "csv"], "INSERT INTO tags (name) VALUES ('go');\nSELECT count(*) AS n FROM tags;\n");
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert!(output_text(&out).contains("n\n3"), "{}", output_text(&out));
+    std::fs::write(s.path("partly.sql"), "INSERT INTO tags (name) VALUES ('go');\nINSERT INTO tags (name) VALUES ('zig');\n").unwrap();
+    let out = s.fails(&["exec", "partly.sql", "--db", "app.db", "--continue"]);
+    assert!(out.contains("line 1") && out.contains("1 failed"), "{out}");
+    assert_eq!(s.count("app.db", "tags WHERE name = 'zig'"), 1, "--continue ran the rest");
+
+    // Imports: matched by name, unknown columns skipped, all or nothing.
+    std::fs::write(s.path("tags.csv"), "Name,color\nweb,red\ncli,\n").unwrap();
+    let out = s.ok(&["import", "--db", "app.db", "tags.csv", "-y"]);
+    assert!(out.contains("color (not in tags)"), "{out}");
+    assert_eq!(s.count("app.db", "tags"), 6);
+    std::fs::write(s.path("more.json"), r#"[{"name": "new"}, {"name": "web"}]"#).unwrap();
+    s.fails(&["import", "--db", "app.db", "more.json", "-t", "tags", "-y"]);
+    assert_eq!(s.count("app.db", "tags WHERE name = 'new'"), 0, "a duplicate rolls back the whole import");
+    s.fails(&["import", "--db", "app.db", "more.json", "-y"]);
+}
+
+#[test]
+fn saved_connections_and_safe_mode() {
+    let s = Scratch::new("conns");
+    s.ok(&["init", "schema.dbs"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    let app = s.path("app.db");
+    let app = app.to_str().unwrap();
+
+    s.ok(&["conn", "add", "ro", app, "--safe-mode", "read-only", "-g", "local"]);
+    s.fails(&["conn", "add", "ro", app]);
+    assert!(s.ok(&["conn", "list"]).contains("ro"));
+    s.ok(&["conn", "test", "ro"]);
+
+    // Read-only: reads run, and every way to write is refused.
+    s.ok(&["query", "--db", "@ro", "SELECT count(*) FROM users"]);
+    for sql in ["INSERT INTO tags (name) VALUES ('x')", "PRAGMA query_only(0)", "WITH x AS (SELECT 1) DELETE FROM tags"] {
+        let out = s.fails(&["query", "--db", "@ro", sql, "-y"]);
+        assert!(out.contains("read-only"), "{sql}: {out}");
+    }
+    assert!(s.fails(&["seed", "--db", "@ro", "-y"]).contains("read-only"));
+    std::fs::write(s.path("tags.csv"), "name\nx\n").unwrap();
+    s.fails(&["import", "--db", "@ro", "tags.csv", "-y"]);
+    std::fs::write(s.path("more.dbs"), "table extra { id int pk }").unwrap();
+    s.fails(&["push", "more.dbs", "--db", "@ro", "-y"]);
+    assert_eq!(s.count("app.db", "tags"), 0);
+
+    // Confirm: writes need a yes, which closed stdin doesn't give.
+    s.ok(&["conn", "add", "ro", app, "--safe-mode", "confirm", "--force"]);
+    assert!(s.fails(&["query", "--db", "@ro", "INSERT INTO tags (name) VALUES ('x')"]).contains("not run"));
+    s.ok(&["query", "--db", "@ro", "INSERT INTO tags (name) VALUES ('x')", "-y"]);
+    assert_eq!(s.count("app.db", "tags"), 1);
+
+    s.ok(&["conn", "remove", "ro"]);
+    s.fails(&["query", "--db", "@ro", "SELECT 1"]);
+
+    // Detect finds a database in a project's .env.
+    std::fs::create_dir(s.path("project")).unwrap();
+    std::fs::write(s.path("project/.env"), "DATABASE_URL=postgres://me:secret@db.example:5432/shop\n").unwrap();
+    let found = s.ok(&["conn", "detect", "project"]);
+    assert!(found.contains("db.example") && !found.contains("secret"), "{found}");
+}
+
+#[test]
+fn shell_meta_commands() {
+    let s = Scratch::new("shell");
+    s.ok(&["init", "schema.dbs"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    std::fs::write(s.path("script.sql"), "INSERT INTO tags (name) VALUES ('from file');").unwrap();
+    let input = "\
+        .timer off\n\
+        INSERT INTO tags (name)\n  VALUES ('a'), ('b');\n\
+        .read script.sql\n\
+        .mode csv\n\
+        SELECT count(*) AS n FROM tags;\n\
+        .tables\n\
+        .schema tags\n\
+        .schema nowhere\n\
+        .ddl mysql\n\
+        .diagram dot\n\
+        .mode nonsense\n\
+        .bogus\n\
+        .quit\n\
+        SELECT 'after quit';\n";
+    let out = s.run_with_input(&["shell", "--db", "app.db"], input);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    for expected in [
+        "connected to app.db",
+        "2 rows affected",
+        "n\n3",
+        "tags                                 3 rows   2 columns",
+        "table tags {\n  id    int   pk autoincrement",
+        "no such table: nowhere",
+        "AUTO_INCREMENT",
+        "digraph",
+        "usage: .mode",
+        "unknown command .bogus",
+    ] {
+        assert!(text.contains(expected), "no {expected:?} in:\n{text}");
+    }
+    assert!(!text.contains("Time:") && !text.contains("after quit"), "{text}");
+    let history = s.path("config/shell_history");
+    assert!(std::fs::read_to_string(&history).unwrap().contains(".schema tags"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&history).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    // An old ~/.sdb_history is still read, and the next save goes to the new place.
+    std::fs::remove_file(&history).unwrap();
+    std::fs::write(s.path(".sdb_history"), "#V2\nSELECT 'from the old file';\n").unwrap();
+    s.run_with_input(&["shell", "--db", "app.db"], ".quit\n");
+    assert!(std::fs::read_to_string(&history).unwrap().contains("from the old file"));
+    assert_eq!(s.count("app.db", "tags"), 3);
+}
+
+#[test]
+fn pull_keeps_types_of_several_words() {
+    let s = Scratch::new("types");
+    std::fs::write(s.path("setup.sql"), "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT UNSIGNED NOT NULL, d DOUBLE PRECISION, note TEXT DEFAULT (upper('Mixed')));\n").unwrap();
+    s.ok(&["exec", "setup.sql", "--db", "app.db"]);
+    s.ok(&["pull", "--db", "app.db", "-o", "pulled.dbs"]);
+    let pulled = std::fs::read_to_string(s.path("pulled.dbs")).unwrap();
+    assert!(pulled.contains(r#""INT UNSIGNED""#) && pulled.contains("upper('Mixed')"), "{pulled}");
+    s.ok(&["check", "pulled.dbs"]);
+    assert!(s.ok(&["push", "pulled.dbs", "--db", "app.db", "-y"]).contains("already up to date"));
 }
 
 /// Runs against the scratch servers of `SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL`

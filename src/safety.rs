@@ -143,13 +143,13 @@ pub(crate) fn words(stmt: &str) -> Vec<String> {
 }
 
 /// A word of a statement, with how deep in parentheses it is and its byte offset.
-struct Word {
-    text: String,
-    depth: usize,
-    at: usize,
+pub(crate) struct Word {
+    pub(crate) text: String,
+    pub(crate) depth: usize,
+    pub(crate) at: usize,
 }
 
-fn scan(stmt: &str) -> Vec<Word> {
+pub(crate) fn scan(stmt: &str) -> Vec<Word> {
     let chars: Vec<(usize, char)> = stmt.char_indices().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
