@@ -12,7 +12,7 @@ pub const DBS_KEYWORDS: &[&str] = &[
     "table", "pk", "primary", "key", "autoincrement", "auto_increment", "unique", "not", "null",
     "nullable", "default", "check", "references", "ref", "on", "delete", "update", "index",
     "cascade", "set_null", "set_default", "restrict", "no_action", "set", "no", "action", "now",
-    "true", "false",
+    "true", "false", "was",
 ];
 pub const DBS_TYPES: &[&str] = &[
     "int", "integer", "bigint", "smallint", "real", "float", "double", "decimal", "numeric", "bool",

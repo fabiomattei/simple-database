@@ -43,6 +43,8 @@ struct TableDiff<'a> {
     altered: Vec<(&'a Column, &'a Column)>,
     added_indexes: Vec<&'a Index>,
     dropped_indexes: Vec<&'a Index>,
+    /// Same columns, new name: (old, new).
+    renamed_indexes: Vec<(&'a Index, &'a Index)>,
     pk_changed: bool,
 }
 
@@ -55,8 +57,13 @@ impl<'a> TableDiff<'a> {
             .iter()
             .filter_map(|n| old.column(&n.name).filter(|o| *o != n).map(|o| (o, n)))
             .collect();
-        let added_indexes = new.indexes.iter().filter(|i| !old.indexes.contains(i)).collect();
-        let dropped_indexes = old.indexes.iter().filter(|i| !new.indexes.contains(i)).collect();
+        let mut added_indexes: Vec<&Index> = new.indexes.iter().filter(|i| !old.indexes.contains(i)).collect();
+        let mut dropped_indexes: Vec<&Index> = old.indexes.iter().filter(|i| !new.indexes.contains(i)).collect();
+        let mut renamed_indexes = Vec::new();
+        dropped_indexes.retain(|o| {
+            let same = added_indexes.iter().position(|n| n.columns == o.columns && n.unique == o.unique);
+            same.map(|i| renamed_indexes.push((*o, added_indexes.remove(i)))).is_none()
+        });
         TableDiff {
             old,
             new,
@@ -65,6 +72,7 @@ impl<'a> TableDiff<'a> {
             altered,
             added_indexes,
             dropped_indexes,
+            renamed_indexes,
             pk_changed: old.primary_key() != new.primary_key(),
         }
     }
@@ -81,6 +89,7 @@ impl<'a> TableDiff<'a> {
             && self.altered.is_empty()
             && self.added_indexes.is_empty()
             && self.dropped_indexes.is_empty()
+            && self.renamed_indexes.is_empty()
             && !self.pk_changed
     }
 }
@@ -113,10 +122,11 @@ fn describe_alter(o: &Column, n: &Column) -> String {
 }
 
 pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
-    let (old, new) = (&canonical(old, d), &canonical(new, d));
     let mut m = Migration::default();
     let mut needs_fk_off = false;
     let mut body: Vec<String> = Vec::new();
+    let old = &apply_renames(canonical(old, d), new, d, &mut m.changes, &mut body);
+    let new = &canonical(new, d);
 
     // New tables, in dependency order.
     for t in new.tables_in_dependency_order() {
@@ -159,6 +169,9 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
         }
         for i in &td.added_indexes {
             m.changes.push(format!("+ index {}", i.name));
+        }
+        for (o, n) in &td.renamed_indexes {
+            m.changes.push(format!("~ index {} -> {}", o.name, n.name));
         }
         for c in &td.added {
             if !c.nullable && c.default.is_none() {
@@ -225,6 +238,199 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
     m
 }
 
+// ---------------------------------------------------------------- Renames
+
+/// Carries out the renames that the `was` hints of `new` ask for: `old` as it
+/// is after them, while their statements go to `body`. A hint applies when
+/// `old` has the earlier name but not the new one, so it does nothing once
+/// the rename is done.
+fn apply_renames(mut old: Schema, new: &Schema, d: Dialect, changes: &mut Vec<String>, body: &mut Vec<String>) -> Schema {
+    for t in &new.tables {
+        if old.table(&t.name).is_some() {
+            continue;
+        }
+        let Some(from) = t.was.iter().rev().find(|w| old.table(w).is_some()) else { continue };
+        changes.push(format!("~ table {from} -> {}", t.name));
+        old.rename_table(from, &t.name);
+        body.extend(rename_table_sql(old.table(&t.name).expect("just renamed"), from, d));
+    }
+    for t in &new.tables {
+        for c in &t.columns {
+            let Some(ot) = old.table(&t.name) else { break };
+            if ot.column(&c.name).is_some() {
+                continue;
+            }
+            let Some(from) = c.was.iter().rev().find(|w| ot.column(w).is_some()) else { continue };
+            changes.push(format!("~ column {}.{from} -> {}", t.name, c.name));
+            // Checks follow the rename, as the database rewrites them.
+            let mut touched: Vec<String> = ot
+                .columns
+                .iter()
+                .filter(|x| x.check.as_ref().is_some_and(|e| rename_ident(e, from, &c.name) != *e))
+                .map(|x| if x.name == *from { c.name.clone() } else { x.name.clone() })
+                .collect();
+            if ot.column(from).is_some_and(|x| x.check.is_some()) && !touched.contains(&c.name) {
+                touched.push(c.name.clone());
+            }
+            old.rename_column(&t.name, from, &c.name);
+            let ot = old.tables.iter_mut().find(|x| x.name == t.name).expect("table exists");
+            for x in &mut ot.columns {
+                if let Some(e) = &mut x.check {
+                    *e = rename_ident(e, from, &c.name);
+                }
+            }
+            body.extend(rename_column_sql(ot, from, &c.name, &touched, d));
+        }
+    }
+    old
+}
+
+/// `expr` with the identifier `old` (bare or quoted) renamed to `new`;
+/// string literals are left alone.
+fn rename_ident(expr: &str, old: &str, new: &str) -> String {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' || c == '`' {
+            let end = (i + 1..chars.len()).find(|&j| chars[j] == c).unwrap_or(chars.len());
+            let inner: String = chars[(i + 1).min(end)..end].iter().collect();
+            out.push(c);
+            out.push_str(if c != '\'' && inner == old { new } else { &inner });
+            if end < chars.len() {
+                out.push(c);
+            }
+            i = end + 1;
+        } else if c.is_alphanumeric() || c == '_' || c == '$' {
+            let end = (i..chars.len()).find(|&j| !(chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '$')).unwrap_or(chars.len());
+            let word: String = chars[i..end].iter().collect();
+            out.push_str(if word.eq_ignore_ascii_case(old) { new } else { &word });
+            i = end;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Names of the constraints Postgres keeps on a column, for a given table and column name.
+fn pg_constraint_names(c: &Column, table: &str, column: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if c.references.is_some() {
+        names.push(fk_name(table, column));
+    }
+    if c.check.is_some() {
+        names.push(check_name(table, column));
+    }
+    if c.unique {
+        names.push(format!("{table}_{column}_key"));
+    }
+    names
+}
+
+/// Whether MySQL made an index (named after the constraint) to back the
+/// foreign key on `column`: it does when no other index starts with it.
+fn mysql_implicit_fk_index(t: &Table, column: &str) -> bool {
+    let leads = |cols: &[String]| cols.first().is_some_and(|c| c == column);
+    !(t.column(column).is_some_and(|c| c.unique) || leads(&t.primary_key()) || t.indexes.iter().any(|i| leads(&i.columns)))
+}
+
+/// Statements that rename table `from` to `t` (as it is after the rename)
+/// and the constraints named after it.
+fn rename_table_sql(t: &Table, from: &str, d: Dialect) -> Vec<String> {
+    let to = &t.name;
+    let q = quote(to, d);
+    let mut out = vec![format!("ALTER TABLE {} RENAME TO {q};", quote(from, d))];
+    match d {
+        Dialect::Sqlite => {}
+        Dialect::Postgres => {
+            let mut names = Vec::new();
+            if !t.primary_key().is_empty() {
+                names.push((format!("{from}_pkey"), format!("{to}_pkey")));
+            }
+            for c in &t.columns {
+                names.extend(pg_constraint_names(c, from, &c.name).into_iter().zip(pg_constraint_names(c, to, &c.name)));
+            }
+            for (a, b) in names {
+                out.push(format!("ALTER TABLE {q} RENAME CONSTRAINT {} TO {};", quote(&a, d), quote(&b, d)));
+            }
+        }
+        // MySQL can't rename constraints, so they are dropped and added again.
+        Dialect::Mysql => {
+            for c in &t.columns {
+                if let Some(fk) = &c.references {
+                    out.push(format!("ALTER TABLE {q} DROP FOREIGN KEY {};", quote(&fk_name(from, &c.name), d)));
+                    if mysql_implicit_fk_index(t, &c.name) {
+                        out.push(format!(
+                            "ALTER TABLE {q} RENAME INDEX {} TO {};",
+                            quote(&fk_name(from, &c.name), d),
+                            quote(&fk_name(to, &c.name), d)
+                        ));
+                    }
+                    out.push(format!("ALTER TABLE {q} ADD {};", fk_sql(to, c, fk, d)));
+                }
+                if let Some(chk) = &c.check {
+                    out.push(format!("ALTER TABLE {q} DROP CHECK {};", quote(&check_name(from, &c.name), d)));
+                    out.push(format!("ALTER TABLE {q} ADD {};", check_sql(to, &c.name, chk, d)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Statements that rename column `from` of `t` (as it is after the rename)
+/// to `to`. `touched` are the columns whose checks mention it.
+fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dialect) -> Vec<String> {
+    let tn = &t.name;
+    let q = quote(tn, d);
+    let c = t.column(to).expect("renamed column");
+    let rename = format!("ALTER TABLE {q} RENAME COLUMN {} TO {};", quote(from, d), quote(to, d));
+    match d {
+        Dialect::Sqlite => vec![rename],
+        Dialect::Postgres => {
+            let mut out = vec![rename];
+            for (a, b) in pg_constraint_names(c, tn, from).into_iter().zip(pg_constraint_names(c, tn, to)) {
+                out.push(format!("ALTER TABLE {q} RENAME CONSTRAINT {} TO {};", quote(&a, d), quote(&b, d)));
+            }
+            out
+        }
+        // MySQL refuses to rename a column a check uses, and can't rename constraints.
+        Dialect::Mysql => {
+            let mut out = Vec::new();
+            if c.references.is_some() {
+                out.push(format!("ALTER TABLE {q} DROP FOREIGN KEY {};", quote(&fk_name(tn, from), d)));
+            }
+            for name in touched {
+                let was = if name == to { from } else { name };
+                out.push(format!("ALTER TABLE {q} DROP CHECK {};", quote(&check_name(tn, was), d)));
+            }
+            out.push(rename);
+            if c.unique {
+                out.push(format!("ALTER TABLE {q} RENAME INDEX {} TO {};", quote(from, d), quote(to, d)));
+            }
+            if let Some(fk) = &c.references {
+                if mysql_implicit_fk_index(t, to) {
+                    out.push(format!(
+                        "ALTER TABLE {q} RENAME INDEX {} TO {};",
+                        quote(&fk_name(tn, from), d),
+                        quote(&fk_name(tn, to), d)
+                    ));
+                }
+                out.push(format!("ALTER TABLE {q} ADD {};", fk_sql(tn, c, fk, d)));
+            }
+            for name in touched {
+                if let Some(chk) = t.column(name).and_then(|x| x.check.as_ref()) {
+                    out.push(format!("ALTER TABLE {q} ADD {};", check_sql(tn, name, chk, d)));
+                }
+            }
+            out
+        }
+    }
+}
+
 // ---------------------------------------------------------------- SQLite
 
 /// SQLite's ALTER TABLE can only add simple columns and drop unconstrained
@@ -253,7 +459,8 @@ fn sqlite_simple_alter(td: &TableDiff) -> Vec<String> {
     let d = Dialect::Sqlite;
     let t = quote(&td.new.name, d);
     let mut out = Vec::new();
-    for i in &td.dropped_indexes {
+    // SQLite can't rename an index.
+    for i in td.dropped_indexes.iter().chain(td.renamed_indexes.iter().map(|(o, _)| o)) {
         out.push(drop_index_sql(&td.old.name, i, d));
     }
     for c in &td.dropped {
@@ -272,7 +479,7 @@ fn sqlite_simple_alter(td: &TableDiff) -> Vec<String> {
         }
         out.push(format!("ALTER TABLE {t} ADD COLUMN {sql};"));
     }
-    for i in &td.added_indexes {
+    for i in td.added_indexes.iter().chain(td.renamed_indexes.iter().map(|(_, n)| n)) {
         out.push(create_index_sql(&td.new.name, i, d));
     }
     out
@@ -331,6 +538,9 @@ fn postgres_alter(td: &TableDiff, warnings: &mut Vec<String>) -> Vec<String> {
 
     for i in &td.dropped_indexes {
         out.push(drop_index_sql(tn, i, d));
+    }
+    for (o, n) in &td.renamed_indexes {
+        out.push(format!("ALTER INDEX {} RENAME TO {};", quote(&o.name, d), quote(&n.name, d)));
     }
     for c in &td.dropped {
         out.push(format!("ALTER TABLE {t} DROP COLUMN {};", quote(&c.name, d)));
@@ -424,6 +634,9 @@ fn mysql_alter(td: &TableDiff, warnings: &mut Vec<String>) -> Vec<String> {
     }
     for i in &td.dropped_indexes {
         out.push(drop_index_sql(tn, i, d));
+    }
+    for (o, n) in &td.renamed_indexes {
+        out.push(format!("ALTER TABLE {t} RENAME INDEX {} TO {};", quote(&o.name, d), quote(&n.name, d)));
     }
     for c in &td.dropped {
         if c.check.is_some() {
@@ -532,6 +745,25 @@ mod tests {
 
         let name: String = conn.query_row("SELECT name FROM users", [], |r| r.get(0)).unwrap();
         assert_eq!(name, "ann");
+    }
+
+    #[test]
+    fn was_hints_rename_until_done() {
+        let old = parse("table users { id int pk\n mail text check (mail like '%@%' and mail <> 'mail') }").unwrap();
+        let new = parse("table people was (persons, users) { id int pk\n email text was mail check (email like '%@%' and email <> 'mail') }").unwrap();
+        let m = diff(&old, &new, Dialect::Sqlite);
+        assert_eq!(m.changes, ["~ table users -> people", "~ column people.mail -> email"]);
+        assert_eq!(
+            m.statements,
+            ["BEGIN;", "ALTER TABLE users RENAME TO people;", "ALTER TABLE people RENAME COLUMN mail TO email;", "COMMIT;"]
+        );
+        // Once done, the hints are ignored.
+        let done = parse("table people { id int pk\n email text check (email like '%@%' and email <> 'mail') }").unwrap();
+        assert!(diff(&done, &new, Dialect::Postgres).is_empty());
+        // A new table may take the old name.
+        let m = diff(&old, &parse("table people was users { id int pk }\ntable users { id int pk }").unwrap(), Dialect::Sqlite);
+        assert_eq!(m.changes[..2], ["~ table users -> people".to_string(), "+ table users".into()]);
+        assert_eq!(rename_ident(r#"a = 'a' or "a" > A_b or `a`"#, "a", "b"), r#"b = 'a' or "b" > A_b or `b`"#);
     }
 
     #[test]

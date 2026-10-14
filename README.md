@@ -68,7 +68,8 @@ columns of every table and keeps comments and blank lines.
 The **Diagram** tab edits the schema file too. Double-click a table (or right-click → **Edit
 table…**) to rename it and edit its columns in a grid: type, PK, not null, unique, autoincrement,
 default, check, reference and its `on delete` action. Renames carry over to keys, indexes and the
-foreign keys pointing at them, and an edit that would make the schema invalid is refused. Right-click
+foreign keys pointing at them and are written down as `was` hints (see [Renames](#renames)), and an
+edit that would make the schema invalid is refused. Right-click
 the background for **New table…**, or a table to add a column, delete the column under the pointer,
 remove its reference or delete the table. To link two tables, drag the ○ handle at the end of a
 column's row onto a column of another table (or onto a table, for its primary key). Only the changed
@@ -150,10 +151,11 @@ table post_tags {
 | | |
 |---|---|
 | Types | `int bigint smallint real decimal(p,s) bool text varchar(n) date time timestamp blob uuid json` (anything else is passed through verbatim) |
-| Column modifiers | `pk` `autoincrement` `unique` `not null` `null` `default <v>` `check (<expr>)` `-> table.col` (or `references table(col)`) `on delete <a>` `on update <a>` |
+| Column modifiers | `pk` `autoincrement` `unique` `not null` `null` `default <v>` `check (<expr>)` `-> table.col` (or `references table(col)`) `on delete <a>` `on update <a>` `was <old>` (or `was (a, b)`) |
 | Referential actions | `cascade` `set_null` `set_default` `restrict` `no_action` |
 | Defaults | `'text'` `42` `true` `null` `now` `fn()` `(any sql expression)` |
 | Table level | `index [name] (a, b)` `unique index [name] (a, b)` `pk (a, b)` |
+| Renamed table | `table people was users { ... }` |
 | Comments | `# ...` or `// ...` |
 
 ## Commands
@@ -355,8 +357,28 @@ Statements end with `;` and may span lines. History is saved to `~/.sdb_history`
   data → drop old → rename, with foreign keys disabled. `sdb push` checks
   `PRAGMA foreign_key_check` before committing and rolls back on any violation.
 
-Destructive changes (dropped tables/columns) are flagged as warnings. Renames are seen as
-drop + add. Edit the generated SQL if you need to preserve the data.
+Destructive changes (dropped tables/columns) are flagged as warnings.
+
+### Renames
+
+A renamed table or column would look like a drop plus an add, which loses its data. Say what it
+was called before, and the migration renames it instead:
+
+```text
+table people was users {
+  id     int           pk autoincrement
+  email  varchar(255)  unique not null was mail
+}
+```
+
+A hint applies when the database has the old name and not the new one, so it does nothing once
+the rename is done: keep it, or delete it after pushing everywhere. `was (a, b)` lists several
+earlier names (oldest first); the latest one the database has wins. The Diagram's table editor
+writes these hints for you. Constraints named after the table or column (`fk_<table>_<col>`,
+`<table>_<col>_check`, Postgres `_key` / `_pkey`) are renamed too; MySQL can't rename
+constraints, so it drops and re-adds them. Indexes that only changed name (such as
+`posts_author_id_idx` → `posts_writer_id_idx`) are renamed, except on SQLite, where they are
+recreated.
 
 ## Development
 

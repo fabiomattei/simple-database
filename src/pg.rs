@@ -172,7 +172,7 @@ fn introspect_table(client: &mut Client, oid: u32, name: String) -> Result<Table
         indexes.push(Index { name: r.get(0), unique: r.get(1), columns: r.get(2) });
     }
 
-    Ok(Table { name, columns, composite_pk, indexes })
+    Ok(Table { name, columns, composite_pk, indexes, was: vec![] })
 }
 
 /// Read a default as `pg_get_expr` prints it: `'x'::text`, `'-1'::integer`, `0`, ...

@@ -1338,7 +1338,7 @@ fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
         "delete" | "update" if prev == Some("on") => words(&["cascade", "set_null", "set_default", "restrict", "no_action"], Kind::Keyword),
         "default" => words(&["now", "true", "false", "null"], Kind::Keyword),
         "not" => words(&["null"], Kind::Keyword),
-        "check" | "set" | "no" => vec![],
+        "check" | "set" | "no" | "was" => vec![],
         _ => {
             let has_ref = has("->") || has("references") || has("ref");
             let mut list = Vec::new();
@@ -1350,6 +1350,7 @@ fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
                 ("null", has("not") || has("null")),
                 ("default", has("default")),
                 ("check", has("check")),
+                ("was", has("was")),
                 ("on delete", !has_ref || has("delete")),
                 ("on update", !has_ref || has("update")),
             ] {

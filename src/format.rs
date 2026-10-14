@@ -17,7 +17,7 @@ fn format_table(t: &Table) -> String {
     let types: Vec<String> = t.columns.iter().map(|c| c.data_type.to_string()).collect();
     let type_w = types.iter().map(|s| s.len()).max().unwrap_or(0);
 
-    let mut out = format!("table {} {{\n", t.name);
+    let mut out = format!("table {}{} {{\n", t.name, was(&t.was));
     for (c, ty) in t.columns.iter().zip(&types) {
         let mods = modifiers(c);
         let line = format!("  {:name_w$}  {:type_w$}  {}", c.name, ty, mods.join(" "));
@@ -77,7 +77,20 @@ fn modifiers(c: &Column) -> Vec<String> {
             m.push(format!("on update {}", fk.on_update.dsl()));
         }
     }
+    let was = was(&c.was);
+    if !was.is_empty() {
+        m.push(was.trim_start().to_string());
+    }
     m
+}
+
+/// ` was a` or ` was (a, b)`; empty without earlier names.
+fn was(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!(" was {one}"),
+        many => format!(" was ({})", many.join(", ")),
+    }
 }
 
 /// Re-aligns the column definitions of every table the way `format_schema`
@@ -131,6 +144,18 @@ pub fn patch(src: &str, new: &Schema) -> String {
 /// where the old one was instead of being dropped and appended.
 pub fn patch_renamed(src: &str, new: &Schema, renamed: &[(String, String)]) -> String {
     let Ok(old) = parse(src) else { return format_schema(new) };
+    // Edits that know nothing of rename hints (the SQL tab) keep the ones written.
+    let mut new = new.clone();
+    for t in &mut new.tables {
+        let Some(o) = old.table(&t.name) else { continue };
+        if t.was.is_empty() {
+            t.was = o.was.clone();
+        }
+        for c in t.columns.iter_mut().filter(|c| c.was.is_empty()) {
+            c.was = o.column(&c.name).map(|oc| oc.was.clone()).unwrap_or_default();
+        }
+    }
+    let new = &new;
     let new_name = |old: &str| renamed.iter().find(|(o, _)| o == old).map_or(old, |(_, n)| n.as_str()).to_string();
     let outline = crate::parser::outline(src);
     let mut lines: Vec<String> = src.split('\n').map(String::from).collect();
@@ -234,7 +259,7 @@ mod tests {
         let src = "table users { id int pk autoincrement\n email varchar(255) unique not null\n \
                    role text default 'it''s' check (role <> '')\n boss_id int -> users.id on delete set null\n \
                    created timestamp default now\n index (boss_id)\n unique index by_role (role, email) }\n\
-                   table tags { a int\n b text\n pk (a, b) }";
+                   table tags was (labels, tag) { a int was x\n b text was (y, z)\n pk (a, b) }";
         let schema = parse(src).unwrap();
         let printed = format_schema(&schema);
         assert_eq!(parse(&printed).unwrap(), schema, "{printed}");
@@ -278,6 +303,15 @@ mod tests {
         renamed.rename_table("b", "bee");
         let out = patch_renamed(src, &renamed, &[("b".into(), "bee".into())]);
         assert_eq!(out, src.replace("table b {\n  y int\n}", "table bee {\n  y  int\n}"));
+
+        // Hints survive a new schema that has none.
+        let hinted = "table a was old { # keep me\n  x int pk was y\n}\n";
+        let mut new = parse(hinted).unwrap();
+        new.tables[0].was.clear();
+        new.tables[0].columns[0].was.clear();
+        assert_eq!(patch(hinted, &new), hinted);
+        new.tables[0].columns[0].unique = true;
+        assert_eq!(patch(hinted, &new), "table a was old {\n  x  int  pk unique was y\n}\n");
     }
 }
 

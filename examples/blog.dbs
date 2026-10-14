@@ -5,10 +5,12 @@
 #               date time timestamp blob uuid json
 #   modifiers:  pk  autoincrement  unique  not null  default <value>
 #               check (<expr>)  -> table.column  on delete|update <action>
+#               was <old_name>  (renamed: migrations rename instead of drop + add)
 #   actions:    cascade  set_null  set_default  restrict  no_action
 #   defaults:   'text'  42  true  null  now  (any sql expression)
 #
 # table-level:  index (a, b)   unique index name (a, b)   pk (a, b)
+# renamed table:  table new_name was old_name { ... }
 
 table users {
   id          int           pk autoincrement

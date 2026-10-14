@@ -38,6 +38,20 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
             error(t.name.clone(), "table has no columns".into());
         }
 
+        // A rename hint has to say which table or column the old one became.
+        for w in &t.was {
+            if schema.tables.iter().any(|o| o.name != t.name && o.was.contains(w)) {
+                error(t.name.clone(), format!("more than one table says it was '{w}'"));
+            }
+        }
+        for c in &t.columns {
+            for w in &c.was {
+                if t.columns.iter().any(|o| o.name != c.name && o.was.contains(w)) {
+                    error(format!("{}.{}", t.name, c.name), format!("more than one column says it was '{w}'"));
+                }
+            }
+        }
+
         let inline_pks: Vec<&Column> = t.columns.iter().filter(|c| c.primary_key).collect();
         if inline_pks.len() > 1 {
             error(

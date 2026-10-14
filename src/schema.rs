@@ -178,6 +178,9 @@ pub struct Column {
     pub default: Option<DefaultValue>,
     pub references: Option<ForeignKey>,
     pub check: Option<String>,
+    /// Earlier names (`was old_name`), oldest first: hints that let a
+    /// migration rename the column instead of dropping it.
+    pub was: Vec<String>,
 }
 
 impl Column {
@@ -192,6 +195,7 @@ impl Column {
             default: None,
             references: None,
             check: None,
+            was: vec![],
         }
     }
 }
@@ -211,6 +215,16 @@ pub struct Table {
     /// declared inline on a single column.
     pub composite_pk: Vec<String>,
     pub indexes: Vec<Index>,
+    /// Earlier names of the table, like `Column::was`.
+    pub was: Vec<String>,
+}
+
+/// Records a rename from `old` to `new` in a list of earlier names.
+pub fn note_rename(was: &mut Vec<String>, old: &str, new: &str) {
+    was.retain(|w| w != old && w != new);
+    if old != new {
+        was.push(old.to_string());
+    }
 }
 
 impl Table {

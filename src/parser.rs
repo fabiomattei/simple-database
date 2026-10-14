@@ -279,6 +279,10 @@ impl Parser {
 
     fn parse_table(&mut self) -> Result<Table, ParseError> {
         let name = self.expect_word("table name")?;
+        let mut was = vec![];
+        if self.eat_keyword("was") {
+            self.parse_was(&mut was)?;
+        }
         let line = self.line();
         if self.next() != Tok::LBrace {
             return err(line, format!("expected '{{' after table name '{name}'"));
@@ -288,6 +292,7 @@ impl Parser {
             columns: vec![],
             composite_pk: vec![],
             indexes: vec![],
+            was,
         };
         loop {
             self.skip_ends();
@@ -381,6 +386,16 @@ impl Parser {
         }
     }
 
+    /// The earlier names after `was`: one name or a list `(a, b)`.
+    fn parse_was(&mut self, was: &mut Vec<String>) -> Result<(), ParseError> {
+        let names = match self.peek() {
+            Tok::Paren(_) => self.expect_paren_list("earlier names")?,
+            _ => vec![self.expect_word("earlier name after 'was'")?],
+        };
+        was.extend(names);
+        Ok(())
+    }
+
     fn expect_paren_list(&mut self, what: &str) -> Result<Vec<String>, ParseError> {
         let line = self.line();
         match self.next() {
@@ -437,6 +452,7 @@ impl Parser {
                             col.auto_increment = true
                         }
                         "unique" => col.unique = true,
+                        "was" => self.parse_was(&mut col.was)?,
                         "not" => {
                             self.expect_keyword("null")?;
                             col.nullable = false;

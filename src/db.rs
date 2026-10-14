@@ -1050,8 +1050,76 @@ mod tests {
 
         // Staged edits and imports, typed by column, in one transaction.
         live_edits(&mut db, &current);
+        let edited_src = src.replace("('new', 'old')", "('new', 'old', 'gone')").replace("default 0.5", "default 0.25");
+        live_renames(&mut db, &edited_src);
         drop_all(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
+    }
+
+    /// Renames through `was` hints keep the rows, and leave nothing to migrate.
+    fn live_renames(db: &mut Database, src: &str) {
+        let count = |db: &mut Database, t: &str| db.query_value(&format!("SELECT count(*) FROM {t}")).unwrap();
+        // A foreign key without an index of its own, which MySQL indexes by itself.
+        let src = &src.replace("table kinds { code varchar(10) pk\n", "table kinds { code varchar(10) pk\n tag int -> tags.id\n");
+        let current = db.introspect().unwrap();
+        let m = db.migration(&current, &parse(src).unwrap());
+        db.apply_migration(&m).unwrap();
+        let (users, posts) = (count(db, "users"), count(db, "posts"));
+        let renamed = src
+            .replace(" tag int -> tags.id\n", " tag_ref int was tag -> tags.id\n")
+            .replace("table users {", "table people was users {")
+            .replace("  email       varchar(255)  unique not null", "  mail varchar(255) unique not null was email")
+            .replace("author_id   int        not null -> users.id", "writer_id int not null was author_id -> people.id")
+            .replace("index (author_id)", "index (writer_id)")
+            .replace("status text not null default 'new' check (status in", "state text not null default 'new' was status check (state in");
+        let desired = parse(&renamed).unwrap();
+        let current = db.introspect().unwrap();
+        let m = db.migration(&current, &desired);
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        let mut changes = m.changes.clone();
+        changes.sort();
+        assert_eq!(
+            changes,
+            [
+                "~ column kinds.status -> state",
+                "~ column kinds.tag -> tag_ref",
+                "~ column people.email -> mail",
+                "~ column posts.author_id -> writer_id",
+                "~ index posts_author_id_idx -> posts_writer_id_idx",
+                "~ table users -> people",
+            ],
+            "{}",
+            m.script()
+        );
+        db.apply_migration(&m).unwrap_or_else(|e| panic!("{e:#}\n{}", m.script()));
+        let current = db.introspect().unwrap();
+        let again = db.migration(&current, &desired);
+        assert!(again.is_empty(), "{:?}\n{}", again.changes, again.script());
+        assert_eq!(count(db, "people"), users);
+        assert_eq!(count(db, "posts WHERE writer_id IS NOT NULL"), posts);
+        // The constraints still work, under the names later migrations use.
+        assert!(db.run("UPDATE kinds SET state = 'bogus'").is_err());
+        let back = parse(&renamed.replace(" was status check (state in ('new', 'old', 'gone'))", "")).unwrap();
+        let m = db.migration(&current, &back);
+        db.apply_migration(&m).unwrap_or_else(|e| panic!("{e:#}\n{}", m.script()));
+        let unlinked = parse(&renamed.replace("was author_id -> people.id on delete cascade", "")).unwrap();
+        let current = db.introspect().unwrap();
+        let m = db.migration(&current, &unlinked);
+        db.apply_migration(&m).unwrap_or_else(|e| panic!("{e:#}\n{}", m.script()));
+        let current = db.introspect().unwrap();
+        assert!(db.migration(&current, &unlinked).is_empty());
+    }
+
+    #[test]
+    fn sqlite_renames_keep_data() {
+        let mut db = Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t");
+        let src = crate::STARTER_SCHEMA.to_string()
+            + "\ntable kinds { code varchar(10) pk\n status text not null default 'new' check (status in ('new', 'old', 'gone')) }";
+        let m = db.migration(&Schema::default(), &parse(&src).unwrap());
+        db.apply_migration(&m).unwrap();
+        let opts = crate::seed::SeedOptions { rows: 15, counts: HashMap::new(), only: vec![], seed: 3 };
+        crate::seed::seed(&mut db, &opts).unwrap();
+        live_renames(&mut db, &src);
     }
 
     fn live_edits(db: &mut Database, schema: &Schema) {

@@ -40,7 +40,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `format.rs` | `Schema` → `.dbs` text (`pull`, `fmt`, shell `.schema`, GUI Pull). `align` re-aligns columns in place keeping comments (GUI Format); it returns `None` unless the result parses to the same schema. `patch` rewrites only the changed tables of a text (SQL tab and Diagram edits → schema text); `patch_renamed` also reprints renamed tables in place |
 | `validate.rs` | Errors (unusable schema) and warnings (design lint); `print_issues` is the CLI's ANSI printer |
 | `ddl.rs` | `Dialect` enum and all CREATE/DROP SQL; `quote()` quotes only when needed; `canonical()` = the schema as a dialect reports it back |
-| `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change |
+| `diff.rs` | `diff(old, new, dialect) -> Migration` (changes, warnings, statements). SQLite falls back to the create-copy-drop-rename table rebuild when `ALTER TABLE` can't make the change. `apply_renames` first turns `was` hints (`Table::was` / `Column::was`) into RENAMEs, including the constraints named after the old names; `canonical` strips the hints |
 | `diagram.rs` | Text diagrams: Mermaid / Graphviz DOT (the GUI canvas is separate, in `gui/er.rs`) |
 | `data.rs` | Data tab logic: `View` (filters, raw WHERE, sort → `page_sql` / `count_sql` / `all_sql`), `literal` (a `Cell` as SQL for a column type; checks text against the type), `RowChange` (staged update/insert/delete by primary key) |
 | `safety.rs` | `SafeMode` (off / warn / confirm / read-only) and `classify` (read, write, dangerous) over comment- and string-free words |

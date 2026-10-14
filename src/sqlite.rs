@@ -149,6 +149,7 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str) -> Result<T
         columns,
         composite_pk,
         indexes,
+        was: vec![],
     })
 }
 

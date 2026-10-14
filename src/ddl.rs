@@ -225,6 +225,11 @@ pub fn drop_index_sql(table: &str, idx: &Index, d: Dialect) -> String {
 /// written.
 pub fn canonical_table(t: &Table, d: Dialect) -> Table {
     let mut t = t.clone();
+    // Rename hints are never reported back.
+    t.was.clear();
+    for c in &mut t.columns {
+        c.was.clear();
+    }
     if d == Dialect::Sqlite {
         return t;
     }

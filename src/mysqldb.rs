@@ -192,7 +192,7 @@ fn introspect_table(conn: &mut Conn, name: String) -> Result<Table> {
         }
     }
 
-    Ok(Table { name, columns, composite_pk, indexes })
+    Ok(Table { name, columns, composite_pk, indexes, was: vec![] })
 }
 
 /// Read `COLUMN_DEFAULT`. Literal defaults come unquoted; expression

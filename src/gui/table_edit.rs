@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Pos2, RichText};
 use simple_database::parser;
-use simple_database::schema::{RefAction, Schema, Table};
+use simple_database::schema::{RefAction, Schema, Table, note_rename};
 use simple_database::validate::{self, Severity};
 
 const TYPES: [&str; 14] =
@@ -308,9 +308,20 @@ impl TableEditor {
                 // Self references were written with the new names already.
                 if let Some(t) = out.tables.iter_mut().find(|t| t.name == name) {
                     t.columns = columns;
+                    // Earlier names, so that a migration renames instead of dropping.
+                    let before = schema.table(old);
+                    note_rename(&mut t.was, old, &name);
+                    for (c, r) in t.columns.iter_mut().zip(&rows) {
+                        if let Some(o) = &r.original
+                            && let Some(oc) = before.and_then(|b| b.column(o))
+                        {
+                            c.was = oc.was.clone();
+                            note_rename(&mut c.was, o, &c.name);
+                        }
+                    }
                 }
             }
-            None => out.tables.push(Table { name: name.clone(), columns, composite_pk: vec![], indexes: vec![] }),
+            None => out.tables.push(Table { name: name.clone(), columns, composite_pk: vec![], indexes: vec![], was: vec![] }),
         }
 
         let before: Vec<(String, String)> = validate::validate(schema).into_iter().map(|i| (i.location, i.message)).collect();
@@ -352,6 +363,18 @@ mod tests {
         let (out, renamed) = apply(&e, &s);
         assert_eq!(renamed, Some(("users".into(), "people".into())));
         let people = out.table("people").unwrap();
+        assert_eq!(people.was, ["users"]);
+        let was: Vec<&[String]> = people.columns.iter().map(|c| c.was.as_slice()).collect();
+        assert_eq!(was, [&["id".to_string()][..], &[], &["email".to_string()]]);
+        // Renamed again before a push, every earlier name is kept; renamed back, none.
+        let mut again = TableEditor::edit(people);
+        again.name = "persons".into();
+        assert_eq!(apply(&again, &out).0.table("persons").unwrap().was, ["users", "people"]);
+        again.name = "users".into();
+        again.rows[0].name = "id".into();
+        let back = apply(&again, &out).0;
+        assert_eq!(back.table("users").unwrap().was, ["people"]);
+        assert!(back.table("users").unwrap().columns[0].was == ["pid"]);
         let boss = people.column("boss").unwrap().references.as_ref().unwrap();
         assert_eq!((boss.table.as_str(), boss.column.as_str()), ("people", "pid"));
         assert_eq!(people.indexes[0].columns, vec!["mail"]);
