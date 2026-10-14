@@ -5,6 +5,7 @@ use eframe::egui::{self, Color32, RichText};
 use simple_database::connections::{Color, Connection, Kind, SafeMode, Store};
 use simple_database::db::{self, Database};
 use simple_database::discover::{self, Found};
+use simple_database::tls;
 use std::path::PathBuf;
 use std::time::Instant;
 use crate::worker::Task;
@@ -94,12 +95,23 @@ impl Manager {
     }
 
     /// What to connect to with the form as it is: (target, label).
-    fn target(&self, store: &Store) -> (String, String) {
-        let saved = self.editing.as_deref().and_then(|n| store.password(n));
-        let pw = if self.password.is_empty() { saved } else { Some(self.password.as_str()) };
-        let target = self.form.target(pw);
+    fn target(&self, store: &Store) -> anyhow::Result<(String, String)> {
+        let pw = match (self.password.is_empty(), self.editing.as_deref()) {
+            (false, _) => Some(self.password.clone()),
+            (true, Some(name)) => store.password(name)?,
+            (true, None) => None,
+        };
+        let target = self.form.target(pw.as_deref());
         let label = if self.form.name.trim().is_empty() { db::redact(&target) } else { format!("@{}", self.form.name.trim()) };
-        (target, label)
+        Ok((target, label))
+    }
+
+    /// Connect with the form as it is, or show why not.
+    fn connect(&mut self, store: &Store, action: &mut Option<Action>) {
+        match self.target(store) {
+            Ok((target, label)) => *action = Some(Action::Connect { target, label, safe_mode: self.form.safe_mode }),
+            Err(e) => self.message = Some((format!("{e:#}"), true)),
+        }
     }
 
     /// Save the form, re-reading the store first so changes made meanwhile
@@ -110,8 +122,12 @@ impl Manager {
         fresh.upsert(self.editing.as_deref(), self.form.clone(), password)?;
         fresh.save()?;
         *store = fresh;
-        self.form.name = self.form.name.trim().to_string();
-        self.editing = Some(self.form.name.clone());
+        let name = self.form.name.trim().to_string();
+        // The store may have filled in some fields (sslmode).
+        if let Some(saved) = store.get(&name) {
+            self.form = saved.clone();
+        }
+        self.editing = Some(name);
         self.password_edited = false;
         Ok(())
     }
@@ -229,8 +245,7 @@ impl Manager {
         {
             self.load(c);
             if connect {
-                let (target, label) = self.target(store);
-                *action = Some(Action::Connect { target, label, safe_mode: self.form.safe_mode });
+                self.connect(store, action);
             }
         }
         if let Some(f) = detected_pick
@@ -285,7 +300,7 @@ impl Manager {
         ui.separator();
 
         let f = &mut self.form;
-        let saved_password = self.editing.as_deref().and_then(|n| store.password(n)).is_some();
+        let saved_password = self.editing.as_deref().is_some_and(|n| store.has_password(n));
         egui::Grid::new("conn_form").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label("Name");
             ui.add(
@@ -353,11 +368,18 @@ impl Manager {
                         self.password_edited = true;
                     }
                     ui.checkbox(&mut f.save_password, "Save password").on_hover_text(format!(
-                        "Kept in {}, readable only by you. Otherwise it is asked for each time \
-                         (or taken from PGPASSWORD / MYSQL_PWD).",
+                        "Kept in {}, readable only by you, or in the OS keychain. Otherwise it is \
+                         asked for each time (or taken from PGPASSWORD / MYSQL_PWD).",
                         store.dir().join("secrets.json").display()
                     ));
                 });
+                ui.end_row();
+
+                ui.label("");
+                ui.add_enabled(f.save_password, egui::Checkbox::new(&mut f.keychain, "In the OS keychain")).on_hover_text(
+                    "Keep the saved password in the macOS Keychain, Windows Credential Manager or the \
+                     Secret Service (GNOME Keyring, KWallet) instead of secrets.json",
+                );
                 ui.end_row();
 
                 ui.label("Database");
@@ -417,12 +439,17 @@ impl Manager {
                 egui::Grid::new("conn_tls_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     ui.label("SSL mode");
                     egui::ComboBox::from_id_salt("sslmode")
-                        .selected_text(if f.sslmode.is_empty() { "default" } else { f.sslmode.as_str() })
+                        .selected_text(if f.sslmode.is_empty() { "default (prefer)" } else { f.sslmode.as_str() })
                         .show_ui(ui, |ui| {
                             for m in SSL_MODES {
-                                ui.selectable_value(&mut f.sslmode, m.to_string(), if m.is_empty() { "default" } else { m });
+                                ui.selectable_value(&mut f.sslmode, m.to_string(), if m.is_empty() { "default (prefer)" } else { m });
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(
+                            "verify-full checks that the server's certificate is trusted and matches the host. \
+                             New connections to remote hosts get it when saved.",
+                        );
                     ui.end_row();
                     for (label, value) in [
                         ("CA certificate", &mut f.sslrootcert),
@@ -455,7 +482,16 @@ impl Manager {
         }
 
         ui.add_space(4.0);
-        ui.label(RichText::new(db::redact(&self.form.target(None))).monospace().small().weak());
+        // What the connection will be once saved: new remote ones get verify-full.
+        let mut effective = self.form.clone();
+        if self.editing.is_none() && !effective.name.trim().is_empty() {
+            effective.verify_remote();
+        }
+        let target = effective.target(None);
+        ui.label(RichText::new(db::redact(&target)).monospace().small().weak());
+        if let Some(w) = tls::warning(&target) {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {w}"));
+        }
         if let Some((msg, error)) = &self.message {
             let color = if *error { ui.visuals().error_fg_color } else { ok_color(ui) };
             ui.colored_label(color, if *error { format!("✖ {msg}") } else { format!("✔ {msg}") });
@@ -469,20 +505,23 @@ impl Manager {
             if ui.button(RichText::new("Connect").strong()).on_hover_text(connect_hint).clicked() {
                 let saved = !named || !unsaved || self.save(store).map_err(|e| self.message = Some((format!("{e:#}"), true))).is_ok();
                 if saved {
-                    let (target, label) = self.target(store);
-                    *action = Some(Action::Connect { target, label, safe_mode: self.form.safe_mode });
+                    self.connect(store, action);
                 }
             }
             if ui.add_enabled(self.testing.is_none(), egui::Button::new("Test")).clicked() {
-                let (target, _) = self.target(store);
-                self.message = None;
-                self.testing = Some(Task::spawn("Testing the connection", ui.ctx(), move || {
-                    let started = Instant::now();
-                    match Database::open_labeled(&target, db::redact(&target)).and_then(|mut d| d.introspect()) {
-                        Ok(s) => (format!("Connected in {:.0?}: {} table(s)", started.elapsed(), s.tables.len()), false),
-                        Err(e) => (format!("{e:#}"), true),
+                match self.target(store) {
+                    Ok((target, _)) => {
+                        self.message = None;
+                        self.testing = Some(Task::spawn("Testing the connection", ui.ctx(), move || {
+                            let started = Instant::now();
+                            match Database::open_labeled(&target, db::redact(&target)).and_then(|mut d| d.introspect()) {
+                                Ok(s) => (format!("Connected in {:.0?}: {} table(s)", started.elapsed(), s.tables.len()), false),
+                                Err(e) => (format!("{e:#}"), true),
+                            }
+                        }));
                     }
-                }));
+                    Err(e) => self.message = Some((format!("{e:#}"), true)),
+                }
             }
             if self.testing.is_some() {
                 ui.spinner();
@@ -496,14 +535,18 @@ impl Manager {
             if ui.add_enabled(self.editing.is_some(), egui::Button::new("Duplicate")).clicked() {
                 self.form.name = store.unique_name(&format!("{} copy", self.form.name.trim()));
                 self.form.last_used = None;
+                let mut message = ("Copy created; Save to keep it".to_string(), false);
                 if !self.password_edited
-                    && let Some(pw) = self.editing.as_deref().and_then(|n| store.password(n))
+                    && let Some(name) = self.editing.as_deref()
                 {
-                    self.password = pw.to_string();
+                    match store.password(name) {
+                        Ok(pw) => self.password = pw.unwrap_or_default(),
+                        Err(e) => message = (format!("Copy created without the password: {e:#}"), true),
+                    }
                 }
                 self.editing = None;
                 self.password_edited = !self.password.is_empty();
-                self.message = Some(("Copy created; Save to keep it".into(), false));
+                self.message = Some(message);
             }
             if let Some(name) = self.editing.clone() {
                 let text = if self.confirm_delete {
@@ -514,7 +557,7 @@ impl Manager {
                 if ui.button(text).clicked() {
                     if self.confirm_delete {
                         let res = Store::load().and_then(|mut fresh| {
-                            fresh.remove(&name);
+                            fresh.remove(&name)?;
                             fresh.save()?;
                             Ok(fresh)
                         });

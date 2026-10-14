@@ -228,6 +228,9 @@ enum ConnCommand {
         /// PGPASSWORD / MYSQL_PWD (CLI) when connecting
         #[arg(long)]
         no_password: bool,
+        /// Keep the password in the OS keychain instead of secrets.json
+        #[arg(long, conflicts_with = "no_password")]
+        keychain: bool,
         /// Replace an existing connection with the same name
         #[arg(short, long)]
         force: bool,
@@ -333,7 +336,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Push { schema, db, dry_run, yes } => {
             let desired = load_valid_schema(&schema)?;
-            let mut db = db::Database::open(&db)?;
+            let mut db = open_db(&db)?;
             let current = db.introspect()?;
             let m = db.migration(&current, &desired);
             if m.is_empty() {
@@ -375,7 +378,7 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?
             };
-            let mut db = db::Database::open(&db)?;
+            let mut db = open_db(&db)?;
             let asks = db.needs_confirmation(&sql);
             if !asks.is_empty() && !yes && !shell::confirm_statements(&asks, db.label())? {
                 bail!("not run");
@@ -469,7 +472,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Restore { file, db, clean, yes } => {
             let sql = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
-            let mut db = db::Database::open(&db)?;
+            let mut db = open_db(&db)?;
             db.ensure_writable()?;
             let r = dump::prepare(&mut db, &sql)?;
             eprintln!("{} statement(s): {} table(s) to create, {} INSERT(s)", r.statements.len(), r.creates.len(), r.inserts());
@@ -491,7 +494,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Shell { db } => {
             let db = match &db {
-                Some(target) => db::Database::open(target)?,
+                Some(target) => open_db(target)?,
                 None => db::Database::from_sqlite(rusqlite::Connection::open_in_memory()?, "in-memory database"),
             };
             shell::run(db)?;
@@ -515,7 +518,11 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
                 for c in conns {
                     let indent = if group.is_empty() { "" } else { "  " };
                     let star = if c.favorite { " ★" } else { "" };
-                    let key = if store.password(&c.name).is_some() { " (password saved)" } else { "" };
+                    let key = match (store.has_password(&c.name), c.keychain) {
+                        (false, _) => "",
+                        (true, false) => " (password saved)",
+                        (true, true) => " (password in keychain)",
+                    };
                     let mode = match c.safe_mode {
                         connections::SafeMode::Off => String::new(),
                         m => format!(" [{}]", m.label().to_lowercase()),
@@ -524,7 +531,7 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
                 }
             }
         }
-        ConnCommand::Add { name, target, group, no_password, force, safe_mode } => {
+        ConnCommand::Add { name, target, group, no_password, keychain, force, safe_mode } => {
             let (mut conn, password) = connections::Connection::from_target(&name, &target)?;
             if conn.kind == connections::Kind::Sqlite {
                 // Saved connections are used from any directory.
@@ -533,6 +540,13 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
             conn.group = group;
             conn.safe_mode = safe_mode;
             conn.save_password = password.is_some() && !no_password;
+            conn.keychain = keychain;
+            if conn.verify_remote() {
+                eprintln!(
+                    "TLS: sslmode=verify-full, so the server certificate must be trusted and match the host \
+                     (add sslrootcert=ca.pem for a private CA, or sslmode=require to skip the check)"
+                );
+            }
             let old = store.get(&conn.name).map(|c| c.name.clone());
             if old.is_some() && !force {
                 bail!("a connection named '{}' already exists (use --force to replace it)", conn.name);
@@ -543,7 +557,7 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
         }
         ConnCommand::Remove { name } => {
             let name = name.trim_start_matches('@');
-            if !store.remove(name) {
+            if !store.remove(name)? {
                 bail!("no saved connection named '{name}'");
             }
             store.save()?;
@@ -575,7 +589,7 @@ fn conn_command(cmd: ConnCommand) -> Result<()> {
         ConnCommand::Test { name } => {
             let name = name.trim_start_matches('@');
             let started = std::time::Instant::now();
-            let mut db = db::Database::open(&format!("@{name}"))?;
+            let mut db = open_db(&format!("@{name}"))?;
             let tables = db.introspect()?.tables.len();
             println!("Connected to @{name} in {:.0?}: {tables} table(s)", started.elapsed());
         }
@@ -592,7 +606,7 @@ fn parse_count(s: &str) -> Result<(String, usize), String> {
 /// Load a schema from a `.dbs` file or by introspecting a database.
 fn load_schema(path: &Path) -> Result<Schema> {
     if let Some(url) = path.to_str().filter(|p| db::is_url(p) || p.starts_with('@')) {
-        return db::Database::open(url)?.introspect();
+        return open_db(url)?.introspect();
     }
     ensure_exists(path)?;
     if sqlite::is_sqlite_file(path) {
@@ -622,7 +636,16 @@ fn open_existing(target: &str) -> Result<db::Database> {
     if !db::is_url(target) && !target.starts_with('@') {
         ensure_exists(Path::new(target))?;
     }
-    db::Database::open(target)
+    open_db(target)
+}
+
+/// Open a database, warning on stderr when the server's identity isn't verified.
+fn open_db(target: &str) -> Result<db::Database> {
+    let db = db::Database::open(target)?;
+    if let Some(w) = db.tls_warning() {
+        eprintln!("\x1b[33mwarning:\x1b[0m {w}");
+    }
+    Ok(db)
 }
 
 fn ensure_exists(path: &Path) -> Result<()> {

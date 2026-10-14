@@ -111,6 +111,55 @@ pub fn split_url(url: &str) -> Result<(String, TlsParams)> {
     Ok((url, params))
 }
 
+/// Whether `host` is this machine: empty, `localhost`, a loopback address or
+/// a Unix socket directory. Connections to it are not warned about.
+pub fn is_local_host(host: &str) -> bool {
+    let host = host.trim();
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    host.is_empty()
+        || host.starts_with('/')
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// A warning for a server URL whose TLS settings don't check who the server
+/// is (`disable`, `prefer`, `require`), unless the host is local.
+pub fn warning(url: &str) -> Option<String> {
+    let (conn, _) = crate::connections::Connection::from_target("", url).ok()?;
+    if conn.kind == crate::connections::Kind::Sqlite || is_local_host(&conn.host) {
+        return None;
+    }
+    let host = &conn.host;
+    let (_, params) = split_url(url).ok()?;
+    match params.mode() {
+        SslMode::Disable => Some(format!("TLS is off for {host} (sslmode=disable): the password and data travel unencrypted")),
+        SslMode::Prefer => Some(format!(
+            "the certificate of {host} is not verified, and plain TCP is used if the server offers no TLS \
+             (sslmode=prefer); use sslmode=verify-full"
+        )),
+        SslMode::Require => {
+            Some(format!("the certificate of {host} is not verified (sslmode=require); use sslmode=verify-full"))
+        }
+        SslMode::VerifyCa | SslMode::VerifyFull => None,
+    }
+}
+
+/// Add advice to a connection error that comes from a certificate that
+/// could not be verified.
+pub fn explain(err: anyhow::Error, mode: SslMode) -> anyhow::Error {
+    let verifies = matches!(mode, SslMode::VerifyCa | SslMode::VerifyFull);
+    if verifies && format!("{err:#}").to_lowercase().contains("certificate") {
+        err.context(format!(
+            "the server certificate could not be verified with sslmode={}: set sslrootcert to the CA that signed \
+             it, or sslmode=require to connect without checking",
+            if mode == SslMode::VerifyCa { "verify-ca" } else { "verify-full" }
+        ))
+    } else {
+        err
+    }
+}
+
 /// The rustls provider every connection uses. Installed as the process
 /// default too, for drivers that build their own `ClientConfig`.
 pub fn provider() -> Arc<CryptoProvider> {
@@ -241,6 +290,19 @@ mod tests {
         assert_eq!(with_ca.mode(), SslMode::VerifyCa);
         let full = TlsParams { sslmode: Some(SslMode::VerifyFull), ..with_ca };
         assert_eq!(full.mode(), SslMode::VerifyFull);
+    }
+
+    #[test]
+    fn warns_about_unverified_remote_servers() {
+        assert!(warning("postgres://u@db.example.com/app").unwrap().contains("sslmode=prefer"));
+        assert!(warning("mysql://u@db.example.com/app?sslmode=require").unwrap().contains("sslmode=require"));
+        assert!(warning("postgres://u@10.0.0.5/app?sslmode=disable").unwrap().contains("unencrypted"));
+        assert_eq!(warning("postgres://u@db.example.com/app?sslmode=verify-full"), None);
+        assert_eq!(warning("postgres://u@db.example.com/app?sslmode=verify-ca"), None);
+        for local in ["postgres://u@localhost/app", "postgres://u@127.0.0.1:5433/app", "mysql://u@[::1]/app", "app.db"] {
+            assert_eq!(warning(local), None, "{local}");
+        }
+        assert!(is_local_host("") && is_local_host("/var/run/postgresql") && !is_local_host("10.0.0.5"));
     }
 
     #[test]

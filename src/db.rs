@@ -28,6 +28,7 @@ pub struct Database {
     /// Server-normalized check expressions per scratch table definition.
     check_cache: HashMap<String, Vec<(String, String)>>,
     cancel: Arc<Canceller>,
+    tls_warning: Option<String>,
 }
 
 /// Stops what a [`Database`] is running, from another thread.
@@ -112,7 +113,9 @@ impl Database {
             Conn::Postgres(c) => CancelVia::Postgres { token: c.cancel_token(), target: target.to_string() },
             Conn::Mysql(c) => CancelVia::Mysql { target: target.to_string(), id: c.connection_id() },
         };
-        Ok(Database::new(conn, label, via))
+        let mut db = Database::new(conn, label, via);
+        db.tls_warning = crate::tls::warning(target);
+        Ok(db)
     }
 
     pub fn from_sqlite(conn: rusqlite::Connection, label: impl Into<String>) -> Database {
@@ -122,7 +125,12 @@ impl Database {
 
     fn new(conn: Conn, label: String, via: CancelVia) -> Database {
         let cancel = Arc::new(Canceller { requested: AtomicBool::new(false), via });
-        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel }
+        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel, tls_warning: None }
+    }
+
+    /// Set when the server's identity isn't verified (see [`crate::tls::warning`]).
+    pub fn tls_warning(&self) -> Option<&str> {
+        self.tls_warning.as_deref()
     }
 
     /// A handle to cancel what this connection runs, from another thread.

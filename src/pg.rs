@@ -30,7 +30,7 @@ pub fn connect(url: &str) -> Result<Client> {
             config.connect(MakeRustlsConnect::new(tls::client_config(&tls, mode)?))
         }
     };
-    client.with_context(|| format!("connecting to {label}"))
+    client.with_context(|| format!("connecting to {label}")).map_err(|e| tls::explain(e, mode))
 }
 
 /// Cancel the query running on the connection `token` came from; `url` is

@@ -230,6 +230,8 @@ struct Db {
     /// What the schema leaves out (views, triggers, …), for Pull.
     skipped: Vec<String>,
     counts: Vec<(String, i64)>,
+    /// Why the server's identity isn't verified, if it isn't.
+    tls_warning: Option<String>,
     /// The Migrate tab's diff: the schema it aims at and, once computed, the migration.
     migration: Option<(Schema, Option<Migration>)>,
 }
@@ -573,7 +575,11 @@ impl App {
     fn attach_db(&mut self, opened: Opened) {
         let Opened { conn, schema, skipped, counts } = opened;
         let (label, dialect, safe_mode) = (conn.label().to_string(), conn.dialect(), conn.safe_mode());
-        self.set_status(format!("Connected to {label}"), false);
+        let tls_warning = conn.tls_warning().map(str::to_string);
+        match &tls_warning {
+            Some(w) => self.set_status(format!("Connected to {label}, but {w}"), true),
+            None => self.set_status(format!("Connected to {label}"), false),
+        }
         if let Some(name) = label.strip_prefix('@') {
             // `Database::open` already recorded `@name` as used; others (typed passwords) are recorded here.
             if let Ok(mut fresh) = Store::load() {
@@ -588,7 +594,7 @@ impl App {
         self.data.open(schema.tables.first().map(|t| t.name.clone()));
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, migration: None });
+        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;

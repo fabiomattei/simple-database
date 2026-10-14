@@ -258,6 +258,10 @@ impl App {
                     ui.spinner();
                     ui.separator();
                 }
+                if let Some(w) = self.db.as_ref().and_then(|db| db.tls_warning.as_deref()) {
+                    ui.colored_label(warn_color(ui), "⚠ server not verified").on_hover_text(w);
+                    ui.separator();
+                }
                 if let Some((msg, err, at)) = &self.status
                     && at.elapsed() < Duration::from_secs(8)
                 {

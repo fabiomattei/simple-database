@@ -2,8 +2,8 @@
 //!
 //! They live in `connections.json` in the config directory (`$SDB_CONFIG_DIR`,
 //! else `$XDG_CONFIG_HOME/sdb`, else `~/.config/sdb`). Saved passwords are kept
-//! apart in `secrets.json`, readable only by the owner (like `~/.pgpass`), so
-//! the connection list can be copied or shared without them.
+//! apart in `secrets.json`, readable only by the owner (like `~/.pgpass`), or
+//! in the OS keychain, so the connection list can be copied or shared without them.
 //!
 //! Anywhere a database target is accepted, `@name` means a saved connection.
 
@@ -13,6 +13,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_perc
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -97,7 +98,8 @@ pub struct Connection {
     pub user: String,
     /// Database name, or the file path for SQLite.
     pub database: String,
-    /// `disable`, `prefer`, `require`, `verify-ca` or `verify-full`; empty = driver default.
+    /// `disable`, `prefer`, `require`, `verify-ca` or `verify-full`; empty = `prefer`.
+    /// [`Store::upsert`] makes new connections to remote hosts `verify-full`.
     pub sslmode: String,
     pub sslrootcert: String,
     pub sslcert: String,
@@ -111,6 +113,9 @@ pub struct Connection {
     /// Keep the password in `secrets.json`. Otherwise it is asked for on connect
     /// (or taken from PGPASSWORD / MYSQL_PWD).
     pub save_password: bool,
+    /// Keep the saved password in the OS keychain (macOS Keychain, Windows
+    /// Credential Manager, Secret Service on Linux) instead of `secrets.json`.
+    pub keychain: bool,
     /// Unix seconds of the last successful connection.
     pub last_used: Option<u64>,
     /// What may run without asking.
@@ -231,6 +236,21 @@ impl Connection {
         crate::db::redact(&self.target(None))
     }
 
+    /// A server on another machine.
+    pub fn is_remote(&self) -> bool {
+        self.kind != Kind::Sqlite && !crate::tls::is_local_host(&self.host)
+    }
+
+    /// Use `sslmode=verify-full` for a remote host that has no `sslmode`.
+    /// Returns whether it did.
+    pub fn verify_remote(&mut self) -> bool {
+        let unset = self.sslmode.trim().is_empty();
+        if unset && self.is_remote() {
+            self.sslmode = "verify-full".into();
+        }
+        unset && self.is_remote()
+    }
+
     /// Whether `query` (lowercase) matches the name, host, database, user, type or group.
     pub fn matches(&self, query: &str) -> bool {
         query.is_empty()
@@ -241,11 +261,59 @@ impl Connection {
 }
 
 /// The saved connections and passwords, as loaded from the config directory.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Store {
     dir: PathBuf,
     pub connections: Vec<Connection>,
     secrets: BTreeMap<String, String>,
+    keychain: Arc<dyn Keychain>,
+}
+
+impl Default for Store {
+    fn default() -> Store {
+        Store { dir: PathBuf::new(), connections: Vec::new(), secrets: BTreeMap::new(), keychain: Arc::new(OsKeychain) }
+    }
+}
+
+/// Where passwords of connections with [`Connection::keychain`] live, by connection name.
+trait Keychain: std::fmt::Debug + Send + Sync {
+    fn get(&self, name: &str) -> Result<Option<String>>;
+    fn set(&self, name: &str, password: &str) -> Result<()>;
+    /// A missing entry is not an error.
+    fn delete(&self, name: &str) -> Result<()>;
+}
+
+/// The OS credential store, under the service name `sdb`.
+#[derive(Debug)]
+struct OsKeychain;
+
+impl OsKeychain {
+    fn entry(name: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new("sdb", name).context("opening the OS keychain")
+    }
+}
+
+impl Keychain for OsKeychain {
+    fn get(&self, name: &str) -> Result<Option<String>> {
+        match OsKeychain::entry(name)?.get_password() {
+            Ok(pw) => Ok(Some(pw)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading the password of '{name}' from the OS keychain")),
+        }
+    }
+
+    fn set(&self, name: &str, password: &str) -> Result<()> {
+        OsKeychain::entry(name)?
+            .set_password(password)
+            .with_context(|| format!("saving the password of '{name}' in the OS keychain"))
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        match OsKeychain::entry(name)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("deleting the password of '{name}' from the OS keychain")),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -291,7 +359,7 @@ impl Store {
         }
         let file: ConnectionsFile = read(&dir.join("connections.json"))?;
         let secrets: SecretsFile = read(&dir.join("secrets.json"))?;
-        Ok(Store { dir: dir.to_path_buf(), connections: file.connections, secrets: secrets.passwords })
+        Ok(Store { dir: dir.to_path_buf(), connections: file.connections, secrets: secrets.passwords, ..Store::default() })
     }
 
     pub fn dir(&self) -> &Path {
@@ -310,16 +378,35 @@ impl Store {
         self.connections.iter().find(|c| c.name == name)
     }
 
-    /// The saved password, if any.
-    pub fn password(&self, name: &str) -> Option<&str> {
-        self.secrets.get(name).map(String::as_str)
+    /// Whether the connection keeps its password in the OS keychain.
+    fn in_keychain(&self, name: &str) -> bool {
+        self.get(name).is_some_and(|c| c.save_password && c.keychain)
+    }
+
+    /// The saved password, if any. May ask the OS keychain, which can prompt the user.
+    pub fn password(&self, name: &str) -> Result<Option<String>> {
+        if self.in_keychain(name) {
+            return self.keychain.get(name);
+        }
+        Ok(self.secrets.get(name).cloned())
+    }
+
+    /// Whether a password is saved, without reading the keychain: there it is
+    /// assumed to be.
+    pub fn has_password(&self, name: &str) -> bool {
+        self.in_keychain(name) || self.secrets.contains_key(name)
     }
 
     /// Add `conn`, or replace the one called `old_name` (which may rename it).
     /// `password` replaces the saved one when `conn.save_password` is set;
     /// `None` keeps it. Without `save_password` any saved password is dropped.
+    /// The OS keychain is updated right away; `secrets.json` on [`Store::save`].
+    /// A new connection to a remote host without an `sslmode` gets `verify-full`.
     pub fn upsert(&mut self, old_name: Option<&str>, mut conn: Connection, password: Option<String>) -> Result<()> {
         conn.name = conn.name.trim().to_string();
+        if old_name.is_none() {
+            conn.verify_remote();
+        }
         let name = conn.name.as_str();
         if name.is_empty() {
             bail!("the connection needs a name");
@@ -333,16 +420,33 @@ impl Store {
         if conn.kind == Kind::Sqlite && conn.database.trim().is_empty() {
             bail!("choose the SQLite database file");
         }
-        let mut secret = old_name.and_then(|o| self.secrets.remove(o));
-        if conn.save_password {
-            if let Some(pw) = password {
-                secret = Some(pw).filter(|p| !p.is_empty());
+        let old_in_keychain = old_name.is_some_and(|o| self.in_keychain(o));
+        let to_keychain = conn.save_password && conn.keychain;
+        // The same keychain entry, with no new password: nothing to move.
+        if !(to_keychain && old_in_keychain && old_name == Some(name) && password.is_none()) {
+            let secret = if !conn.save_password {
+                None
+            } else if let Some(pw) = password {
+                Some(pw).filter(|p| !p.is_empty())
+            } else if let Some(old) = old_name.filter(|_| old_in_keychain) {
+                self.keychain.get(old)?
+            } else {
+                old_name.and_then(|o| self.secrets.get(o).cloned())
+            };
+            match &secret {
+                Some(pw) if to_keychain => self.keychain.set(name, pw)?,
+                None if to_keychain => self.keychain.delete(name)?,
+                _ => {}
             }
-        } else {
-            secret = None;
-        }
-        if let Some(pw) = secret {
-            self.secrets.insert(conn.name.clone(), pw);
+            if let Some(old) = old_name.filter(|o| old_in_keychain && (*o != name || !to_keychain)) {
+                self.keychain.delete(old)?;
+            }
+            if let Some(old) = old_name {
+                self.secrets.remove(old);
+            }
+            if let Some(pw) = secret.filter(|_| !to_keychain) {
+                self.secrets.insert(conn.name.clone(), pw);
+            }
         }
         match old_name.and_then(|o| self.connections.iter().position(|c| c.name == o)) {
             Some(i) => self.connections[i] = conn,
@@ -351,11 +455,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn remove(&mut self, name: &str) -> bool {
+    /// Forget the connection and its saved password.
+    pub fn remove(&mut self, name: &str) -> Result<bool> {
+        if self.in_keychain(name) {
+            self.keychain.delete(name)?;
+        }
         self.secrets.remove(name);
         let before = self.connections.len();
         self.connections.retain(|c| c.name != name);
-        self.connections.len() != before
+        Ok(self.connections.len() != before)
     }
 
     /// Record a successful connection, for the recent list.
@@ -424,7 +532,8 @@ pub fn resolve(target: &str) -> Result<Option<Resolved>> {
     let Some(c) = store.get(name) else {
         bail!("no saved connection named '{name}' (see `sdb conn list`)");
     };
-    let resolved = Resolved { target: c.target(store.password(name)), name: name.to_string(), safe_mode: c.safe_mode };
+    let password = store.password(name)?;
+    let resolved = Resolved { target: c.target(password.as_deref()), name: name.to_string(), safe_mode: c.safe_mode };
     store.touch(name);
     // Recording the last use is a nicety; a read-only config must not stop the connection.
     let _ = store.save();
@@ -504,18 +613,91 @@ mod tests {
         }
 
         let mut store = Store::load_from(&dir).unwrap();
-        assert_eq!(store.password("prod"), Some("secret"));
+        let pw = |store: &Store, name| store.password(name).unwrap();
+        assert_eq!(pw(&store, "prod").as_deref(), Some("secret"));
         // Renaming carries the password along; `None` keeps it.
         c.name = "production".into();
         store.upsert(Some("prod"), c.clone(), None).unwrap();
-        assert_eq!((store.password("prod"), store.password("production")), (None, Some("secret")));
+        assert_eq!((pw(&store, "prod"), pw(&store, "production").as_deref()), (None, Some("secret")));
         assert_eq!(store.connections.len(), 1);
         // Turning off save_password forgets it.
         c.save_password = false;
         store.upsert(Some("production"), c, None).unwrap();
-        assert_eq!(store.password("production"), None);
+        assert_eq!(pw(&store, "production"), None);
         assert_eq!(store.unique_name("production"), "production 2");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Stands in for the OS keychain.
+    #[derive(Debug, Default)]
+    struct MemoryKeychain(std::sync::Mutex<BTreeMap<String, String>>);
+
+    impl Keychain for MemoryKeychain {
+        fn get(&self, name: &str) -> Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(name).cloned())
+        }
+        fn set(&self, name: &str, password: &str) -> Result<()> {
+            self.0.lock().unwrap().insert(name.into(), password.into());
+            Ok(())
+        }
+        fn delete(&self, name: &str) -> Result<()> {
+            self.0.lock().unwrap().remove(name);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn keychain_passwords_stay_out_of_the_secrets_file() {
+        let keychain = Arc::new(MemoryKeychain::default());
+        let entries = || keychain.0.lock().unwrap().clone().into_iter().collect::<Vec<_>>();
+        let mut store = Store { keychain: keychain.clone(), ..Store::default() };
+        let (mut c, pw) = Connection::from_target("prod", "postgres://u:secret@h/db").unwrap();
+        c.save_password = true;
+        store.upsert(None, c.clone(), pw).unwrap();
+        assert_eq!(store.secrets.get("prod").map(String::as_str), Some("secret"));
+
+        // Moving it to the keychain takes the saved password along.
+        c.keychain = true;
+        store.upsert(Some("prod"), c.clone(), None).unwrap();
+        assert!(store.secrets.is_empty());
+        assert_eq!(entries(), [("prod".to_string(), "secret".to_string())]);
+        assert!(store.has_password("prod"));
+        assert_eq!(store.password("prod").unwrap().as_deref(), Some("secret"));
+
+        // Renames move the entry; a new password replaces it.
+        c.name = "production".into();
+        store.upsert(Some("prod"), c.clone(), Some("new".into())).unwrap();
+        assert_eq!(entries(), [("production".to_string(), "new".to_string())]);
+
+        // Back to the file, then deleting forgets it everywhere.
+        c.keychain = false;
+        store.upsert(Some("production"), c.clone(), None).unwrap();
+        assert!(entries().is_empty());
+        assert_eq!(store.password("production").unwrap().as_deref(), Some("new"));
+        c.keychain = true;
+        store.upsert(Some("production"), c, None).unwrap();
+        assert!(store.remove("production").unwrap());
+        assert!(entries().is_empty() && store.secrets.is_empty());
+    }
+
+    #[test]
+    fn new_remote_connections_verify_the_server() {
+        let mut store = Store::default();
+        for (name, url, sslmode) in [
+            ("remote", "postgres://u@db.example.com/app", "verify-full"),
+            ("explicit", "postgres://u@db.example.com/app?sslmode=require", "require"),
+            ("local", "mysql://u@127.0.0.1/app", ""),
+            ("file", "app.db", ""),
+        ] {
+            let (c, _) = Connection::from_target(name, url).unwrap();
+            store.upsert(None, c, None).unwrap();
+            assert_eq!(store.get(name).unwrap().sslmode, sslmode, "{name}");
+        }
+        // Existing connections keep what they have.
+        let mut c = store.get("remote").unwrap().clone();
+        c.sslmode.clear();
+        store.upsert(Some("remote"), c, None).unwrap();
+        assert_eq!(store.get("remote").unwrap().sslmode, "");
     }
 
     #[test]

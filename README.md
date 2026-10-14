@@ -210,7 +210,11 @@ TLS uses the same libpq-style URL parameters for both servers:
 | `sslcert=client.pem`, `sslkey=client.key` | Client certificate authentication (PEM; both are needed) |
 
 Giving certificate files without `sslmode` makes TLS required, and `require` with `sslrootcert`
-verifies the CA, as libpq does:
+verifies the CA, as libpq does. Connecting to a remote host (anything but `localhost`, a
+loopback address or a socket) with `disable`, `prefer` or `require` prints a warning, because
+nothing checks which server answered; the app shows "⚠ server not verified" in the status bar.
+A connection saved to a remote host without an `sslmode` gets `verify-full`. If the server's
+certificate comes from a private CA, pass it with `sslrootcert`:
 
 ```sh
 --db "postgres://app@db.example.com/app?sslmode=verify-full&sslrootcert=ca.pem&sslcert=client.pem&sslkey=client.key"
@@ -235,7 +239,7 @@ verifies the CA, as libpq does:
 | `sdb restore FILE --db app.db [--clean] [-y]` | Run a dump against a database in one transaction (see below) |
 | `sdb shell [--db app.db]` | Interactive SQL shell (in-memory if no `--db`) |
 | `sdb conn list` | List saved connections by group |
-| `sdb conn add NAME URL\|FILE [-g GROUP] [--no-password] [-f] [--safe-mode MODE]` | Save a connection. A password in the URL is saved unless `--no-password`; `-f` replaces an existing one |
+| `sdb conn add NAME URL\|FILE [-g GROUP] [--no-password] [--keychain] [-f] [--safe-mode MODE]` | Save a connection. A password in the URL is saved unless `--no-password`, in the OS keychain with `--keychain`; `-f` replaces an existing one. Remote hosts default to `sslmode=verify-full` |
 | `sdb conn detect [DIR] [--save]` | List databases a project describes; `--save` saves the new ones (without passwords) |
 | `sdb conn remove NAME` | Delete a saved connection |
 | `sdb conn test NAME` | Connect and report how many tables there are |
@@ -254,7 +258,9 @@ sdb diff @prod schema.dbs -d postgres
 
 They are stored in `connections.json` in `$SDB_CONFIG_DIR`, else `$XDG_CONFIG_HOME/sdb`, else
 `~/.config/sdb` (`%APPDATA%\sdb` on Windows). Saved passwords are kept apart in `secrets.json`,
-which only you can read (mode 0600, like `~/.pgpass`; it is not encrypted). That way
+which only you can read (mode 0600, like `~/.pgpass`; it is not encrypted), or, with
+`--keychain` (the app's "In the OS keychain"), in the macOS Keychain, the Windows Credential
+Manager or the Secret Service (GNOME Keyring, KWallet) under the service name `sdb`. That way
 `connections.json` can be copied or shared without them. A connection without a saved
 password uses `PGPASSWORD` / `MYSQL_PWD`, or the app asks for it. The app's query history
 (`history.json`, last 500 queries, also 0600) and saved queries (`queries.json`) live in the

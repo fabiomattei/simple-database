@@ -55,7 +55,7 @@ pub fn connect(url: &str) -> Result<Conn> {
             result => result,
         }
     };
-    conn.with_context(|| format!("connecting to {label}"))
+    conn.with_context(|| format!("connecting to {label}")).map_err(|e| tls::explain(e, mode))
 }
 
 /// Stop the statement running on connection `id`, from a new connection to `url`.
