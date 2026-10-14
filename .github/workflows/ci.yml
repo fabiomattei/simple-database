@@ -10,12 +10,13 @@ env:
 
 jobs:
   test:
-    name: Linux (SQLite, PostgreSQL, MySQL)
+    name: Linux (SQLite, PostgreSQL, MySQL, MariaDB)
     runs-on: ubuntu-latest
     env:
       # The live round-trip tests drop every table in these scratch databases.
       SDB_TEST_POSTGRES: postgres://sdb:sdb@localhost:5432/sdb
       SDB_TEST_MYSQL: mysql://sdb:sdb@127.0.0.1:3306/sdb
+      SDB_TEST_MARIADB: mariadb://sdb:sdb@127.0.0.1:3307/sdb
     services:
       postgres:
         image: postgres:17-alpine
@@ -37,6 +38,17 @@ jobs:
         options: >-
           --health-cmd "mysqladmin ping -h 127.0.0.1 -psdb"
           --health-interval 5s --health-timeout 5s --health-retries 30
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: sdb
+          MARIADB_USER: sdb
+          MARIADB_PASSWORD: sdb
+          MARIADB_DATABASE: sdb
+        ports: ["3307:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-      - name: Tests (SQLite, PostgreSQL, MySQL)
+      - name: Tests (SQLite, PostgreSQL, MySQL, MariaDB)
         run: cargo test
 
   # Service containers only run on Linux runners, so the server tests skip

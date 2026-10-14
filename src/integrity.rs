@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(o.count, 5, "every set key is an orphan");
     }
 
-    /// Runs with SDB_TEST_POSTGRES / SDB_TEST_MYSQL. Temporary tables, so the
+    /// Runs with SDB_TEST_POSTGRES / SDB_TEST_MYSQL / SDB_TEST_MARIADB. Temporary tables, so the
     /// round-trip tests sharing the scratch database don't see them. (MySQL
     /// can't use a temporary table twice in one query: no self-reference here.)
     #[test]
@@ -242,7 +242,7 @@ mod tests {
              table ic_posts { id int pk\n author_id int -> ic_users.id\n tag_post int\n tag_lang text\n fk (tag_post, tag_lang) -> ic_tags (post_id, lang) }",
         )
         .unwrap();
-        for var in ["SDB_TEST_POSTGRES", "SDB_TEST_MYSQL"] {
+        for var in ["SDB_TEST_POSTGRES", "SDB_TEST_MYSQL", "SDB_TEST_MARIADB"] {
             let Ok(url) = std::env::var(var) else { continue };
             let mut db = Database::open(&url).unwrap();
             for sql in [

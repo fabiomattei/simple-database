@@ -3,8 +3,8 @@
 `sdb` is a schema-first database tool in Rust: a **desktop app** (`sdb-gui`, egui/eframe) and a
 CLI (`sdb`). Both sit on one library crate (`simple_database`, `src/lib.rs`). You write schemas
 in a small DSL (`.dbs`). The tool validates them, generates DDL for SQLite/Postgres/MySQL, draws
-ER diagrams, diffs schemas into migrations, dumps and restores databases, pushes to and pulls from live SQLite, PostgreSQL and
-MySQL databases, seeds fake data and runs SQL. The README documents the DSL, every CLI command and every GUI tab.
+ER diagrams, diffs schemas into migrations, dumps and restores databases, pushes to and pulls from live SQLite, PostgreSQL,
+MySQL and MariaDB databases, seeds fake data and runs SQL. The README documents the DSL, every CLI command and every GUI tab.
 
 **It must build and work on macOS, Linux and Windows**, both binaries. See [Cross-platform](#cross-platform).
 
@@ -18,7 +18,8 @@ cargo run --bin sdb-gui -- schema.dbs app.db --tab diagram
 ```
 
 - CI (`.github/workflows/ci.yml`) runs clippy with `-D warnings` and `cargo test` on Linux with
-  Postgres and MySQL service containers (`SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` set), so server
+  Postgres, MySQL and MariaDB service containers (`SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` /
+  `SDB_TEST_MARIADB` set), so server
   tests must pass too, and on macOS and Windows without them (SQLite only).
 - `cargo test` and `cargo clippy` do **not** rebuild the binaries (`tests/cli.rs` does build `sdb`). Run `cargo build` before
   manual end-to-end checks, or you are testing a stale binary.
@@ -63,7 +64,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `db.rs` | `Database`: one live connection (SQLite path or `postgres://` / `mysql://` URL). `introspect` (`introspect_with_skipped` also lists views, triggers, functions, … it can't model; `format::note_skipped` puts them in a pulled schema's header), `run` / `run_limited`, `run_script` (a file statement by statement, with line numbers; optional single transaction), `row_counts`, `migration`, `apply_migration`, `normalize_checks`. Also `Cell` / `QueryResult`, `split_statements` (knows quotes, comments, `$$` bodies and trigger `BEGIN … END`), `statement_at` (Query tab's Run at the caret; `editor::selection` gives the caret), `statements_with_lines` and `schema_from_sqlite_ddl` (DDL → `Schema` via an in-memory SQLite; the GUI's editable SQL tab) |
 | `sqlite.rs` | SQLite introspection, `run_limited` (multi-statement via `rusqlite::Batch`), `apply_migration`. Checks, enums and comments are read from the stored `CREATE TABLE` text (`table_items` splits it, keeping `--` / `/* */` comments) |
 | `pg.rs` | Postgres via the `postgres` crate (TLS through `tokio-postgres-rustls`). Everything works on `current_schema()`; a `schema=` URL parameter (`take_schema`) sets the `search_path` on connect, and other schemas with tables are listed in `skipped`. A `schema=a,b` list reads several schemas (`read_schemas`; the first is the default, the others' tables come back as `b.table`). Catalog introspection, one query per catalog for all tables (`per_table`), never one per table, since round trips dominate on a remote server; queries are prepared for column types, then run with the simple protocol so every value arrives as text |
-| `mysqldb.rs` | MySQL via the `mysql` crate (pure Rust, rustls): `information_schema` introspection; checks are parsed from `SHOW CREATE TABLE` |
+| `mysqldb.rs` | MySQL and MariaDB via the `mysql` crate (pure Rust, rustls): `information_schema` introspection; checks are parsed from `SHOW CREATE TABLE`. MariaDB is the MySQL dialect; `is_mariadb` (checked on connect, `Database::server_name`) switches what introspection reads differently: defaults are SQL (`'x'`, `NULL` = none, `current_timestamp()`), column-level checks sit on the column's line (`inline_checks`), `json` is `longtext` + `json_valid`. RESTRICT reads as NO ACTION (InnoDB treats them alike; `canonical` does the same) |
 | `tls.rs` | TLS for both servers from libpq-style URL parameters (`sslmode`, default `prefer`; `sslrootcert`, `sslcert`, `sslkey`). `split_url` strips them before the URL reaches the driver; `client_config` builds the rustls config. `warning` flags remote hosts whose certificate isn't verified (`Database::tls_warning`; the CLI prints it, the GUI status bar shows it); `explain` adds advice to certificate errors |
 | `seed.rs` | Fake data. Seedable SplitMix64 RNG (no `rand` crate), heuristics based on column names. Multi-row INSERTs of `BATCH` rows (in a savepoint on Postgres); a rejected batch is retried row by row, keeping the rows that fit. Self-referencing tables go row by row |
 | `shell.rs` | CLI REPL (rustyline) and its `.meta` commands; line history in `config_dir()/shell_history`, 0600 on Unix |
@@ -103,8 +104,8 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
   (MySQL: indexed `text` → `varchar(255)`, padded decimal defaults; both: `DEFAULT NULL`
   dropped, composite-pk columns NOT NULL). `diff` applies it to both sides. Check expressions
   are rewritten by the server itself in a scratch temp table (`Database::normalize_checks`,
-  cached). Tests: `db::tests::{postgres,mysql}_round_trip`, which run only with
-  `SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` set to a scratch database URL (they drop all tables).
+  cached). Tests: `db::tests::{postgres,mysql,mariadb}_round_trip`, which run only with
+  `SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` / `SDB_TEST_MARIADB` set to a scratch database URL (they drop all tables).
 - **Round-trip with SQLite**: `introspect(execute(schema_sql(s, Sqlite)))` must equal `s`, so
   push on an up-to-date database reports no changes. This is why SQLite DDL emits specific
   declared types (`BOOLEAN`, `VARCHAR(n)`, `DECIMAL(p,s)`, `TIMESTAMP`) instead of only the

@@ -2,7 +2,7 @@
 
 Design your database as a small, readable text file, then let `sdb` validate it,
 generate SQL for SQLite / PostgreSQL / MySQL, draw ER diagrams, compute migrations,
-and push changes into a live SQLite, PostgreSQL or MySQL database. Includes an interactive SQL shell.
+and push changes into a live SQLite, PostgreSQL, MySQL or MariaDB database. Includes an interactive SQL shell.
 
 ```sh
 cargo install --path .      # installs `sdb-gui` (desktop app) and `sdb` (CLI)
@@ -61,8 +61,8 @@ matches the filters. The bar under the grid shows the rows on the page and moves
 connections (see [Saved connections](#saved-connections)). The list on the left has a search
 box (it matches name, host, database, user, type and group), **Favorites**, the five most
 **Recent** connections, and the rest in collapsible groups. Double-click a connection to
-connect. The form on the right edits the selected connection: name, type (PostgreSQL, MySQL,
-SQLite), host, port, user, password (**Save password** keeps it), database or file, group,
+connect. The form on the right edits the selected connection: name, type (PostgreSQL, MySQL
+or MariaDB, SQLite), host, port, user, password (**Save password** keeps it), database or file, group,
 color, favorite and [safe mode](#safe-mode). **TLS and options** holds the SSL mode and
 certificate files. **Import URL** fills the form from a pasted URL. **Detected in project** lists
 databases described next to the schema file or in the working directory (see `sdb conn
@@ -230,7 +230,7 @@ Any `SCHEMA` argument may be a `.dbs` file, **a SQLite database file or a databa
 ```sh
 --db app.db                                   # SQLite (push creates it if missing)
 --db postgres://user:password@localhost:5432/app
---db mysql://user:password@localhost:3306/app # also mariadb://
+--db mysql://user:password@localhost:3306/app # MySQL or MariaDB; mariadb:// works too
 --db @prod                                    # saved connection (see below)
 ```
 
@@ -242,7 +242,14 @@ keep plain names and those of `billing` are qualified (`billing.invoices`; see
 [Postgres schemas](#the-schema-language-dbs)). The first schema listed is the default: unqualified
 names in queries resolve through all of them, in order, and new unqualified tables go there. Every
 schema listed must exist. `pull` lists the other schemas that hold tables, and `push` warns about a
-schema-qualified table in a schema the connection doesn't read. MySQL needs 8.0.16 or newer for check constraints.
+schema-qualified table in a schema the connection doesn't read. MySQL needs 8.0.19 or newer for check constraints.
+
+MariaDB (10.2.7 or newer) uses the MySQL dialect: `sdb sql -d mysql` output runs on both, and anything
+said about MySQL here holds for MariaDB too. `sdb` tells them apart on connect (the app shows
+*MariaDB* next to the database name) and reads what MariaDB reports its own way: `json` columns
+(stored as `longtext` checked by `json_valid`), defaults, column-level checks and the `RESTRICT`
+it reports for a foreign key's unspecified action. MariaDB has no expression indexes, and its
+**Explain** runs only reads (`ANALYZE FORMAT=JSON`), showing the plan of a write without running it.
 
 TLS uses the same libpq-style URL parameters for both servers:
 
@@ -561,12 +568,13 @@ dispatches to `sqlite.rs`, `pg.rs` and `mysqldb.rs` (introspection & queries); `
 
 Unit tests live in each module's `mod tests`; `tests/cli.rs` runs the `sdb` binary end to end
 (init → push → seed → dump → restore → pull, migrations, error exits) in a temporary directory.
-The PostgreSQL and MySQL tests (round trips in `db.rs`, the CLI pipeline in `tests/cli.rs`) run
+The PostgreSQL, MySQL and MariaDB tests (round trips in `db.rs`, the CLI pipeline in `tests/cli.rs`) run
 only when they get a scratch database (all of its tables are dropped):
 
 ```sh
-SDB_TEST_POSTGRES=postgres://sdb:sdb@localhost:5432/sdb SDB_TEST_MYSQL=mysql://sdb:sdb@127.0.0.1:3306/sdb cargo test
+SDB_TEST_POSTGRES=postgres://sdb:sdb@localhost:5432/sdb SDB_TEST_MYSQL=mysql://sdb:sdb@127.0.0.1:3306/sdb \
+  SDB_TEST_MARIADB=mariadb://sdb:sdb@127.0.0.1:3307/sdb cargo test
 ```
 
 CI (`.github/workflows/ci.yml`) runs `cargo clippy --all-targets -D warnings` and `cargo test`
-with PostgreSQL 17 and MySQL 8.4 service containers, so the server tests always run there.
+with PostgreSQL 17, MySQL 8.4 and MariaDB 11 service containers, so the server tests always run there.

@@ -33,6 +33,8 @@ pub struct Database {
     pg_schemas: Vec<String>,
     /// The database's own functions that may write (see [`Database::writing_functions`]).
     writing_functions: HashSet<String>,
+    /// A MySQL connection that reached MariaDB, which reports some things differently.
+    mariadb: bool,
 }
 
 /// Stops what a [`Database`] is running, from another thread.
@@ -125,6 +127,9 @@ impl Database {
         let mut db = Database::new(conn, label, via);
         db.tls_warning = crate::tls::warning(target);
         db.pg_schemas = pg_schemas;
+        if let Conn::Mysql(c) = &mut db.conn {
+            db.mariadb = mysqldb::is_mariadb(c)?;
+        }
         db.load_writing_functions();
         Ok(db)
     }
@@ -136,12 +141,22 @@ impl Database {
 
     fn new(conn: Conn, label: String, via: CancelVia) -> Database {
         let cancel = Arc::new(Canceller { requested: AtomicBool::new(false), via });
-        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel, tls_warning: None, pg_schemas: Vec::new(), writing_functions: HashSet::new() }
+        Database { conn, label, safe_mode: SafeMode::Off, check_cache: HashMap::new(), cancel, tls_warning: None, pg_schemas: Vec::new(), writing_functions: HashSet::new(), mariadb: false }
     }
 
     /// Set when the server's identity isn't verified (see [`crate::tls::warning`]).
     pub fn tls_warning(&self) -> Option<&str> {
         self.tls_warning.as_deref()
+    }
+
+    /// The server's product name: SQLite, PostgreSQL, MySQL or MariaDB.
+    pub fn server_name(&self) -> &'static str {
+        match self.conn {
+            Conn::Sqlite(_) => "SQLite",
+            Conn::Postgres(_) => "PostgreSQL",
+            Conn::Mysql(_) if self.mariadb => "MariaDB",
+            Conn::Mysql(_) => "MySQL",
+        }
     }
 
     /// A handle to cancel what this connection runs, from another thread.
@@ -272,7 +287,7 @@ impl Database {
         let schema = match &mut self.conn {
             Conn::Sqlite(c) => return sqlite::introspect(c, &mut skipped).map(|s| (s, skipped)),
             Conn::Postgres(c) => pg::introspect(c, &self.pg_schemas, &mut skipped)?,
-            Conn::Mysql(c) => mysqldb::introspect(c, &mut skipped)?,
+            Conn::Mysql(c) => mysqldb::introspect(c, self.mariadb, &mut skipped)?,
         };
         let tables = schema.tables_in_dependency_order().into_iter().cloned().collect();
         Ok((Schema { tables }, skipped))
@@ -631,6 +646,7 @@ impl Database {
     /// SQLite only plans (`EXPLAIN QUERY PLAN`). Postgres and MySQL run the
     /// statement with `EXPLAIN ANALYZE` inside a transaction that is rolled
     /// back, so the plan shows real timings while writes are discarded.
+    /// MariaDB does so only for reads (`ANALYZE FORMAT=JSON`).
     pub fn explain(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
         for stmt in split_statements(sql) {
@@ -641,6 +657,15 @@ impl Database {
                 match self.dialect() {
                     Dialect::Sqlite => self.run(&format!("EXPLAIN QUERY PLAN {stmt}"))?.pop().map(sqlite_plan_tree),
                     Dialect::Postgres => self.rolled_back(&format!("EXPLAIN (ANALYZE, BUFFERS) {stmt}"))?,
+                    // MariaDB's ANALYZE runs writes too, and MyISAM tables ignore the rollback.
+                    Dialect::Mysql if self.mariadb => {
+                        let first = stmt.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+                        if matches!(first.as_str(), "select" | "with" | "values" | "table") {
+                            self.rolled_back(&format!("ANALYZE FORMAT=JSON {stmt}"))?
+                        } else {
+                            self.run(&format!("EXPLAIN FORMAT=JSON {stmt}"))?.pop()
+                        }
+                    }
                     // EXPLAIN ANALYZE needs MySQL 8.0.18+ and supports only some statements.
                     Dialect::Mysql => match self.rolled_back(&format!("EXPLAIN ANALYZE {stmt}")) {
                         Ok(r) => r,
@@ -1096,7 +1121,7 @@ mod tests {
 
     #[test]
     fn cancels_a_running_server_query() {
-        for (var, sql) in [("SDB_TEST_POSTGRES", "SELECT pg_sleep(30)"), ("SDB_TEST_MYSQL", "SELECT SLEEP(30)")] {
+        for (var, sql) in [("SDB_TEST_POSTGRES", "SELECT pg_sleep(30)"), ("SDB_TEST_MYSQL", "SELECT SLEEP(30)"), ("SDB_TEST_MARIADB", "SELECT SLEEP(30)")] {
             let Ok(url) = std::env::var(var) else { continue };
             let started = std::time::Instant::now();
             let res = cancel_slow_query(Database::open(&url).unwrap(), sql);
@@ -1112,7 +1137,17 @@ mod tests {
     /// Only the declarations matter, so no table is needed (other live tests drop every table).
     #[test]
     fn server_functions_that_write_need_confirmation() {
-        let setup: [(&str, &[&str], &[&str]); 2] = [
+        let mysql: (&[&str], &[&str]) = (
+            &[
+                "DROP FUNCTION IF EXISTS sdb_fn_logs",
+                "DROP FUNCTION IF EXISTS Sdb_Fn_Reads",
+                // DETERMINISTIC: binary logging refuses a function without it.
+                "CREATE FUNCTION sdb_fn_logs() RETURNS int DETERMINISTIC MODIFIES SQL DATA RETURN 1",
+                "CREATE FUNCTION Sdb_Fn_Reads() RETURNS int DETERMINISTIC READS SQL DATA RETURN 1",
+            ],
+            &["DROP FUNCTION sdb_fn_logs", "DROP FUNCTION Sdb_Fn_Reads"],
+        );
+        let setup: [(&str, &[&str], &[&str]); 3] = [
             (
                 "SDB_TEST_POSTGRES",
                 &[
@@ -1121,17 +1156,8 @@ mod tests {
                 ],
                 &["DROP FUNCTION sdb_fn_logs()", "DROP FUNCTION \"Sdb_Fn_Reads\"()"],
             ),
-            (
-                "SDB_TEST_MYSQL",
-                &[
-                    "DROP FUNCTION IF EXISTS sdb_fn_logs",
-                    "DROP FUNCTION IF EXISTS Sdb_Fn_Reads",
-                    // DETERMINISTIC: binary logging refuses a function without it.
-                    "CREATE FUNCTION sdb_fn_logs() RETURNS int DETERMINISTIC MODIFIES SQL DATA RETURN 1",
-                    "CREATE FUNCTION Sdb_Fn_Reads() RETURNS int DETERMINISTIC READS SQL DATA RETURN 1",
-                ],
-                &["DROP FUNCTION sdb_fn_logs", "DROP FUNCTION Sdb_Fn_Reads"],
-            ),
+            ("SDB_TEST_MYSQL", mysql.0, mysql.1),
+            ("SDB_TEST_MARIADB", mysql.0, mysql.1),
         ];
         for (var, create, drop) in setup {
             let Ok(url) = std::env::var(var) else { continue };
@@ -1295,14 +1321,20 @@ mod tests {
         assert_eq!(db.query_value("SELECT count(*) FROM post_tags").unwrap(), Cell::Int(15));
 
         // What a schema can't hold is reported, not pulled.
+        // MariaDB has no expression indexes.
+        let expr_index = db.server_name() != "MariaDB";
         db.run("CREATE VIEW sdb_names AS SELECT name FROM users").unwrap();
-        db.run("CREATE INDEX sdb_expr ON posts ((author_id + 1))").unwrap();
+        if expr_index {
+            db.run("CREATE INDEX sdb_expr ON posts ((author_id + 1))").unwrap();
+        }
         let (schema, skipped) = db.introspect_with_skipped().unwrap();
         assert!(skipped.contains(&"view sdb_names".to_string()), "{skipped:?}");
-        assert!(skipped.iter().any(|s| s.starts_with("index sdb_expr on posts")), "{skipped:?}");
+        assert!(!expr_index || skipped.iter().any(|s| s.starts_with("index sdb_expr on posts")), "{skipped:?}");
         assert!(schema.table("sdb_names").is_none() && db.migration(&schema, &edited).is_empty());
         db.run("DROP VIEW sdb_names").unwrap();
-        db.run(if db.dialect() == Dialect::Mysql { "DROP INDEX sdb_expr ON posts" } else { "DROP INDEX sdb_expr" }).unwrap();
+        if expr_index {
+            db.run(if db.dialect() == Dialect::Mysql { "DROP INDEX sdb_expr ON posts" } else { "DROP INDEX sdb_expr" }).unwrap();
+        }
 
         // Staged edits and imports, typed by column, in one transaction.
         live_edits(&mut db, &current);
@@ -1767,6 +1799,18 @@ mod tests {
         match std::env::var("SDB_TEST_MYSQL") {
             Ok(url) => live_round_trip(&url),
             Err(_) => eprintln!("SDB_TEST_MYSQL not set; skipped"),
+        }
+    }
+
+    /// Runs when SDB_TEST_MARIADB points at a scratch MariaDB database. Its tables are dropped.
+    #[test]
+    fn mariadb_round_trip() {
+        match std::env::var("SDB_TEST_MARIADB") {
+            Ok(url) => {
+                assert_eq!(Database::open(&url).unwrap().server_name(), "MariaDB");
+                live_round_trip(&url)
+            }
+            Err(_) => eprintln!("SDB_TEST_MARIADB not set; skipped"),
         }
     }
 

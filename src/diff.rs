@@ -625,7 +625,7 @@ fn rename_table_sql(t: &Table, from: &str, d: Dialect) -> Vec<String> {
                     out.push(format!("ALTER TABLE {q} ADD {};", fk_sql(to, c, fk, d)));
                 }
                 if let Some(chk) = &c.check {
-                    out.push(format!("ALTER TABLE {q} DROP CHECK {};", quote(&check_name(from, &c.name), d)));
+                    out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(&check_name(from, &c.name), d)));
                     out.push(format!("ALTER TABLE {q} ADD {};", check_sql(to, &c.name, chk, d)));
                 }
             }
@@ -680,7 +680,7 @@ fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dia
             }
             for name in touched {
                 let was = if name == to { from } else { name };
-                out.push(format!("ALTER TABLE {q} DROP CHECK {};", quote(&check_name(tn, was), d)));
+                out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(&check_name(tn, was), d)));
             }
             out.push(rename);
             if c.unique {
@@ -1012,7 +1012,7 @@ fn mysql_alter(td: &TableDiff) -> Vec<String> {
     }
     for c in &td.dropped {
         if c.check.is_some() {
-            out.push(format!("ALTER TABLE {t} DROP CHECK {};", quote(&check_name(tn, &c.name), d)));
+            out.push(format!("ALTER TABLE {t} DROP CONSTRAINT {};", quote(&check_name(tn, &c.name), d)));
         }
         if in_key_change(&c.name) {
             key_change.push(format!("DROP COLUMN {}", quote(&c.name, d)));
@@ -1049,7 +1049,7 @@ fn mysql_alter(td: &TableDiff) -> Vec<String> {
             out.push(format!("ALTER TABLE {t} DROP INDEX {};", quote(&n.name, d)));
         }
         if o.check.is_some() && o.check != n.check {
-            out.push(format!("ALTER TABLE {t} DROP CHECK {};", quote(&check_name(tn, &n.name), d)));
+            out.push(format!("ALTER TABLE {t} DROP CONSTRAINT {};", quote(&check_name(tn, &n.name), d)));
         }
         let definition_changed = o.data_type != n.data_type
             || o.nullable != n.nullable

@@ -388,7 +388,8 @@ impl Manager {
 
         form_group(ui, if f.kind == Kind::Sqlite { "Database" } else { "Server" }, |ui| {
             field(ui, "Type", |ui| {
-                let items: Vec<(Kind, RichText, &str)> = Kind::ALL.iter().map(|&k| (k, RichText::new(k.label()), "")).collect();
+                let hover = |k| if k == Kind::Mysql { "MySQL or MariaDB" } else { "" };
+                let items: Vec<(Kind, RichText, &str)> = Kind::ALL.iter().map(|&k| (k, RichText::new(k.label()), hover(k))).collect();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     if let (Some(k), _) = theme::segmented(ui, f.kind, &items, true)
                         && k != f.kind

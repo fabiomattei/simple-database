@@ -2,7 +2,6 @@
 
 use crate::{App, DiagramSource, Dialog, MigrateSource, Pending, SCHEMA_EDITOR, Tab, error_color, ok_color, warn_color, conns, editor, theme};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
-use simple_database::ddl::Dialect;
 use simple_database::parser;
 use simple_database::connections::{Connection, SafeMode};
 use simple_database::db;
@@ -381,13 +380,8 @@ impl App {
             }
             return;
         };
-        let (mode, dialect, label) = (db.safe_mode, db.dialect, db.label.clone());
+        let (mode, kind, label) = (db.safe_mode, db.server, db.label.clone());
         let saved = label.strip_prefix('@').and_then(|n| self.conns.get(n)).cloned();
-        let kind = match dialect {
-            Dialect::Sqlite => "SQLite",
-            Dialect::Postgres => "PostgreSQL",
-            Dialect::Mysql => "MySQL",
-        };
         let color = saved.as_ref().and_then(|c| conns::to_color32(c.color)).unwrap_or(p.accent);
         let hover = saved.map_or_else(|| label.clone(), |c| c.summary());
         let name = db_name(&label);

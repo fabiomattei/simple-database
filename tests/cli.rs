@@ -358,11 +358,11 @@ fn pull_keeps_types_of_several_words() {
     assert!(s.ok(&["push", "pulled.dbs", "--db", "app.db", "-y"]).contains("already up to date"));
 }
 
-/// Runs against the scratch servers of `SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL`
+/// Runs against the scratch servers of `SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` / `SDB_TEST_MARIADB`
 /// when set (their tables are dropped), e.g. `postgres://sdb:sdb@localhost:55432/sdb`.
 #[test]
 fn servers_push_seed_dump_restore() {
-    for var in ["SDB_TEST_POSTGRES", "SDB_TEST_MYSQL"] {
+    for var in ["SDB_TEST_POSTGRES", "SDB_TEST_MYSQL", "SDB_TEST_MARIADB"] {
         let Ok(url) = std::env::var(var) else {
             eprintln!("{var} not set; skipped");
             continue;

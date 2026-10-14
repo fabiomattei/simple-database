@@ -259,6 +259,8 @@ struct Db {
     worker: Worker<App>,
     label: String,
     dialect: Dialect,
+    /// The server's product name ([`Database::server_name`]), for the toolbar.
+    server: &'static str,
     /// Mirrors the connection's mode (which is what refuses writes), to ask the user.
     safe_mode: SafeMode,
     /// Mirrors `Database::writing_functions`, for the confirmations.
@@ -722,6 +724,7 @@ impl App {
     fn attach_db(&mut self, opened: Opened) {
         let Opened { conn, schema, skipped, counts } = opened;
         let (label, dialect, safe_mode) = (conn.label().to_string(), conn.dialect(), conn.safe_mode());
+        let server = conn.server_name();
         let tls_warning = conn.tls_warning().map(str::to_string);
         let writing_functions = conn.writing_functions().clone();
         match &tls_warning {
@@ -746,7 +749,7 @@ impl App {
         self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, safe_mode, writing_functions, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None, drift: None, drift_running: false });
+        self.db = Some(Db { worker, label, dialect, server, safe_mode, writing_functions, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None, drift: None, drift_running: false });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;

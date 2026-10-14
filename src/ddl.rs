@@ -405,10 +405,24 @@ pub fn canonical_table(t: &Table, d: Dialect) -> Table {
         }
         return t;
     }
-    // MySQL lists foreign keys by name.
+    // MySQL lists foreign keys by name, and InnoDB treats RESTRICT as NO ACTION
+    // (MariaDB reports an unspecified action as RESTRICT).
     if d == Dialect::Mysql {
         let name = t.name.clone();
         t.foreign_keys.sort_by_key(|fk| table_fk_name(&name, fk));
+        let same = |a: &mut RefAction| {
+            if *a == RefAction::Restrict {
+                *a = RefAction::NoAction;
+            }
+        };
+        for fk in &mut t.foreign_keys {
+            same(&mut fk.on_delete);
+            same(&mut fk.on_update);
+        }
+        for fk in t.columns.iter_mut().filter_map(|c| c.references.as_mut()) {
+            same(&mut fk.on_delete);
+            same(&mut fk.on_update);
+        }
     }
     let keyed: Vec<String> = t.indexes.iter().flat_map(|i| i.columns.clone()).collect();
     for c in &mut t.columns {

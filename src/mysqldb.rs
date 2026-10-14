@@ -64,6 +64,12 @@ pub fn cancel(url: &str, id: u32) -> Result<()> {
     connect(url)?.query_drop(format!("KILL QUERY {id}")).context("cancelling the query")
 }
 
+/// Whether the server is MariaDB rather than MySQL.
+pub fn is_mariadb(conn: &mut Conn) -> Result<bool> {
+    let version: Option<String> = conn.query_first("SELECT VERSION()")?;
+    Ok(version.is_some_and(|v| v.contains("MariaDB")))
+}
+
 // ---------------------------------------------------------------- introspection
 
 /// The lowercased names of the stored functions that may write, in any
@@ -80,14 +86,15 @@ pub fn writing_functions(conn: &mut Conn) -> Result<HashSet<String>> {
 
 /// The tables of the database. What a schema can't hold (views, triggers,
 /// routines, events, some keys, checks and indexes) is described in `skipped`.
-pub fn introspect(conn: &mut Conn, skipped: &mut Vec<String>) -> Result<Schema> {
+/// `mariadb`: the server is MariaDB (see [`is_mariadb`]).
+pub fn introspect(conn: &mut Conn, mariadb: bool, skipped: &mut Vec<String>) -> Result<Schema> {
     let names: Vec<(String, String)> = conn.query(
         "SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY CREATE_TIME, TABLE_NAME",
     )?;
     let mut schema = Schema::default();
     for (name, comment) in names {
-        let mut t = introspect_table(conn, name, skipped)?;
+        let mut t = introspect_table(conn, name, mariadb, skipped)?;
         t.comment = Some(comment).filter(|c| !c.is_empty());
         schema.tables.push(t);
     }
@@ -103,7 +110,10 @@ pub fn introspect(conn: &mut Conn, skipped: &mut Vec<String>) -> Result<Schema> 
     Ok(schema)
 }
 
-fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) -> Result<Table> {
+fn introspect_table(conn: &mut Conn, name: String, mariadb: bool, skipped: &mut Vec<String>) -> Result<Table> {
+    let create = show_create_one(conn, &name)?;
+    // MariaDB shows column-level checks on the column's line, `json` among them.
+    let inline_checks = if mariadb { inline_checks(&create) } else { Vec::new() };
     type ColumnRow = (String, String, String, Option<String>, String, String);
     let rows: Vec<ColumnRow> = conn.exec(
         "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT FROM information_schema.COLUMNS \
@@ -123,12 +133,22 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
                 other => other,
             },
         };
+        let check = inline_checks.iter().find(|(c, _)| *c == cname).map(|(_, e)| clean_expr(e).0);
+        // MariaDB's JSON is LONGTEXT checked by json_valid().
+        let json = ctype == "longtext"
+            && check.as_deref() == Some(&format!("json_valid({})", quote(&cname, Dialect::Mysql)));
+        let data_type = if json { DataType::Json } else { data_type };
         if extra.contains("auto_increment") {
             generated.push(cname.clone());
         }
         let mut col = Column::new(cname, data_type);
         col.nullable = nullable == "YES";
-        col.default = default.map(|d| parse_default(&d, &extra, &col.data_type));
+        col.check = check.filter(|_| !json);
+        col.default = match default {
+            Some(d) if mariadb => mariadb_default(&d, &col.data_type),
+            Some(d) => Some(parse_default(&d, &extra, &col.data_type)),
+            None => None,
+        };
         col.comment = Some(comment).filter(|c| !c.is_empty());
         columns.push(col);
     }
@@ -156,8 +176,8 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
                     columns,
                     table: rtable.clone(),
                     ref_columns,
-                    on_delete: RefAction::parse(on_delete).unwrap_or(RefAction::NoAction),
-                    on_update: RefAction::parse(on_update).unwrap_or(RefAction::NoAction),
+                    on_delete: ref_action(on_delete),
+                    on_update: ref_action(on_update),
                 });
             }
             continue;
@@ -166,8 +186,8 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
             c.references = Some(ForeignKey {
                 table: rtable.clone(),
                 column: rcol.clone(),
-                on_delete: RefAction::parse(on_delete).unwrap_or(RefAction::NoAction),
-                on_update: RefAction::parse(on_update).unwrap_or(RefAction::NoAction),
+                on_delete: ref_action(on_delete),
+                on_update: ref_action(on_update),
             });
         }
     }
@@ -222,7 +242,6 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
         }
     }
 
-    let create = show_create_one(conn, &name)?;
     for (cname, raw) in check_constraints(&create) {
         let (expr, idents) = clean_expr(&raw);
         let by_name = columns.iter().position(|c| check_name(&name, &c.name) == cname);
@@ -241,6 +260,15 @@ fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) ->
     Ok(Table { columns, composite_pk, indexes, foreign_keys, ..Table::new(name) })
 }
 
+/// InnoDB treats RESTRICT as NO ACTION, and MariaDB reports a key's
+/// unspecified action as RESTRICT.
+fn ref_action(rule: &str) -> RefAction {
+    match RefAction::parse(rule) {
+        Some(RefAction::Restrict) | None => RefAction::NoAction,
+        Some(a) => a,
+    }
+}
+
 /// Read `COLUMN_DEFAULT`. Literal defaults come unquoted; expression
 /// defaults (`EXTRA` has DEFAULT_GENERATED) come as SQL with escaped quotes.
 fn parse_default(raw: &str, extra: &str, ty: &DataType) -> DefaultValue {
@@ -256,8 +284,26 @@ fn parse_default(raw: &str, extra: &str, ty: &DataType) -> DefaultValue {
         };
     }
     let unescaped = raw.replace("\\'", "'").replace("\\\\", "\\");
-    let (expr, _) = clean_expr(&unescaped);
-    if expr.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
+    expr_default(&unescaped)
+}
+
+/// Read MariaDB's `COLUMN_DEFAULT`, always SQL: `'text'`, `0`,
+/// `current_timestamp()`, and `NULL` for no default.
+fn mariadb_default(raw: &str, ty: &DataType) -> Option<DefaultValue> {
+    if raw == "NULL" {
+        return None;
+    }
+    Some(match expr_default(raw) {
+        DefaultValue::Number(n) if *ty == DataType::Bool && (n == "0" || n == "1") => DefaultValue::Bool(n == "1"),
+        d => d,
+    })
+}
+
+/// A default given as SQL.
+fn expr_default(raw: &str) -> DefaultValue {
+    let (expr, _) = clean_expr(raw);
+    let lower = expr.to_ascii_lowercase();
+    if lower == "current_timestamp" || lower == "current_timestamp()" {
         return DefaultValue::Now;
     }
     if let Some(s) = single_literal(&expr) {
@@ -355,6 +401,54 @@ fn clean_expr(raw: &str) -> (String, Vec<String>) {
     (strip_outer_parens(&out), idents)
 }
 
+/// Where the parenthesis that `s` starts with closes, skipping quoted text.
+fn matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, ch) {
+            (Some(_), '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '`' | '"') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// MariaDB's column-level checks: the `CHECK (expr)` ending a column's line
+/// of a SHOW CREATE TABLE, as (column, expr).
+fn inline_checks(create: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in create.lines() {
+        let line = line.trim().trim_end_matches(',');
+        let Some(rest) = line.strip_prefix('`') else { continue };
+        let Some(end) = rest.replace("``", "\0\0").find('`') else { continue };
+        let name = rest[..end].replace("``", "`");
+        // The last CHECK whose parenthesis closes at the end of the line.
+        let found = rest.rmatch_indices(" CHECK (").map(|(i, _)| i + " CHECK ".len()).find(|&open| {
+            matching_paren(&rest[open..]).is_some_and(|close| open + close + 1 == rest.len())
+        });
+        if let Some(open) = found.filter(|&open| open > end) {
+            out.push((name, rest[open + 1..rest.len() - 1].to_string()));
+        }
+    }
+    out
+}
+
 /// `CONSTRAINT `name` CHECK (expr)` lines of a SHOW CREATE TABLE, as (name, expr).
 fn check_constraints(create: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -365,32 +459,7 @@ fn check_constraints(create: &str) -> Vec<(String, String)> {
         let name = rest[..end].replace("``", "`");
         let body = &rest[end + "` CHECK ".len()..];
         // The expression runs to the parenthesis matching the first one.
-        let mut depth = 0;
-        let mut quote: Option<char> = None;
-        let mut escaped = false;
-        let mut close = None;
-        for (i, ch) in body.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match (quote, ch) {
-                (Some(_), '\\') => escaped = true,
-                (Some(q), c) if c == q => quote = None,
-                (Some(_), _) => {}
-                (None, '\'' | '`' | '"') => quote = Some(ch),
-                (None, '(') => depth += 1,
-                (None, ')') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some(close) = close {
+        if let Some(close) = matching_paren(body) {
             out.push((name, body[1..close].to_string()));
         }
     }
@@ -406,7 +475,7 @@ fn show_create_one(conn: &mut Conn, table: &str) -> Result<String> {
 pub fn show_create(conn: &mut Conn, table: Option<&str>) -> Result<Vec<String>> {
     let names = match table {
         Some(t) => vec![t.to_string()],
-        None => introspect(conn, &mut Vec::new())?.tables.into_iter().map(|t| t.name).collect(),
+        None => introspect(conn, false, &mut Vec::new())?.tables.into_iter().map(|t| t.name).collect(),
     };
     names.iter().map(|t| show_create_one(conn, t)).collect()
 }
@@ -495,6 +564,28 @@ mod tests {
         assert_eq!(parse_default("0.00", "", &DataType::Decimal(8, 2)), DefaultValue::Number("0.00".into()));
         assert_eq!(parse_default("1", "", &DataType::Bool), DefaultValue::Bool(true));
         assert_eq!(parse_default("it's", "", &DataType::Varchar(9)), DefaultValue::String("it's".into()));
+    }
+
+    #[test]
+    fn reads_mariadb_defaults() {
+        assert_eq!(mariadb_default("NULL", &DataType::Int), None);
+        assert_eq!(mariadb_default("'NULL'", &DataType::Text), Some(DefaultValue::String("NULL".into())));
+        assert_eq!(mariadb_default("'it''s \\\\ x'", &DataType::Text), Some(DefaultValue::String("it's \\ x".into())));
+        assert_eq!(mariadb_default("current_timestamp()", &DataType::Timestamp), Some(DefaultValue::Now));
+        assert_eq!(mariadb_default("uuid()", &DataType::Uuid), Some(DefaultValue::Expr("uuid()".into())));
+        assert_eq!(mariadb_default("1.00", &DataType::Decimal(6, 2)), Some(DefaultValue::Number("1.00".into())));
+        assert_eq!(mariadb_default("1", &DataType::Bool), Some(DefaultValue::Bool(true)));
+    }
+
+    #[test]
+    fn reads_mariadb_inline_checks() {
+        let create = "CREATE TABLE `e` (\n  `b` int(11) DEFAULT NULL COMMENT 'x CHECK (y)' CHECK (`b` > 0),\n  \
+                      `c` int(11) COMMENT 'CHECK (z)',\n  \
+                      `g` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL CHECK (json_valid(`g`))\n) ENGINE=InnoDB";
+        assert_eq!(
+            inline_checks(create),
+            [("b".to_string(), "`b` > 0".to_string()), ("g".to_string(), "json_valid(`g`)".to_string())]
+        );
     }
 
     #[test]
