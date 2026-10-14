@@ -7,7 +7,8 @@ use crate::schema::*;
 use anyhow::{Context, Result};
 use crate::tls::{self, SslMode};
 use postgres::config::SslMode as PgSslMode;
-use postgres::{Client, NoTls, SimpleQueryMessage, types::Type};
+use postgres::{Client, NoTls, Row, SimpleQueryMessage, types::Type};
+use std::collections::HashMap;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use std::str::FromStr;
 
@@ -46,18 +47,67 @@ pub fn cancel(token: &postgres::CancelToken, url: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- introspection
 
+/// The oids of the current schema's tables, for `relid IN …`.
+const SCHEMA_TABLES: &str = "(SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                              WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p'))";
+
 /// The tables of the current schema. What a schema can't hold (views,
 /// functions, triggers, types, some constraints and indexes) is described in `skipped`.
+/// Each catalog is read once for all tables: one round trip per table adds up
+/// over a remote connection.
 pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Schema> {
     let tables = client.query(
-        "SELECT c.oid, c.relname::text, obj_description(c.oid, 'pg_class') FROM pg_class c \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') ORDER BY c.oid",
+        &format!("SELECT c.oid, c.relname::text, obj_description(c.oid, 'pg_class') FROM pg_class c WHERE c.oid IN {SCHEMA_TABLES} ORDER BY c.oid"),
         &[],
+    )?;
+    // The table's oid is each query's last column.
+    let mut columns = per_table(
+        client,
+        &format!(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
+             pg_get_expr(d.adbin, d.adrelid), a.attidentity::text, col_description(a.attrelid, a.attnum), \
+             (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), \
+             a.attrelid \
+             FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE a.attrelid IN {SCHEMA_TABLES} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attrelid, a.attnum"
+        ),
+        7,
+    )?;
+    let mut constraints = per_table(
+        client,
+        &format!(
+            "SELECT con.contype::text, con.conname::text, {}, \
+             COALESCE((SELECT relname::text FROM pg_class WHERE oid = con.confrelid), ''), {}, \
+             con.confupdtype::text, con.confdeltype::text, pg_get_constraintdef(con.oid), con.conrelid \
+             FROM pg_constraint con WHERE con.conrelid IN {SCHEMA_TABLES} ORDER BY con.conrelid, con.oid",
+            attnames("con.conkey", "con.conrelid"),
+            attnames("con.confkey", "con.confrelid")
+        ),
+        8,
+    )?;
+    let mut indexes = per_table(
+        client,
+        &format!(
+            "SELECT i.relname::text, ix.indisunique, {}, ix.indexprs IS NULL AND ix.indpred IS NULL, ix.indrelid \
+             FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
+             WHERE ix.indrelid IN {SCHEMA_TABLES} \
+             AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = ix.indexrelid \
+                             AND c.conrelid = ix.indrelid AND c.contype IN ('p', 'u', 'x')) \
+             ORDER BY ix.indrelid, i.oid",
+            attnames("ix.indkey::int2[]", "ix.indrelid")
+        ),
+        4,
     )?;
     let mut schema = Schema::default();
     for row in tables {
-        let mut t = introspect_table(client, row.get(0), row.get(1), skipped)?;
+        let oid: u32 = row.get(0);
+        let mut t = build_table(
+            row.get(1),
+            columns.remove(&oid).unwrap_or_default(),
+            constraints.remove(&oid).unwrap_or_default(),
+            indexes.remove(&oid).unwrap_or_default(),
+            skipped,
+        );
         t.comment = row.get::<_, Option<String>>(2).filter(|c| !c.is_empty());
         schema.tables.push(t);
     }
@@ -102,15 +152,17 @@ fn attnames(list: &str, rel: &str) -> String {
     )
 }
 
-fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut Vec<String>) -> Result<Table> {
-    let rows = client.query(
-        "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
-         pg_get_expr(d.adbin, d.adrelid), a.attidentity::text, col_description(a.attrelid, a.attnum), \
-         (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid) \
-         FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-         WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-        &[&oid],
-    )?;
+/// The rows of `sql` keyed by the table oid in column `oid_col`, in query order.
+fn per_table(client: &mut Client, sql: &str, oid_col: usize) -> Result<HashMap<u32, Vec<Row>>> {
+    let mut out: HashMap<u32, Vec<Row>> = HashMap::new();
+    for r in client.query(sql, &[])? {
+        out.entry(r.get(oid_col)).or_default().push(r);
+    }
+    Ok(out)
+}
+
+/// One table from its rows of the catalog queries in [`introspect`].
+fn build_table(name: String, rows: Vec<Row>, constraints: Vec<Row>, index_rows: Vec<Row>, skipped: &mut Vec<String>) -> Table {
     let mut columns = Vec::new();
     // Columns whose value is generated: identity or serial.
     let mut generated = Vec::new();
@@ -133,17 +185,6 @@ fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut V
         columns.push(col);
     }
 
-    let constraints = client.query(
-        &format!(
-            "SELECT con.contype::text, con.conname::text, {}, \
-             COALESCE((SELECT relname::text FROM pg_class WHERE oid = con.confrelid), ''), {}, \
-             con.confupdtype::text, con.confdeltype::text, pg_get_constraintdef(con.oid) \
-             FROM pg_constraint con WHERE con.conrelid = $1 ORDER BY con.oid",
-            attnames("con.conkey", "con.conrelid"),
-            attnames("con.confkey", "con.confrelid")
-        ),
-        &[&oid],
-    )?;
     let mut composite_pk = Vec::new();
     let mut indexes = Vec::new();
     let mut foreign_keys = Vec::new();
@@ -205,31 +246,16 @@ fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut V
         }
     }
 
-    let rows = client.query(
-        &format!(
-            "SELECT i.relname::text, ix.indisunique, {} \
-             FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
-             WHERE ix.indrelid = $1 AND ix.indexprs IS NULL AND ix.indpred IS NULL \
-             AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = ix.indexrelid \
-                             AND c.conrelid = ix.indrelid AND c.contype IN ('p', 'u', 'x')) \
-             ORDER BY i.oid",
-            attnames("ix.indkey::int2[]", "ix.indrelid")
-        ),
-        &[&oid],
-    )?;
-    for r in rows {
-        indexes.push(Index { name: r.get(0), unique: r.get(1), columns: r.get(2) });
-    }
-    let rows = client.query(
-        "SELECT i.relname::text FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
-         WHERE ix.indrelid = $1 AND (ix.indexprs IS NOT NULL OR ix.indpred IS NOT NULL) ORDER BY i.oid",
-        &[&oid],
-    )?;
-    for r in rows {
-        skipped.push(format!("index {} on {name} (on an expression, or partial)", r.get::<_, String>(0)));
+    for r in index_rows {
+        let iname: String = r.get(0);
+        if r.get::<_, bool>(3) {
+            indexes.push(Index { name: iname, unique: r.get(1), columns: r.get(2) });
+        } else {
+            skipped.push(format!("index {iname} on {name} (on an expression, or partial)"));
+        }
     }
 
-    Ok(Table { columns, composite_pk, indexes, foreign_keys, ..Table::new(name) })
+    Table { columns, composite_pk, indexes, foreign_keys, ..Table::new(name) }
 }
 
 /// Read a default as `pg_get_expr` prints it: `'x'::text`, `'-1'::integer`, `0`, ...
