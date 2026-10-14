@@ -2,7 +2,7 @@
 //! place. Edits, new rows and deletions are staged until Save, which applies
 //! them in one transaction.
 
-use crate::grid::number_color;
+use crate::grid::{self, number_color};
 use eframe::egui::{self, Color32, Key, RichText};
 use egui_extras::{Column, TableBuilder};
 use simple_database::data::{self, Filter, Op, RowChange, View};
@@ -646,9 +646,15 @@ impl DataView {
 
         let pk = table.map(|t| t.primary_key()).unwrap_or_default();
         let sort = self.view.sort.clone();
+        let fit_key = egui::Id::new(("data_grid", self.table.clone()));
+        let generation = grid::fit_generation(ui, fit_key);
+        let grid_id = fit_key.with((self.page, generation));
+        // Room for the key icon and a sort arrow, so sorting doesn't truncate the header.
+        let headers: Vec<String> = r.columns.iter().map(|c| format!("{}{c} ⏷", if pk.contains(c) { "🔑" } else { "" })).collect();
+        let widths = grid::fitted_widths(ui, grid_id, &headers, &r.rows);
         egui::ScrollArea::horizontal().id_salt("data_grid_h").show(ui, |ui| {
             let mut tb = TableBuilder::new(ui)
-                .id_salt(("data_grid", self.table.clone(), self.page))
+                .id_salt(grid_id)
                 .striped(true)
                 .resizable(true)
                 .sense(egui::Sense::click())
@@ -657,8 +663,8 @@ impl DataView {
                 .max_scroll_height(f32::INFINITY)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::exact(52.0));
-            for _ in &r.columns {
-                tb = tb.column(Column::auto_with_initial_suggestion(130.0).at_least(40.0).at_most(600.0).clip(true));
+            for w in widths {
+                tb = tb.column(Column::initial(w).at_least(40.0).clip(true));
             }
             tb.header(row_h + 2.0, |mut header| {
                 header.col(|ui| {
@@ -672,9 +678,11 @@ impl DataView {
                         };
                         let key = if pk.contains(c) { "🔑" } else { "" };
                         let label = egui::Label::new(RichText::new(format!("{key}{c}{arrow}")).strong()).sense(egui::Sense::click());
-                        if ui.add(label).on_hover_text("Click to sort").clicked() {
+                        let resp = ui.add(label).on_hover_text("Click to sort · right-click to fit the columns to their content");
+                        if resp.clicked() {
                             sort_by = Some(c.clone());
                         }
+                        resp.context_menu(|ui| grid::fit_columns_button(ui, fit_key));
                     });
                 }
             })

@@ -36,7 +36,8 @@ use **➕** next to the tabs, or **Browse data** in the Diagram), and every tab 
 filters and unsaved changes while you look at another; a tab with changes waiting is marked •
 and can't be closed until they're saved or discarded. The open tabs are remembered per database and come
 back the next time you open it. Click a column header to sort (again to reverse, a third
-time to clear). **Filter** adds conditions per column (=, ≠, <, >, contains, starts with, in, is
+time to clear). Columns start as wide as their content (up to a limit; drag an edge for more), and
+right-clicking a header offers **Fit columns to content**, as in Query results. **Filter** adds conditions per column (=, ≠, <, >, contains, starts with, in, is
 NULL…) and an optional SQL `WHERE` condition; **Apply** or Enter runs them. Double-click a cell
 to edit it (Enter or clicking elsewhere keeps the value, Esc cancels), right-click for **Set
 NULL**, **Revert cell**, **Copy value**, **Duplicate row** and **Delete row**. **➕ Row** adds a
