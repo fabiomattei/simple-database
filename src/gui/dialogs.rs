@@ -141,7 +141,7 @@ impl App {
                 match answer {
                     Some(true) => match c.write {
                         Write::Query => self.run_query(),
-                        Write::SaveRows(changes) => self.save_rows(changes),
+                        Write::SaveRows(table, changes) => self.save_rows(table, changes),
                         Write::Seed => self.seed_now(),
                     },
                     Some(false) => {}
@@ -242,9 +242,7 @@ impl App {
                                         }
                                         app.set_status(format!("Imported {n} row(s) into {table}"), false);
                                         app.refresh_db();
-                                        app.data.open(Some(table));
-                                        app.data_loading = None;
-                                        app.tab = Tab::Data;
+                                        app.open_table_data(table);
                                     }
                                     Err(e) => match &mut app.dialog {
                                         Some(Dialog::Import(st)) => {

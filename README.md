@@ -20,10 +20,13 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save. In SQLite it is editable and kept in sync with the schema (see below) |
 | **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, or another database (a saved connection or a SQLite file), to make the open database match it. **Pull** replaces the editor with the database's schema |
 | **Query** | Run SQL (Ctrl+Enter) and see the results in a grid. Shows up to 10,000 rows per result. **Explain** shows each statement's query plan: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept. **History** lists past queries (searchable; click to load, double-click to run) and saved queries (**Save query…**). **Export** saves the result as CSV, TSV, JSON, JSON Lines, Markdown, HTML or SQL INSERTs, or copies it |
-| **Data** | Browse and edit a table, 200 rows per page (see below) |
+| **Data** | Browse and edit tables, each in its own tab, 200 rows per page (see below) |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
 
-The **Data** tab edits rows in place. Click a column header to sort (again to reverse, a third
+The **Data** tab edits rows in place. Each table opens in its own tab (click it in the sidebar,
+use **➕** next to the tabs, or **Browse data** in the Diagram), and every tab keeps its page,
+filters and unsaved changes while you look at another; a tab with changes waiting is marked •
+and can't be closed until they're saved or discarded. Click a column header to sort (again to reverse, a third
 time to clear). **Filter** adds conditions per column (=, ≠, <, >, contains, starts with, in, is
 NULL…) and an optional SQL `WHERE` condition; **Apply** or Enter runs them. Double-click a cell
 to edit it (Enter or clicking elsewhere keeps the value, Esc cancels), right-click for **Set

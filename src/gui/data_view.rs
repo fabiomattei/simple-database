@@ -9,7 +9,7 @@ use simple_database::data::{self, Filter, Op, RowChange, View};
 use simple_database::db::{Cell, QueryResult};
 use simple_database::ddl::Dialect;
 use simple_database::output::ExportFormat;
-use simple_database::schema::Table;
+use simple_database::schema::{Schema, Table};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PAGE_SIZE: usize = 200;
@@ -78,6 +78,126 @@ pub enum DataAction {
     Export(ExportFormat),
 }
 
+/// The Data tab's open tables, one `DataView` each, so every table keeps its
+/// page, filters and staged changes while another one is shown.
+#[derive(Default)]
+pub struct DataTabs {
+    pub views: Vec<DataView>,
+    pub active: usize,
+}
+
+impl DataTabs {
+    pub fn current(&self) -> Option<&DataView> {
+        self.views.get(self.active)
+    }
+
+    pub fn current_mut(&mut self) -> Option<&mut DataView> {
+        self.views.get_mut(self.active)
+    }
+
+    /// The shown table.
+    pub fn table(&self) -> Option<&str> {
+        self.current().and_then(|v| v.table.as_deref())
+    }
+
+    pub fn view_mut(&mut self, table: &str) -> Option<&mut DataView> {
+        self.views.iter_mut().find(|v| v.table.as_deref() == Some(table))
+    }
+
+    /// Show `table`, in a new tab unless one already has it.
+    pub fn show(&mut self, table: String) {
+        match self.views.iter().position(|v| v.table.as_ref() == Some(&table)) {
+            Some(i) => self.active = i,
+            None => {
+                let mut v = DataView::default();
+                v.open(Some(table));
+                self.views.push(v);
+                self.active = self.views.len() - 1;
+            }
+        }
+    }
+
+    /// Only `table` open, or nothing: another database.
+    pub fn start(&mut self, table: Option<String>) {
+        *self = DataTabs::default();
+        if let Some(t) = table {
+            self.show(t);
+        }
+    }
+
+    pub fn close(&mut self, i: usize) {
+        if i >= self.views.len() {
+            return;
+        }
+        self.views.remove(i);
+        if self.active > i || self.active >= self.views.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    /// After the database was read again: close the tabs of tables that are
+    /// gone, reload the others unless they have changes waiting. With no tab
+    /// left, the first table opens.
+    pub fn refresh(&mut self, schema: &Schema) {
+        let shown = self.table().map(str::to_owned);
+        self.views.retain(|v| v.table.as_deref().is_some_and(|t| schema.table(t).is_some()));
+        if self.views.is_empty() {
+            return self.start(schema.tables.first().map(|t| t.name.clone()));
+        }
+        self.active = shown.and_then(|t| self.views.iter().position(|v| v.table.as_ref() == Some(&t))).unwrap_or(0);
+        for v in &mut self.views {
+            if v.pending() == 0 {
+                v.reset();
+            }
+        }
+    }
+
+    /// The tab strip: one tab per open table, ✖ to close, ➕ to open another.
+    /// `tables`: (name, rows).
+    pub fn bar(&mut self, ui: &mut egui::Ui, tables: &[(String, i64)]) {
+        let mut close = None;
+        egui::ScrollArea::horizontal().id_salt("data_tabs").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (i, v) in self.views.iter().enumerate() {
+                    let name = v.table.as_deref().unwrap_or_default();
+                    let pending = v.pending() > 0;
+                    let text = if pending { format!("• {name}") } else { name.to_owned() };
+                    let tab = ui.selectable_label(i == self.active, text);
+                    if tab.clicked() {
+                        self.active = i;
+                    }
+                    if tab.middle_clicked() && !pending {
+                        close = Some(i);
+                    }
+                    let x = ui
+                        .add_enabled(!pending, egui::Button::new(RichText::new("✖").small()).frame(false))
+                        .on_hover_text("Close")
+                        .on_disabled_hover_text("Save or discard the changes to this table first");
+                    if x.clicked() {
+                        close = Some(i);
+                    }
+                    ui.separator();
+                }
+                ui.menu_button("➕", |ui| {
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        for (t, n) in tables {
+                            if ui.button(format!("{t}  ({n})")).clicked() {
+                                self.show(t.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                })
+                .response
+                .on_hover_text("Open another table");
+            });
+        });
+        if let Some(i) = close {
+            self.close(i);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct DataView {
     pub table: Option<String>,
@@ -131,17 +251,6 @@ impl DataView {
 
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!pending, |ui| {
-                let mut pick = current.clone();
-                egui::ComboBox::from_id_salt("data_table").selected_text(&pick).show_ui(ui, |ui| {
-                    for (t, n) in tables {
-                        ui.selectable_value(&mut pick, t.clone(), format!("{t}  ({n})"));
-                    }
-                });
-                if pick != current {
-                    self.open(Some(pick));
-                    action = Some(DataAction::Load);
-                }
-                ui.separator();
                 if ui.add_enabled(self.page > 0, egui::Button::new("◀")).clicked() {
                     self.page -= 1;
                     self.reset();
@@ -667,6 +776,41 @@ impl DataView {
 mod tests {
     use super::*;
     use simple_database::parser::parse;
+
+    #[test]
+    fn tabs_open_close_and_refresh() {
+        let mut tabs = DataTabs::default();
+        tabs.start(Some("a".into()));
+        tabs.show("b".into());
+        tabs.show("c".into());
+        assert_eq!(tabs.table(), Some("c"));
+        tabs.show("a".into());
+        assert_eq!((tabs.views.len(), tabs.table()), (3, Some("a")));
+
+        // Closing a tab before the shown one keeps showing the same table.
+        tabs.active = 2;
+        tabs.close(0);
+        assert_eq!(tabs.table(), Some("c"));
+        tabs.close(1);
+        assert_eq!(tabs.table(), Some("b"));
+
+        tabs.show("c".into());
+        tabs.views[0].out = Some(Err("x".into()));
+        tabs.views[0].staged.deleted.insert(0);
+        tabs.views[1].out = Some(Err("x".into()));
+        let schema = parse("table a { id int pk }\ntable b { id int pk }").unwrap();
+        tabs.refresh(&schema);
+        assert_eq!((tabs.views.len(), tabs.table()), (1, Some("b")));
+        assert!(tabs.views[0].out.is_some(), "changes waiting: not reloaded");
+        tabs.views[0].staged = Staged::default();
+        tabs.refresh(&schema);
+        assert!(tabs.views[0].out.is_none());
+
+        tabs.close(0);
+        assert_eq!(tabs.table(), None);
+        tabs.refresh(&schema);
+        assert_eq!(tabs.table(), Some("a"));
+    }
 
     #[test]
     fn staged_changes_become_row_changes() {

@@ -17,28 +17,36 @@ impl App {
             empty_state(ui, "The database has no tables", "Push a schema from the Migrate tab first.");
             return;
         }
-        if self.data.table.is_none() {
-            self.data.open(db.counts.first().map(|(t, _)| t.clone()));
-        }
-        if self.data.out.is_none() && self.data_loading.is_none() {
+        let counts = db.counts.clone();
+        self.data.bar(ui, &counts);
+        ui.separator();
+        let Some(view) = self.data.current() else {
+            empty_state(ui, "No table open", "Pick one with ➕ above or in the sidebar.");
+            return;
+        };
+        if view.out.is_none() && self.data_loading.is_none() {
             self.load_data();
         }
         let Some(db) = &self.db else { return };
-        let table = self.data.table.as_ref().and_then(|t| db.schema.table(t)).cloned();
+        let Some(view) = self.data.views.get_mut(self.data.active) else { return };
+        let name = view.table.clone().unwrap_or_default();
+        let table = db.schema.table(&name).cloned();
         let read_only = db.safe_mode == SafeMode::ReadOnly;
-        let action = self.data.ui(ui, &db.counts.clone(), table.as_ref(), db.dialect, read_only);
+        let (d, confirm) = (db.dialect, db.safe_mode == SafeMode::Confirm);
+        // Each table keeps its own grid scroll position.
+        let action = ui.push_id(("data_view", &name), |ui| view.ui(ui, &counts, table.as_ref(), d, read_only)).inner;
         match action {
             Some(data_view::DataAction::Load) => self.load_data(),
             Some(data_view::DataAction::Save(_)) if self.db_running("Saving changes") => {}
             Some(data_view::DataAction::Save(changes)) => {
-                if self.db.as_ref().is_some_and(|d| d.safe_mode == SafeMode::Confirm) {
+                if confirm {
                     let statements = match &table {
-                        Some(t) => changes.iter().map(|c| (c.sql(t, self.dialect_of_db()).unwrap_or_default(), None)).collect(),
+                        Some(t) => changes.iter().map(|c| (c.sql(t, d).unwrap_or_default(), None)).collect(),
                         None => vec![],
                     };
-                    self.dialog = Some(Dialog::ConfirmWrite(Box::new(ConfirmWrite { statements, write: Write::SaveRows(changes) })));
+                    self.dialog = Some(Dialog::ConfirmWrite(Box::new(ConfirmWrite { statements, write: Write::SaveRows(name, changes) })));
                 } else {
-                    self.save_rows(changes);
+                    self.save_rows(name, changes);
                 }
             }
             Some(data_view::DataAction::Query(sql)) => {
@@ -51,43 +59,39 @@ impl App {
         }
     }
 
-    /// Switch to the Data tab showing `table`, unless the table shown there has unsaved changes.
+    /// Switch to the Data tab showing `table`, in its own tab.
     pub(crate) fn open_table_data(&mut self, table: String) {
         self.tab = Tab::Data;
-        if self.data.table.as_deref() == Some(table.as_str()) {
-            return;
-        }
-        if self.data.pending() > 0 {
-            self.set_status("Save or discard the changes to this table first", true);
-        } else {
-            self.data.open(Some(table));
-        }
+        self.data.show(table);
     }
 
     pub(crate) fn dialect_of_db(&self) -> Dialect {
         self.db.as_ref().map_or(Dialect::Sqlite, |d| d.dialect)
     }
 
-    /// The Data tab's count and page queries, for its table, filters and page.
-    fn data_queries(&self) -> Result<(String, String), String> {
+    /// The count and page queries of a Data tab, for its table, filters and page.
+    fn data_queries(&self, view: &data_view::DataView) -> Result<(String, String), String> {
         let db = self.db.as_ref().ok_or("no database open")?;
-        let t = self.data.table.as_ref().and_then(|t| db.schema.table(t)).ok_or("no such table")?;
-        let view = &self.data.view;
-        let offset = self.data.page * data_view::PAGE_SIZE;
-        let count = view.count_sql(t, db.dialect).map_err(|e| format!("{e:#}"))?;
-        let page = view.page_sql(t, data_view::PAGE_SIZE, offset, db.dialect).map_err(|e| format!("{e:#}"))?;
+        let t = view.table.as_ref().and_then(|t| db.schema.table(t)).ok_or("no such table")?;
+        let offset = view.page * data_view::PAGE_SIZE;
+        let count = view.view.count_sql(t, db.dialect).map_err(|e| format!("{e:#}"))?;
+        let page = view.view.page_sql(t, data_view::PAGE_SIZE, offset, db.dialect).map_err(|e| format!("{e:#}"))?;
         Ok((count, page))
     }
 
-    /// Load the Data tab's page and its row count.
+    /// Load the shown Data tab's page and its row count.
     fn load_data(&mut self) {
-        let queries = match self.data_queries() {
+        let Some(view) = self.data.current() else { return };
+        let queries = match self.data_queries(view) {
             Ok(q) => q,
             Err(e) => {
-                self.data.out = Some(Err(e));
+                if let Some(v) = self.data.current_mut() {
+                    v.out = Some(Err(e));
+                }
                 return;
             }
         };
+        let table = view.table.clone().unwrap_or_default();
         self.data_loading = Some(queries.clone());
         let (count, page) = queries.clone();
         self.db_run(
@@ -102,33 +106,41 @@ impl App {
                     return; // a newer load is on its way
                 }
                 app.data_loading = None;
-                // The table, filters or page changed meanwhile: the next frame loads again.
-                if app.data.out.is_some() || app.data_queries().as_ref() != Ok(&queries) {
+                // The tab was closed, or its filters or page changed meanwhile: it loads again when shown.
+                let Some(i) = app.data.views.iter().position(|v| v.table.as_ref() == Some(&table)) else { return };
+                let view = &app.data.views[i];
+                if view.out.is_some() || app.data_queries(view).as_ref() != Ok(&queries) {
                     return;
                 }
+                let view = &mut app.data.views[i];
                 match res {
                     Ok((page, total)) => {
-                        app.data.total = total;
-                        app.data.out = Some(Ok(page));
+                        view.total = total;
+                        view.out = Some(Ok(page));
                     }
-                    Err(e) => app.data.out = Some(Err(format!("{e:#}"))),
+                    Err(e) => view.out = Some(Err(format!("{e:#}"))),
                 }
             },
         );
     }
 
-    pub(crate) fn save_rows(&mut self, changes: Vec<simple_database::data::RowChange>) {
-        let Some(t) = self.db.as_ref().and_then(|db| self.data.table.as_ref().and_then(|t| db.schema.table(t))).cloned() else { return };
+    pub(crate) fn save_rows(&mut self, table: String, changes: Vec<simple_database::data::RowChange>) {
+        let Some(t) = self.db.as_ref().and_then(|db| db.schema.table(&table)).cloned() else { return };
         self.db_run(
             "Saving changes",
             move |conn| conn.apply_changes(&t, &changes).map(|n| (changes.len(), n)).map_err(|e| format!("{e:#}")),
-            |app, res| match res {
+            move |app, res| match res {
                 Ok((changes, n)) => {
                     app.set_status(format!("Saved {changes} change(s), {n} row(s) affected"), false);
-                    app.data.reset();
+                    if let Some(v) = app.data.view_mut(&table) {
+                        v.reset();
+                    }
                     app.refresh_db();
                 }
-                Err(e) => app.data.error = Some(e),
+                Err(e) => match app.data.view_mut(&table) {
+                    Some(v) => v.error = Some(e),
+                    None => app.set_status(format!("Saving {table} failed: {e}"), true),
+                },
             },
         );
     }
@@ -136,7 +148,8 @@ impl App {
     /// Export every row matching the Data tab's filters.
     fn export_table(&mut self, f: ExportFormat) {
         let Some(db) = &self.db else { return };
-        let Some(t) = self.data.table.as_ref().and_then(|t| db.schema.table(t)) else { return };
+        let Some(view) = self.data.current() else { return };
+        let Some(t) = view.table.as_ref().and_then(|t| db.schema.table(t)) else { return };
         let Some(path) = rfd::FileDialog::new()
             .add_filter(f.label(), &[f.extension()])
             .set_file_name(format!("{}.{}", t.name, f.extension()))
@@ -146,7 +159,7 @@ impl App {
         };
         let d = db.dialect;
         let name = t.name.clone();
-        let sql = match self.data.view.all_sql(t, d) {
+        let sql = match view.view.all_sql(t, d) {
             Ok(sql) => sql,
             Err(e) => return self.set_status(format!("Export failed: {e:#}"), true),
         };
@@ -178,7 +191,7 @@ impl App {
             Ok(rows) => {
                 let stem = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
                 let tables = self.db.as_ref().map(|d| d.schema.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
-                let table = tables.iter().find(|t| t.to_lowercase() == stem).cloned().or_else(|| self.data.table.clone()).unwrap_or_default();
+                let table = tables.iter().find(|t| t.to_lowercase() == stem).cloned().or_else(|| self.data.table().map(str::to_owned)).unwrap_or_default();
                 self.dialog = Some(Dialog::Import(Box::new(ImportState { path, rows, table, error: None, busy: false })));
             }
             Err(e) => self.set_status(format!("{e:#}"), true),

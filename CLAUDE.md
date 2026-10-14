@@ -82,7 +82,7 @@ Binaries:
 | `src/gui/conns.rs` | Connections dialog (`Manager`): list with search, favorites, recent, groups; form, test, save, duplicate, delete. Re-reads the store from disk before each change |
 | `src/gui/worker.rs` | `Worker`: owns the open `Database` on its own thread, runs queued jobs and hands back replies; `Task`: one-off background work |
 | `src/gui/grid.rs` | Read-only virtualized result grid (egui_extras `TableBuilder`): Query results, import preview |
-| `src/gui/data_view.rs` | Data tab: `DataView` (page, filters, sort, `Staged` edits/deletes/new rows), editable grid; returns `DataAction`s that `App` carries out (load, save, import, export) |
+| `src/gui/data_view.rs` | Data tab: `DataTabs` (one tab per open table, tab strip, `refresh` after a re-read), each a `DataView` (page, filters, sort, `Staged` edits/deletes/new rows), editable grid; returns `DataAction`s that `App` carries out (load, save, import, export) |
 | `src/gui/editor.rs` | `code_editor`: `TextEdit` plus gutter and problem `Mark`s, line commands (`command`, pure and unit-tested), find/replace bar, column selection (multi-caret, consumed from input before `TextEdit` sees it) and autocomplete (`Vocabulary` from a `Schema`; context-aware for the DSL). `goto_line` / `caret_line` talk to it by id. Use `take_key` for exact-modifier shortcuts: `consume_key` also matches with Shift held |
 | `src/gui/highlight.rs` | DSL/SQL highlighter, keyword lists (also used by autocomplete), `code_view` |
 

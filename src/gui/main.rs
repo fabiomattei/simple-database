@@ -132,7 +132,7 @@ enum Dialog {
 /// A write held back until the user confirms it.
 enum Write {
     Query,
-    SaveRows(Vec<simple_database::data::RowChange>),
+    SaveRows(String, Vec<simple_database::data::RowChange>),
     Seed,
 }
 
@@ -305,7 +305,7 @@ struct App {
     history_search: String,
     /// Name being typed for "Save query", while the field is open.
     save_name: Option<String>,
-    data: data_view::DataView,
+    data: data_view::DataTabs,
     /// The count and page queries of the Data tab load on their way.
     data_loading: Option<(String, String)>,
     migrate_source: MigrateSource,
@@ -355,7 +355,7 @@ impl App {
             show_saved: false,
             history_search: String::new(),
             save_name: None,
-            data: data_view::DataView::default(),
+            data: data_view::DataTabs::default(),
             data_loading: None,
             migrate_source: MigrateSource::SchemaFile,
             migrate_reading: None,
@@ -605,7 +605,7 @@ impl App {
         if [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql].iter().any(|d| self.query == default_query(*d)) {
             self.query = default_query(dialect).into();
         }
-        self.data.open(schema.tables.first().map(|t| t.name.clone()));
+        self.data.start(schema.tables.first().map(|t| t.name.clone()));
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
         self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None });
@@ -719,11 +719,7 @@ impl App {
                         db.schema = schema;
                         db.skipped = skipped;
                         db.counts = counts;
-                        if app.data.table.as_ref().is_none_or(|t| db.schema.table(t).is_none()) {
-                            app.data.open(db.schema.tables.first().map(|t| t.name.clone()));
-                        } else if app.data.pending() == 0 {
-                            app.data.reset();
-                        }
+                        app.data.refresh(&db.schema);
                     }
                     Err(e) => app.set_status(format!("Cannot read database: {e:#}"), true),
                 }

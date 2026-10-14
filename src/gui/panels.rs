@@ -198,7 +198,7 @@ impl App {
                         ui.label(RichText::new("(empty — push a schema)").weak());
                     }
                     for (t, n) in &db.counts {
-                        let selected = self.tab == Tab::Data && self.data.table.as_deref() == Some(t.as_str());
+                        let selected = self.tab == Tab::Data && self.data.table() == Some(t.as_str());
                         ui.horizontal(|ui| {
                             if ui.selectable_label(selected, format!("  {t}")).clicked() {
                                 open_table = Some(Some(t.clone()));
