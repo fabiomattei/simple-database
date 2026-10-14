@@ -827,4 +827,119 @@ mod tests {
         assert!(sql.contains("ALTER TABLE t ADD COLUMN n INTEGER NOT NULL DEFAULT 0;"), "{sql}");
         assert!(!sql.contains("_sdb_new_"));
     }
+
+    /// A SQLite database (foreign keys on, as `sqlite::open` sets them) with `schema` and `rows`.
+    fn sqlite_db(schema: &str, rows: &str) -> crate::db::Database {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(&schema_sql(&parse(schema).unwrap(), Dialect::Sqlite)).unwrap();
+        conn.execute_batch(rows).unwrap();
+        crate::db::Database::from_sqlite(conn, "mem")
+    }
+
+    /// Migrate a live SQLite database the way `push` does; afterwards it must
+    /// match `new` exactly and `check` must return 1.
+    fn sqlite_migrates(old: &str, rows: &str, new: &str, check: &str) {
+        let mut db = sqlite_db(old, rows);
+        let desired = parse(new).unwrap();
+        let current = db.introspect().unwrap();
+        let m = db.migration(&current, &desired);
+        assert!(!m.is_empty(), "no changes from {old}\nto {new}");
+        db.apply_migration(&m).unwrap_or_else(|e| panic!("{e:#}\n{}", m.script()));
+        let after = db.introspect().unwrap();
+        let again = db.migration(&after, &desired);
+        assert!(again.is_empty(), "still differs after migrating to {new}:\n{}", again.changes.join("\n"));
+        let ok = db.query_value(check).unwrap();
+        assert_eq!(ok, crate::db::Cell::Int(1), "{check}\nafter:\n{}", m.script());
+        assert_eq!(db.query_value("SELECT count(*) FROM pragma_foreign_key_check").unwrap(), crate::db::Cell::Int(0));
+    }
+
+    #[test]
+    fn sqlite_migrations_keep_data() {
+        let users = "table users { id int pk autoincrement\n name text\n age text }";
+        let rows = "INSERT INTO users (name, age) VALUES ('ann', '31'), ('bob', '42');";
+        let cases: &[(&str, &str, &str)] = &[
+            // Columns added, dropped, retyped, tightened.
+            (
+                "table users { id int pk autoincrement\n name text\n age text\n email text\n active bool not null default true }",
+                "", "SELECT count(*) = 2 AND sum(active) = 2 AND count(email) = 0 FROM users",
+            ),
+            ("table users { id int pk autoincrement\n name text }", "", "SELECT count(*) = 2 FROM users"),
+            ("table users { id int pk autoincrement\n name text\n age int }", "", "SELECT sum(age) = 73 AND min(typeof(age)) = 'integer' FROM users"),
+            ("table users { id int pk autoincrement\n name text not null\n age text }", "", "SELECT count(*) = 2 FROM users WHERE name IS NOT NULL"),
+            ("table users { id int pk autoincrement\n name varchar(50) unique not null default 'x'\n age text }", "", "SELECT group_concat(name) = 'ann,bob' FROM users"),
+            ("table users { id int pk autoincrement\n name text\n age text check (age <> '') }", "", "SELECT count(*) = 2 FROM users"),
+            // Renames keep the values.
+            ("table users { id int pk autoincrement\n full_name text was name\n age text }", "", "SELECT full_name = 'ann' FROM users WHERE id = 1"),
+            ("table people was users { id int pk autoincrement\n name text\n age text }", "", "SELECT count(*) = 2 FROM people"),
+            // Indexes.
+            ("table users { id int pk autoincrement\n name text\n age text\n index (name)\n unique index users_age_name (age, name) }", "", "SELECT count(*) = 2 FROM users"),
+            // A new table referencing an old one, with rows added afterwards by `check`.
+            (
+                "table users { id int pk autoincrement\n name text\n age text }\ntable posts { id int pk\n user_id int not null -> users.id on delete cascade }",
+                "", "SELECT count(*) = 0 FROM posts",
+            ),
+        ];
+        for (new, extra, check) in cases {
+            sqlite_migrates(users, &format!("{rows}{extra}"), new, check);
+        }
+    }
+
+    #[test]
+    fn sqlite_migrations_keep_references() {
+        let old = "table users { id int pk\n name text }\ntable posts { id int pk\n user_id int -> users.id\n index (user_id) }";
+        let rows = "INSERT INTO users VALUES (1, 'ann'); INSERT INTO posts VALUES (10, 1), (11, 1);";
+        // Renaming the referenced table and column follows through to the foreign key.
+        sqlite_migrates(
+            old, rows,
+            "table people was users { id int pk\n name text }\ntable posts { id int pk\n author_id int was user_id -> people.id\n index (author_id) }",
+            "SELECT count(*) = 2 FROM posts JOIN people ON people.id = posts.author_id",
+        );
+        // Adding a foreign key to a column that already holds valid values.
+        sqlite_migrates(
+            "table users { id int pk\n name text }\ntable posts { id int pk\n user_id int }", rows,
+            "table users { id int pk\n name text }\ntable posts { id int pk\n user_id int -> users.id on delete cascade }",
+            "SELECT count(*) = 2 FROM posts",
+        );
+        // Rebuilding the referenced table keeps the children.
+        sqlite_migrates(
+            old, rows,
+            "table users { id int pk\n name text not null }\ntable posts { id int pk\n user_id int -> users.id\n index (user_id) }",
+            "SELECT count(*) = 2 FROM posts",
+        );
+        // A composite primary key in place of a single one.
+        sqlite_migrates(
+            "table tags { post_id int not null\n tag text not null\n id int pk }",
+            "INSERT INTO tags VALUES (1, 'a', 1), (1, 'b', 2);",
+            "table tags { post_id int not null\n tag text not null\n pk (post_id, tag) }",
+            "SELECT count(*) = 2 FROM tags",
+        );
+    }
+
+    #[test]
+    fn sqlite_failed_migrations_change_nothing() {
+        let old = "table users { id int pk\n name text }\ntable posts { id int pk\n user_id int }";
+        let rows = "INSERT INTO users VALUES (1, 'ann'), (2, NULL); INSERT INTO posts VALUES (10, 99);";
+        let bad = [
+            // A dangling reference: the foreign key check rolls the migration back.
+            "table users { id int pk\n name text }\ntable posts { id int pk\n user_id int -> users.id }",
+            // NOT NULL on a column holding a NULL.
+            "table users { id int pk\n name text not null }\ntable posts { id int pk\n user_id int }",
+            // A unique index over duplicates.
+            "table users { id int pk\n name text }\ntable posts { id int pk\n user_id int\n unique index (user_id) }\ntable more { id int pk }",
+        ];
+        for (i, new) in bad.iter().enumerate() {
+            let mut db = sqlite_db(old, rows);
+            if i == 2 {
+                db.execute("INSERT INTO posts VALUES (11, 99)").unwrap();
+            }
+            let before = db.introspect().unwrap();
+            let m = db.migration(&before, &parse(new).unwrap());
+            assert!(db.apply_migration(&m).is_err(), "{new} should fail:\n{}", m.script());
+            assert_eq!(db.introspect().unwrap(), before, "{new} left changes behind");
+            assert_eq!(db.query_value("SELECT count(*) FROM users").unwrap(), crate::db::Cell::Int(2));
+            assert_eq!(db.query_value("PRAGMA foreign_keys").unwrap(), crate::db::Cell::Int(1), "foreign keys back on");
+            db.execute("INSERT INTO users VALUES (3, 'cy')").expect("the connection is usable after the rollback");
+        }
+    }
 }

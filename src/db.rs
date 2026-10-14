@@ -1253,6 +1253,12 @@ mod tests {
         if let Conn::Sqlite(c) = &db.conn {
             assert!(c.execute_batch("INSERT INTO t VALUES (3)").is_err(), "query_only is set");
         }
+        // Nothing may lift query_only or set a value through the pragma call form.
+        for sql in ["PRAGMA query_only(0)", "PRAGMA query_only = OFF", "PRAGMA user_version(5)", "WITH x AS (SELECT 1) DELETE FROM t"] {
+            assert!(db.run(sql).unwrap_err().to_string().contains("read-only"), "{sql}");
+        }
+        assert_eq!(db.query_value("PRAGMA user_version").unwrap(), Cell::Int(0));
+        db.run("PRAGMA table_info(t)").unwrap();
         db.set_safe_mode(SafeMode::Warn).unwrap();
         assert_eq!(db.needs_confirmation("SELECT 1; DELETE FROM t; DELETE FROM t WHERE a = 1").len(), 1);
         db.run("INSERT INTO t VALUES (2)").unwrap();
