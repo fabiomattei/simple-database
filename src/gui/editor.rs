@@ -1224,7 +1224,7 @@ fn completions(text: &str, cursor: usize, lang: Lang, vocab: &Vocabulary) -> (us
                 .into_iter()
                 .find(|(alias, _)| alias.eq_ignore_ascii_case(&qualifier))
                 .map_or(qualifier, |(_, t)| t),
-            Lang::Dbs => qualifier,
+            Lang::Dbs | Lang::Php | Lang::Ruby => qualifier,
         };
         if let Some(cols) = vocab.columns_of(&table) {
             add(&mut cols.iter().cloned(), Kind::Column);
@@ -1399,6 +1399,8 @@ fn in_comment_or_string(before: &[char], lang: Lang) -> bool {
                 let comment = match lang {
                     Lang::Dbs => c == '#' || (c == '/' && next == Some('/')),
                     Lang::Sql => c == '-' && next == Some('-'),
+                    Lang::Php => c == '/' && next == Some('/'),
+                    Lang::Ruby => c == '#',
                 };
                 if comment {
                     return true;

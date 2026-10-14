@@ -69,15 +69,24 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Show what changes between two schemas and the migration SQL
+    /// Show what changes between two schemas and the migration SQL, or a Laravel / Rails migration
     Diff {
         from: PathBuf,
         to: PathBuf,
         #[arg(short, long, value_enum, default_value = "sqlite")]
         dialect: Dialect,
-        /// Write the migration SQL to a file
+        /// Write the migration to a file; for laravel / rails, a directory gets a timestamped file
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// What to write the migration as
+        #[arg(short, long, value_enum, default_value = "sql")]
+        format: DiffFormat,
+        /// Name of a laravel / rails migration (default: from the changes)
+        #[arg(long)]
+        name: Option<String>,
+        /// The ActiveRecord::Migration[...] version of a rails migration
+        #[arg(long, default_value = "8.0")]
+        rails_version: String,
     },
     /// Migrate a database to match a schema file
     Push {
@@ -348,9 +357,18 @@ fn run(cli: Cli) -> Result<()> {
             let s = load_schema(&schema)?;
             emit(output.as_deref(), &diagram::render(&s, format))?;
         }
-        Command::Diff { from, to, dialect, output } => {
+        Command::Diff { from, to, dialect, output, format, name, rails_version } => {
             let old = load_schema(&from)?;
             let new = load_valid_schema(&to)?;
+            let fw = match format {
+                DiffFormat::Sql => None,
+                DiffFormat::Laravel => Some(framework::Framework::Laravel),
+                DiffFormat::Rails => Some(framework::Framework::Rails),
+            };
+            if let Some(fw) = fw {
+                let opts = framework::Options { name, rails_version, ..Default::default() };
+                return write_framework_migration(framework::generate(&old, &new, dialect, fw, &opts), output.as_deref());
+            }
             let m = diff::diff(&old, &new, dialect);
             if m.is_empty() {
                 eprintln!("Schemas are identical.");
@@ -716,6 +734,35 @@ fn print_integrity(r: &integrity::Report) {
     } else {
         println!("{} foreign key(s) checked: {bad} with problems.", r.checked);
     }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DiffFormat {
+    Sql,
+    Laravel,
+    Rails,
+}
+
+/// Prints a framework migration, or writes it to `output` (a file, or a
+/// directory that gets the framework's file name).
+fn write_framework_migration(g: framework::Generated, output: Option<&Path>) -> Result<()> {
+    if g.is_empty() {
+        eprintln!("Schemas are identical.");
+        return Ok(());
+    }
+    print_changes(&diff::Migration { changes: g.changes, warnings: g.warnings, statements: vec![] });
+    match output {
+        Some(path) => {
+            let path = if path.is_dir() { path.join(&g.file_name) } else { path.to_path_buf() };
+            std::fs::write(&path, &g.code)?;
+            eprintln!("\nMigration written to {}", path.display());
+        }
+        None => {
+            eprintln!("\n{}:", g.file_name);
+            print!("{}", g.code);
+        }
+    }
+    Ok(())
 }
 
 fn print_changes(m: &diff::Migration) {

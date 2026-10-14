@@ -6,7 +6,14 @@ use eframe::egui::{self, Color32, FontId, TextFormat, text::LayoutJob};
 pub enum Lang {
     Dbs,
     Sql,
+    /// Laravel migrations.
+    Php,
+    /// Rails migrations.
+    Ruby,
 }
+
+const PHP_KEYWORDS: &[&str] = &["use", "return", "new", "class", "extends", "function", "public", "void", "if", "throw", "true", "false", "null"];
+const RUBY_KEYWORDS: &[&str] = &["class", "def", "end", "do", "if", "ensure", "raise", "true", "false", "nil"];
 
 pub const DBS_KEYWORDS: &[&str] = &[
     "table", "pk", "primary", "key", "autoincrement", "auto_increment", "unique", "not", "null",
@@ -82,6 +89,8 @@ pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> LayoutJob {
         let comment_start = match lang {
             Lang::Dbs => rest.starts_with('#') || rest.starts_with("//"),
             Lang::Sql => rest.starts_with("--"),
+            Lang::Php => rest.starts_with("//"),
+            Lang::Ruby => rest.starts_with('#'),
         };
         if comment_start {
             let end = rest.find('\n').unwrap_or(rest.len());
@@ -91,10 +100,15 @@ pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> LayoutJob {
         }
         if c == '\'' || c == '"' || c == '`' {
             let mut end = 1;
+            let escapes = matches!(lang, Lang::Php | Lang::Ruby);
             while end < rest.len() {
+                if escapes && bytes[i + end] == b'\\' {
+                    end += 1 + rest[end + 1..].chars().next().map_or(0, char::len_utf8);
+                    continue;
+                }
                 if bytes[i + end] == c as u8 {
                     end += 1;
-                    if bytes.get(i + end) == Some(&(c as u8)) {
+                    if !escapes && bytes.get(i + end) == Some(&(c as u8)) {
                         end += 1; // doubled quote escape
                         continue;
                     }
@@ -102,7 +116,7 @@ pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> LayoutJob {
                 }
                 end += rest[end..].chars().next().map_or(1, char::len_utf8);
             }
-            let color = if c == '\'' { p.string } else { p.plain };
+            let color = if c == '\'' || (c == '"' && matches!(lang, Lang::Php | Lang::Ruby)) { p.string } else { p.plain };
             push(&rest[..end], color);
             i += end;
             continue;
@@ -126,6 +140,8 @@ pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> LayoutJob {
                 Lang::Dbs if DBS_TYPES.contains(&lower.as_str()) => p.ty,
                 Lang::Sql if SQL_KEYWORDS.contains(&lower.as_str()) => p.keyword,
                 Lang::Sql if DBS_TYPES.contains(&lower.as_str()) => p.ty,
+                Lang::Php if PHP_KEYWORDS.contains(&word) => p.keyword,
+                Lang::Ruby if RUBY_KEYWORDS.contains(&word) => p.keyword,
                 _ => p.plain,
             };
             push(word, color);

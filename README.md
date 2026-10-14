@@ -18,7 +18,7 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | **Schema** | Edit the `.dbs` file with syntax highlighting and line numbers. Errors and design warnings update as you type |
 | **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. **Auto layout** keeps related tables together (parents left of the tables that reference them, tall layers wrapped into several columns, unrelated tables in a grid at the end) without overlaps; **Tidy** only moves overlapping tables apart, and a table that grows pushes its neighbors aside. **Browse data** (or right-click a table → **Browse data**, or double-click it in the read-only database diagram) opens the selected table in the Data tab. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file or the live database. The schema file's diagram is editable (see below). **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
 | **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save. In SQLite it is editable and kept in sync with the schema (see below) |
-| **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, or another database (a saved connection or a SQLite file), to make the open database match it. **Pull** replaces the editor with the database's schema |
+| **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, or another database (a saved connection or a SQLite file), to make the open database match it. **Show as** switches the right-hand side between the SQL and the same changes as a **Laravel** or **Rails** migration, to **Copy** or **Save as…** (into the project's `database/migrations` or `db/migrate` next to the schema file, when there is one). **Pull** replaces the editor with the database's schema |
 | **Query** | Run SQL (Ctrl+Enter) and see the results in a grid. Shows up to 10,000 rows per result. **Explain** shows each statement's query plan: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept. **History** lists past queries (searchable; click to load, double-click to run) and saved queries (**Save query…**). **Export** saves the result as CSV, TSV, JSON, JSON Lines, Markdown, HTML or SQL INSERTs, or copies it |
 | **Data** | Browse and edit tables, each in its own tab, 200 rows per page (see below) |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
@@ -246,6 +246,7 @@ certificate comes from a private CA, pass it with `sslrootcert`:
 | `sdb sql SCHEMA -d sqlite\|postgres\|mysql` | Generate DDL (tables in dependency order) |
 | `sdb diagram SCHEMA -f mermaid\|dot` | ER diagram: paste Mermaid into GitHub/GitLab markdown, or `\| dot -Tsvg > er.svg` |
 | `sdb diff FROM TO -d DIALECT [-o file]` | Summary of changes + migration SQL |
+| `sdb diff FROM TO -d DIALECT -f laravel\|rails [--name NAME] [--rails-version 8.0] [-o dir]` | The same changes as a Laravel or Rails migration (see [Framework migrations](#framework-migrations)) |
 | `sdb push SCHEMA --db app.db [--dry-run] [-y]` | Migrate a database to match the schema |
 | `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database. What a schema can't describe (views, triggers, functions, enum types no column uses, expression and partial indexes, table-level checks) is listed in comments at the top |
 | `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42] [-y]` | Fill tables with realistic fake data (see below) |
@@ -447,6 +448,50 @@ writes these hints for you. Constraints named after the table or column (`fk_<ta
 constraints, so it drops and re-adds them. Indexes that only changed name (such as
 `posts_author_id_idx` → `posts_writer_id_idx`) are renamed, except on SQLite, where they are
 recreated.
+
+### Framework migrations
+
+`sdb diff` (and the app's Migrate tab) can write a migration as a **Laravel** or **Rails**
+migration file instead of SQL, with `down` / the `down()` method worked out from the reverse
+diff (renames included):
+
+```sh
+sdb diff prod_snapshot.dbs schema.dbs -d postgres -f laravel -o database/migrations
+sdb diff prod_snapshot.dbs schema.dbs -d mysql -f rails --name add_comments -o db/migrate
+```
+
+Given a directory, `-o` writes the framework's file name (`2026_10_14_120000_add_comments.php`,
+`20261014120000_add_comments.rb`); without `-o` the migration is printed. `--name` defaults to
+something like `create_comments_table` or `update_schema`. The dialect still matters: the
+generated code is for that database.
+
+Changes become the framework's schema builder calls (`Schema::create`, `$table->...->change()`,
+`create_table`, `add_column`, `change_column`, `add_foreign_key`, …) using the constraint names
+`sdb` uses (`fk_<table>_<col>`, `<table>_<col>_check`, index names), so later diffs and pushes
+still find them. What the framework can't express is written as `sdb`'s own SQL for that table
+(`DB::unprepared(...)` / `execute`), and listed as a warning:
+
+| | Laravel | Rails |
+|---|---|---|
+| Check constraints | SQL (added after `Schema::create` on Postgres/MySQL) | `check_constraint` / `add_check_constraint` |
+| Enums | `enum()` on MySQL; SQL elsewhere (Laravel's is a checked `varchar`) | `create_enum` + `t.enum` on Postgres, `ENUM(...)` on MySQL |
+| Custom types | SQL | `t.column :x, "TYPE"` |
+| Primary key / autoincrement changes | SQL | SQL |
+| `on delete set default` | supported | SQL (Rails has no such option) |
+| Changing an enum's values on Postgres | SQL | SQL |
+| SQLite tables with checks, enums or comments | SQL | SQL |
+| Foreign key changes on SQLite | SQL (Laravel can't) | `add_foreign_key` (Rails rebuilds the table) |
+
+When `sdb`'s SQL rebuilds a SQLite table, the migration turns off the framework's transaction
+(`public $withinTransaction = false;` / `disable_ddl_transaction!`) and runs with foreign keys
+off in its own transaction, failing if `PRAGMA foreign_key_check` finds a violation, as
+`sdb push` does.
+
+Tested against Laravel 13 and Rails 8.1 on SQLite, PostgreSQL 17 and MySQL 8.4, up then down:
+on PostgreSQL and MySQL `sdb push --dry-run` then reports the database up to date. On SQLite
+each framework writes some types its own way, which `sdb` sees as differences: Laravel's
+booleans (`tinyint(1)`), `varchar` without a length and `uuid` (`varchar`), and both frameworks'
+unique columns (a separate unique index rather than an inline `UNIQUE`).
 
 ## Development
 

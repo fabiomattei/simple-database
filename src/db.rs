@@ -352,6 +352,12 @@ impl Database {
         diff::diff(current, &desired, self.dialect())
     }
 
+    /// Like [`Database::migration`], written as a Laravel or Rails migration.
+    pub fn framework_migration(&mut self, current: &Schema, desired: &Schema, fw: crate::framework::Framework, opts: &crate::framework::Options) -> crate::framework::Generated {
+        let desired = self.normalize_checks(desired);
+        crate::framework::generate(current, &desired, self.dialect(), fw, opts)
+    }
+
     /// Execute a migration produced by [`Database::migration`].
     pub fn apply_migration(&mut self, m: &Migration) -> Result<()> {
         self.ensure_writable()?;
@@ -1040,6 +1046,10 @@ mod tests {
         let current = db.introspect().unwrap();
         let again = db.migration(&current, &desired);
         assert!(again.is_empty(), "{:?}\n{}", again.changes, again.script());
+        for fw in crate::framework::Framework::ALL {
+            let g = db.framework_migration(&current, &desired, fw, &Default::default());
+            assert!(g.is_empty(), "{fw:?}: {:?}", g.changes);
+        }
         let pulled = crate::parser::parse(&crate::format::format_schema(&current)).unwrap();
         assert!(db.migration(&current, &pulled).is_empty(), "pulled schema differs");
 

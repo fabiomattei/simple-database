@@ -35,25 +35,25 @@ impl Migration {
 }
 
 /// What changed on an existing table.
-struct TableDiff<'a> {
-    old: &'a Table,
-    new: &'a Table,
-    added: Vec<&'a Column>,
-    dropped: Vec<&'a Column>,
-    altered: Vec<(&'a Column, &'a Column)>,
-    added_indexes: Vec<&'a Index>,
-    dropped_indexes: Vec<&'a Index>,
+pub struct TableDiff<'a> {
+    pub old: &'a Table,
+    pub new: &'a Table,
+    pub added: Vec<&'a Column>,
+    pub dropped: Vec<&'a Column>,
+    pub altered: Vec<(&'a Column, &'a Column)>,
+    pub added_indexes: Vec<&'a Index>,
+    pub dropped_indexes: Vec<&'a Index>,
     /// Same columns, new name: (old, new).
-    renamed_indexes: Vec<(&'a Index, &'a Index)>,
+    pub renamed_indexes: Vec<(&'a Index, &'a Index)>,
     /// Multi-column foreign keys; a changed one is dropped and added.
-    added_fks: Vec<&'a TableForeignKey>,
-    dropped_fks: Vec<&'a TableForeignKey>,
-    pk_changed: bool,
-    comment_changed: bool,
+    pub added_fks: Vec<&'a TableForeignKey>,
+    pub dropped_fks: Vec<&'a TableForeignKey>,
+    pub pk_changed: bool,
+    pub comment_changed: bool,
 }
 
 impl<'a> TableDiff<'a> {
-    fn compute(old: &'a Table, new: &'a Table) -> Self {
+    pub fn compute(old: &'a Table, new: &'a Table) -> Self {
         let added = new.columns.iter().filter(|c| old.column(&c.name).is_none()).collect();
         let dropped = old.columns.iter().filter(|c| new.column(&c.name).is_none()).collect();
         let altered = new
@@ -84,7 +84,7 @@ impl<'a> TableDiff<'a> {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.dropped.is_empty()
             && self.altered.is_empty()
@@ -141,43 +141,85 @@ fn drop_enum_sql(table: &str, column: &str) -> String {
     format!("DROP TYPE IF EXISTS {};", quote(&enum_type_name(table, column), Dialect::Postgres))
 }
 
-pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
-    let mut m = Migration::default();
-    let mut needs_fk_off = false;
-    let mut body: Vec<String> = Vec::new();
-    let old = &apply_renames(canonical(old, d), new, d, &mut m.changes, &mut body);
-    let new = &canonical(new, d);
+/// A rename that a `was` hint asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rename {
+    /// The table a renamed column is in, by its new name; `None` for a table.
+    pub table: Option<String>,
+    pub from: String,
+    pub to: String,
+    /// The rename in the plan's dialect, with the constraints named after the old name.
+    pub statements: Vec<String>,
+}
 
-    // New tables, in dependency order.
+/// What a migration does, before it is written out as SQL (`diff`) or as a
+/// framework's migration (`framework::generate`).
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub dialect: Dialect,
+    /// The old schema, canonical, with the renames already done.
+    pub old: Schema,
+    /// The new schema, canonical.
+    pub new: Schema,
+    pub renames: Vec<Rename>,
+    /// New tables, in dependency order.
+    pub created: Vec<String>,
+    /// Tables in both schemas that differ.
+    pub altered: Vec<String>,
+    /// Old tables that are gone, dependents first.
+    pub dropped: Vec<String>,
+    /// As in `Migration`.
+    pub changes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// What changed on `table`, one of `altered`.
+    pub fn table_diff(&self, table: &str) -> Option<TableDiff<'_>> {
+        Some(TableDiff::compute(self.old.table(table)?, self.new.table(table)?))
+    }
+}
+
+/// Works out what turns `old` into `new` in dialect `d`.
+pub fn plan(old: &Schema, new: &Schema, d: Dialect) -> Plan {
+    let mut changes = Vec::new();
+    let mut warnings = Vec::new();
+    let mut renames = Vec::new();
+    let old = apply_renames(canonical(old, d), new, d, &mut changes, &mut renames);
+    let new = canonical(new, d);
+
+    let mut created = Vec::new();
     for t in new.tables_in_dependency_order() {
         if old.table(&t.name).is_none() {
-            m.changes.push(format!("+ table {}", t.name));
-            body.extend(create_table_statements(t, d));
-            for idx in &t.indexes {
-                body.push(create_index_sql(&t.name, idx, d));
-            }
+            changes.push(format!("+ table {}", t.name));
+            created.push(t.name.clone());
         }
     }
 
-    // Changed tables.
+    let mut altered = Vec::new();
     for new_t in &new.tables {
         let Some(old_t) = old.table(&new_t.name) else { continue };
         let td = TableDiff::compute(old_t, new_t);
         if td.is_empty() {
             continue;
         }
+        altered.push(new_t.name.clone());
         for c in &td.added {
-            m.changes.push(format!("+ column {}.{} {}", new_t.name, c.name, c.data_type));
+            changes.push(format!("+ column {}.{} {}", new_t.name, c.name, c.data_type));
         }
         for c in &td.dropped {
-            m.changes.push(format!("- column {}.{}", old_t.name, c.name));
-            m.warnings.push(format!("dropping column {}.{} deletes its data", old_t.name, c.name));
+            changes.push(format!("- column {}.{}", old_t.name, c.name));
+            warnings.push(format!("dropping column {}.{} deletes its data", old_t.name, c.name));
         }
         for (o, n) in &td.altered {
-            m.changes.push(format!("~ column {}.{}: {}", new_t.name, n.name, describe_alter(o, n)));
+            changes.push(format!("~ column {}.{}: {}", new_t.name, n.name, describe_alter(o, n)));
         }
         if td.pk_changed && td.altered.iter().all(|(o, n)| o.primary_key == n.primary_key) {
-            m.changes.push(format!(
+            changes.push(format!(
                 "~ table {}: primary key ({}) -> ({})",
                 new_t.name,
                 old_t.primary_key().join(", "),
@@ -185,26 +227,26 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
             ));
         }
         for i in &td.dropped_indexes {
-            m.changes.push(format!("- index {}", i.name));
+            changes.push(format!("- index {}", i.name));
         }
         for i in &td.added_indexes {
-            m.changes.push(format!("+ index {}", i.name));
+            changes.push(format!("+ index {}", i.name));
         }
         for (o, n) in &td.renamed_indexes {
-            m.changes.push(format!("~ index {} -> {}", o.name, n.name));
+            changes.push(format!("~ index {} -> {}", o.name, n.name));
         }
         for fk in &td.dropped_fks {
-            m.changes.push(format!("- foreign key {}", table_fk_name(&old_t.name, fk)));
+            changes.push(format!("- foreign key {}", table_fk_name(&old_t.name, fk)));
         }
         for fk in &td.added_fks {
-            m.changes.push(format!("+ foreign key {}", describe_fk(&new_t.name, fk)));
+            changes.push(format!("+ foreign key {}", describe_fk(&new_t.name, fk)));
         }
         if td.comment_changed {
-            m.changes.push(format!("~ table {}: comment changed", new_t.name));
+            changes.push(format!("~ table {}: comment changed", new_t.name));
         }
         for c in &td.added {
             if !c.nullable && c.default.is_none() && !c.auto_increment {
-                m.warnings.push(format!(
+                warnings.push(format!(
                     "{}.{} is NOT NULL without a default; this fails if the table already has rows",
                     new_t.name, c.name
                 ));
@@ -214,42 +256,69 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
         let mut referenced = old.tables.iter().flat_map(|t| t.all_foreign_keys());
         let old_pk = old_t.primary_key();
         if td.pk_changed && d != Dialect::Sqlite && referenced.any(|fk| fk.table == old_t.name && fk.ref_columns.iter().any(|c| old_pk.contains(c))) {
-            m.warnings.push(format!(
+            warnings.push(format!(
                 "foreign keys point at the primary key of {}; the server refuses to change it until they are dropped",
                 old_t.name
             ));
         }
-
-        match d {
-            Dialect::Sqlite => {
-                if sqlite_needs_rebuild(&td) {
-                    needs_fk_off = true;
-                    body.extend(sqlite_rebuild(&td));
-                } else {
-                    body.extend(sqlite_simple_alter(&td));
-                }
-            }
-            Dialect::Postgres => body.extend(postgres_alter(&td)),
-            Dialect::Mysql => body.extend(mysql_alter(&td)),
-        }
     }
 
-    // Dropped tables, dependents first.
-    let mut dropped: Vec<&Table> = old
+    let mut dropped: Vec<String> = old
         .tables_in_dependency_order()
         .into_iter()
         .filter(|t| new.table(&t.name).is_none())
+        .map(|t| t.name.clone())
         .collect();
     dropped.reverse();
-    for t in dropped {
-        m.changes.push(format!("- table {}", t.name));
-        m.warnings.push(format!("dropping table {} deletes all its data", t.name));
-        body.push(format!("DROP TABLE {};", quote(&t.name, d)));
-        if d == Dialect::Postgres {
-            body.extend(t.columns.iter().filter(|c| is_enum(&c.data_type)).map(|c| drop_enum_sql(&t.name, &c.name)));
-        }
+    for t in &dropped {
+        changes.push(format!("- table {t}"));
+        warnings.push(format!("dropping table {t} deletes all its data"));
     }
 
+    Plan { dialect: d, old, new, renames, created, altered, dropped, changes, warnings }
+}
+
+/// The statements that make the changes `td` in dialect `d`, the table
+/// already renamed. On SQLite, see `sqlite_needs_rebuild`.
+pub fn alter_statements(td: &TableDiff, d: Dialect) -> Vec<String> {
+    match d {
+        Dialect::Sqlite if sqlite_needs_rebuild(td) => sqlite_rebuild(td),
+        Dialect::Sqlite => sqlite_simple_alter(td),
+        Dialect::Postgres => postgres_alter(td),
+        Dialect::Mysql => mysql_alter(td),
+    }
+}
+
+/// Statements that drop table `t`, and on Postgres the types of its enums.
+pub fn drop_table_statements(t: &Table, d: Dialect) -> Vec<String> {
+    let mut out = vec![format!("DROP TABLE {};", quote(&t.name, d))];
+    if d == Dialect::Postgres {
+        out.extend(t.columns.iter().filter(|c| is_enum(&c.data_type)).map(|c| drop_enum_sql(&t.name, &c.name)));
+    }
+    out
+}
+
+pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
+    let p = plan(old, new, d);
+    let mut needs_fk_off = false;
+    let mut body: Vec<String> = p.renames.iter().flat_map(|r| r.statements.clone()).collect();
+    for name in &p.created {
+        let t = p.new.table(name).expect("created table");
+        body.extend(create_table_statements(t, d));
+        for idx in &t.indexes {
+            body.push(create_index_sql(&t.name, idx, d));
+        }
+    }
+    for name in &p.altered {
+        let td = p.table_diff(name).expect("altered table");
+        needs_fk_off |= d == Dialect::Sqlite && sqlite_needs_rebuild(&td);
+        body.extend(alter_statements(&td, d));
+    }
+    for name in &p.dropped {
+        body.extend(drop_table_statements(p.old.table(name).expect("dropped table"), d));
+    }
+
+    let mut m = Migration { changes: p.changes, warnings: p.warnings, statements: Vec::new() };
     if body.is_empty() {
         return m;
     }
@@ -282,10 +351,10 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
 // ---------------------------------------------------------------- Renames
 
 /// Carries out the renames that the `was` hints of `new` ask for: `old` as it
-/// is after them, while their statements go to `body`. A hint applies when
+/// is after them, while the renames go to `renames`. A hint applies when
 /// `old` has the earlier name but not the new one, so it does nothing once
 /// the rename is done.
-fn apply_renames(mut old: Schema, new: &Schema, d: Dialect, changes: &mut Vec<String>, body: &mut Vec<String>) -> Schema {
+fn apply_renames(mut old: Schema, new: &Schema, d: Dialect, changes: &mut Vec<String>, renames: &mut Vec<Rename>) -> Schema {
     for t in &new.tables {
         if old.table(&t.name).is_some() {
             continue;
@@ -293,7 +362,8 @@ fn apply_renames(mut old: Schema, new: &Schema, d: Dialect, changes: &mut Vec<St
         let Some(from) = t.was.iter().rev().find(|w| old.table(w).is_some()) else { continue };
         changes.push(format!("~ table {from} -> {}", t.name));
         old.rename_table(from, &t.name);
-        body.extend(rename_table_sql(old.table(&t.name).expect("just renamed"), from, d));
+        let statements = rename_table_sql(old.table(&t.name).expect("just renamed"), from, d);
+        renames.push(Rename { table: None, from: from.clone(), to: t.name.clone(), statements });
     }
     for t in &new.tables {
         for c in &t.columns {
@@ -320,7 +390,8 @@ fn apply_renames(mut old: Schema, new: &Schema, d: Dialect, changes: &mut Vec<St
                     *e = rename_ident(e, from, &c.name);
                 }
             }
-            body.extend(rename_column_sql(ot, from, &c.name, &touched, d));
+            let statements = rename_column_sql(ot, from, &c.name, &touched, d);
+            renames.push(Rename { table: Some(t.name.clone()), from: from.clone(), to: c.name.clone(), statements });
         }
     }
     old
@@ -534,8 +605,8 @@ fn rename_column_sql(t: &Table, from: &str, to: &str, touched: &[String], d: Dia
 // ---------------------------------------------------------------- SQLite
 
 /// SQLite's ALTER TABLE can only add simple columns and drop unconstrained
-/// ones; everything else requires recreating the table.
-fn sqlite_needs_rebuild(td: &TableDiff) -> bool {
+/// ones; everything else requires recreating the table, with foreign keys off.
+pub fn sqlite_needs_rebuild(td: &TableDiff) -> bool {
     // ADD COLUMN would not keep a comment where introspection finds it.
     let addable = |c: &Column| {
         !c.primary_key

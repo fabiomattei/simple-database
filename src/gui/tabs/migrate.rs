@@ -6,6 +6,7 @@ use simple_database::schema::Schema;
 use simple_database::connections::SafeMode;
 use simple_database::db::{self, Database};
 use simple_database::diff::Migration;
+use simple_database::framework::{self, Framework, Generated};
 use simple_database::validate::Severity;
 
 impl App {
@@ -139,6 +140,15 @@ impl App {
             empty_state(ui, "✔ Database is up to date", body);
             return;
         }
+        // The right column shows the SQL Push runs, or the same as a framework's migration.
+        let mut format = self.migrate_format;
+        let generated = format.and_then(|fw| self.framework_migration_for(&schema, fw));
+        let migrations_dir = |fw: Framework| {
+            let dir = self.schema_path.as_ref()?.parent()?.join(fw.migrations_dir());
+            dir.is_dir().then_some(dir)
+        };
+        let save_dir = format.and_then(migrations_dir);
+        let mut saved: Option<Result<std::path::PathBuf, String>> = None;
         ui.columns(2, |cols| {
             cols[0].strong("Changes");
             egui::ScrollArea::vertical().id_salt("changes").show(&mut cols[0], |ui| {
@@ -150,19 +160,86 @@ impl App {
                     };
                     ui.label(RichText::new(c).monospace().color(color));
                 }
-                if !m.warnings.is_empty() {
+                // A framework's migration adds what it couldn't write its own way.
+                let extra = generated.iter().flat_map(|g| g.warnings.iter()).filter(|w| !m.warnings.contains(w));
+                let warnings: Vec<&String> = m.warnings.iter().chain(extra).collect();
+                if !warnings.is_empty() {
                     ui.add_space(8.0);
                     ui.strong("Warnings");
-                    for w in &m.warnings {
+                    for w in warnings {
                         ui.colored_label(warn_color(ui), format!("⚠ {w}"));
                     }
                 }
             });
-            cols[1].strong("SQL that will run");
-            egui::ScrollArea::both().id_salt("migration_sql").auto_shrink([false, false]).show(&mut cols[1], |ui| {
-                highlight::code_view(ui, &m.script(), Lang::Sql);
+            cols[1].horizontal(|ui| {
+                ui.strong("Show as");
+                ui.selectable_value(&mut format, None, "SQL").on_hover_text("The SQL that Push runs");
+                for fw in Framework::ALL {
+                    ui.selectable_value(&mut format, Some(fw), fw.label())
+                        .on_hover_text(format!("The same changes as a {} migration, with the way back", fw.label()));
+                }
+                if let (Some(fw), Some(g)) = (format, &generated) {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Save as…").on_hover_text(&g.file_name).clicked() {
+                            let ext = if fw == Framework::Laravel { "php" } else { "rb" };
+                            let mut dialog = rfd::FileDialog::new().add_filter(format!("{} migration", fw.label()), &[ext]).set_file_name(&g.file_name);
+                            if let Some(dir) = &save_dir {
+                                dialog = dialog.set_directory(dir);
+                            }
+                            if let Some(path) = dialog.save_file() {
+                                saved = Some(std::fs::write(&path, &g.code).map(|()| path).map_err(|e| e.to_string()));
+                            }
+                        }
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(g.code.clone());
+                        }
+                    });
+                }
+            });
+            egui::ScrollArea::both().id_salt("migration_sql").auto_shrink([false, false]).show(&mut cols[1], |ui| match (format, &generated) {
+                (None, _) => highlight::code_view(ui, &m.script(), Lang::Sql),
+                (Some(fw), Some(g)) => highlight::code_view(ui, &g.code, if fw == Framework::Laravel { Lang::Php } else { Lang::Ruby }),
+                (Some(_), None) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Writing the migration…");
+                    });
+                }
             });
         });
+        self.migrate_format = format;
+        match saved {
+            Some(Ok(path)) => self.set_status(format!("Migration saved to {}", path.display()), false),
+            Some(Err(e)) => self.set_status(format!("Cannot save the migration: {e}"), true),
+            None => {}
+        }
+    }
+
+    /// The migration from the open database to `desired` as a framework's
+    /// migration, computed on the database thread like `migration_for`.
+    fn framework_migration_for(&mut self, desired: &Schema, fw: Framework) -> Option<Generated> {
+        let db = self.db.as_mut()?;
+        match &db.framework_migration {
+            Some((s, f, g)) if s == desired && *f == fw => return g.clone(),
+            _ => {}
+        }
+        db.framework_migration = Some((desired.clone(), fw, None));
+        let (current, target) = (db.schema.clone(), desired.clone());
+        db.worker.run(
+            "Writing the migration",
+            move |conn| (conn.framework_migration(&current, &target, fw, &framework::Options::default()), current, target),
+            move |app: &mut App, (g, current, target)| {
+                if let Some(db) = &mut app.db
+                    && db.schema == current
+                    && let Some((desired, f, slot @ None)) = &mut db.framework_migration
+                    && *desired == target
+                    && *f == fw
+                {
+                    *slot = Some(g);
+                }
+            },
+        );
+        None
     }
 
     /// The schema the open database should get: the schema file's, or the

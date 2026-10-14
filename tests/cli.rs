@@ -198,6 +198,21 @@ fn fmt_sql_diagram_and_diff() {
     assert!(out.contains("+ column posts.views"), "{out}");
     let sql = std::fs::read_to_string(s.path("migration.sql")).unwrap();
     assert!(sql.contains("ALTER TABLE posts ADD COLUMN views INTEGER NOT NULL DEFAULT 0;"), "{sql}");
+
+    // As framework migrations: printed, or written into a migrations folder.
+    let out = s.ok(&["diff", "schema.dbs", "new.dbs", "-d", "postgres", "-f", "laravel"]);
+    assert!(out.contains("$table->integer('views')->default(0);"), "{out}");
+    assert!(out.contains("$table->dropColumn('views');"), "{out}");
+    std::fs::create_dir(s.path("migrate")).unwrap();
+    let out = s.ok(&["diff", "schema.dbs", "new.dbs", "-d", "mysql", "-f", "rails", "--name", "add views", "-o", "migrate"]);
+    let file = std::fs::read_dir(s.path("migrate")).unwrap().next().unwrap().unwrap().path();
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.len() == "20261014120000_add_views.rb".len() && name.ends_with("_add_views.rb"), "{name}");
+    assert!(out.contains("Migration written to"), "{out}");
+    let rb = std::fs::read_to_string(&file).unwrap();
+    assert!(rb.starts_with("class AddViews < ActiveRecord::Migration[8.0]"), "{rb}");
+    assert!(rb.contains("    add_column :posts, :views, :integer, null: false, default: 0\n"), "{rb}");
+    s.fails(&["diff", "schema.dbs", "new.dbs", "-f", "django"]);
 }
 
 #[test]

@@ -26,6 +26,7 @@ use simple_database::schema::Schema;
 use simple_database::connections::{SafeMode, Store};
 use simple_database::db::{self, Database, QueryResult};
 use simple_database::diff::Migration;
+use simple_database::framework::{Framework, Generated};
 use simple_database::dump;
 use simple_database::history::QueryLog;
 use simple_database::import;
@@ -69,6 +70,8 @@ struct Settings {
     hide_outline: bool,
     show_preview: bool,
     hide_history: bool,
+    /// The Migrate tab's format: 0 SQL, 1 Laravel, 2 Rails.
+    migrate_format: u8,
     /// Read from older settings only: Data tabs now live in their own file, shared by all windows.
     #[serde(skip_serializing)]
     data_tabs: Vec<data_view::SavedTabs>,
@@ -263,6 +266,8 @@ struct Db {
     tls_warning: Option<String>,
     /// The Migrate tab's diff: the schema it aims at and, once computed, the migration.
     migration: Option<(Schema, Option<Migration>)>,
+    /// The same as a framework migration, when the tab shows one.
+    framework_migration: Option<(Schema, Framework, Option<Generated>)>,
 }
 
 /// A connection made in the background, with its schema read.
@@ -310,6 +315,8 @@ struct App {
     dialect: Dialect,
     show_outline: bool,
     show_preview: bool,
+    /// What the Migrate tab shows the migration as: SQL, or a framework's.
+    migrate_format: Option<Framework>,
     outline_filter: String,
     sql: SqlSync,
     /// Schema texts before each diagram edit, for Undo.
@@ -367,6 +374,11 @@ impl App {
             },
             show_outline: !settings.hide_outline,
             show_preview: settings.show_preview,
+            migrate_format: match settings.migrate_format {
+                1 => Some(Framework::Laravel),
+                2 => Some(Framework::Rails),
+                _ => None,
+            },
             outline_filter: String::new(),
             sql: SqlSync::default(),
             diagram_undo: Vec::new(),
@@ -705,7 +717,7 @@ impl App {
         self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None });
+        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, tls_warning, migration: None, framework_migration: None });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;
@@ -812,6 +824,7 @@ impl App {
                     Ok((schema, skipped, counts)) => {
                         if schema != db.schema {
                             db.migration = None;
+                            db.framework_migration = None;
                         }
                         db.schema = schema;
                         db.skipped = skipped;
@@ -940,6 +953,11 @@ impl eframe::App for App {
             hide_outline: !self.show_outline,
             show_preview: self.show_preview,
             hide_history: !self.show_history,
+            migrate_format: match self.migrate_format {
+                None => 0,
+                Some(Framework::Laravel) => 1,
+                Some(Framework::Rails) => 2,
+            },
             data_tabs: Vec::new(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
