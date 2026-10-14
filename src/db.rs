@@ -1309,9 +1309,40 @@ mod tests {
         db.set_safe_mode(SafeMode::ReadOnly).unwrap();
         assert!(db.run("DELETE FROM tags").is_err());
         assert!(db.run("SELECT count(*) FROM tags").is_ok());
-        if let Conn::Postgres(c) = &mut db.conn {
-            assert!(c.batch_execute("DELETE FROM tags").is_err(), "the session itself is read-only");
+        // Statements that would lift the read-only session or write from a "read".
+        let escapes: &[&str] = match db.dialect() {
+            Dialect::Postgres => &[
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+                "SET default_transaction_read_only = off",
+                "SET transaction_read_only TO false",
+                "BEGIN READ WRITE",
+                "START TRANSACTION READ WRITE",
+                "SELECT set_config('default_transaction_read_only', 'off', false)",
+                "SELECT * INTO tags_copy FROM tags",
+                "WITH d AS (DELETE FROM tags RETURNING *) SELECT * FROM d",
+                "EXPLAIN ANALYZE DELETE FROM tags",
+            ],
+            Dialect::Mysql => &[
+                "SET SESSION TRANSACTION READ WRITE",
+                "SET transaction_read_only = 0",
+                "SET @@session.transaction_read_only = OFF",
+                "START TRANSACTION READ WRITE",
+                "SET GLOBAL read_only = 0",
+                "SELECT * FROM tags INTO OUTFILE 'sdb_tags.csv'",
+            ],
+            Dialect::Sqlite => &[],
+        };
+        let before = db.query_value("SELECT count(*) FROM tags").unwrap();
+        for sql in escapes {
+            assert!(db.run(sql).unwrap_err().to_string().contains("read-only"), "{sql}");
         }
+        assert_eq!(db.query_value("SELECT count(*) FROM tags").unwrap(), before);
+        let raw_delete = match &mut db.conn {
+            Conn::Postgres(c) => c.batch_execute("DELETE FROM tags").map_err(anyhow::Error::from),
+            Conn::Mysql(c) => mysql::prelude::Queryable::query_drop(c.as_mut(), "DELETE FROM tags").map_err(anyhow::Error::from),
+            Conn::Sqlite(c) => c.execute_batch("DELETE FROM tags").map_err(anyhow::Error::from),
+        };
+        assert!(raw_delete.is_err(), "the session itself is read-only");
         db.set_safe_mode(SafeMode::Off).unwrap();
         db.run("DELETE FROM tags WHERE name LIKE 'imported%'").unwrap();
     }

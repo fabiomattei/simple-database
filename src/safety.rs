@@ -93,6 +93,9 @@ pub fn classify(stmt: &str) -> Kind {
     let lifts_read_only = w.windows(2).any(|p| p == ["read", "write"]) || w.iter().any(|x| x.ends_with("read_only"));
     match w.first().copied().unwrap_or("") {
         "" => Kind::Read,
+        // Postgres `set_config` changes any setting from inside a query, `default_transaction_read_only`
+        // included; its arguments can be built at run time, so the name alone decides.
+        _ if has("set_config") => Kind::Write,
         "set" if lifts_read_only || has("global") || has("persist") || has("persist_only") => Kind::Write,
         "begin" | "start" if lifts_read_only => Kind::Write,
         // Postgres SELECT INTO creates a table; MySQL INTO OUTFILE writes a file.
@@ -265,6 +268,11 @@ mod tests {
         read("BEGIN");
         read("SET search_path TO app");
         read("PRAGMA query_only");
+        write("SELECT set_config('default_transaction_read_only', 'off', false)");
+        write("select 1 from t where pg_catalog.SET_CONFIG('transaction_read_only', 'off', true) is null");
+        write("WITH x AS (SELECT set_config('a', 'b', false)) SELECT * FROM x");
+        read("SELECT current_setting('default_transaction_read_only')");
+        read("SELECT 'set_config' FROM t");
         // Server-wide settings.
         write("SET GLOBAL max_connections = 1");
         write("SET PERSIST max_connections = 1");
