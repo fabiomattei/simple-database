@@ -393,10 +393,19 @@ impl Database {
     /// The migration that turns `current` (introspected from this database)
     /// into `desired`.
     pub fn migration(&mut self, current: &Schema, desired: &Schema) -> Migration {
-        let (desired, warnings) = self.schema_names(desired);
-        let desired = self.normalize_checks(&desired);
-        let mut m = diff::diff(current, &desired, self.dialect());
+        let (named, warnings) = self.schema_names(desired);
+        let named = self.normalize_checks(&named);
+        let mut m = diff::diff(current, &named, self.dialect());
         m.warnings.extend(warnings);
+        // `tables` by the names `desired` gives them (`public.users`, not `users`).
+        for t in &mut m.tables {
+            if t.change != diff::TableChange::Dropped
+                && desired.table(&t.name).is_none()
+                && let Some(d) = desired.tables.iter().find(|d| named.table(&d.name).is_none() && split_qualified(&d.name).1 == t.name)
+            {
+                t.name = d.name.clone();
+            }
+        }
         m
     }
 
@@ -1302,6 +1311,8 @@ mod tests {
         names.sort();
         assert_eq!(names, ["kids", "parents", "refunds", "sdb_billing.invoices", "sdb_billing.lines"]);
         assert!(both.migration(&current, &desired).is_empty(), "{}", both.migration(&current, &desired).script());
+        let tables = both.migration(&current, &desired).tables;
+        assert!(tables.iter().all(|t| t.change == diff::TableChange::Unchanged && t.old.as_ref() == Some(&t.name)), "{tables:?}");
         let pulled = parse(&crate::format::format_schema(&current)).unwrap();
         assert!(both.migration(&current, &pulled).is_empty(), "pulled schema differs");
         assert_eq!(both.row_counts(&current).unwrap().len(), 5);
@@ -1315,6 +1326,8 @@ mod tests {
         let moved = parse(&src.replace("table kids {", "table sdb_billing.children was kids {")).unwrap();
         let m = both.migration(&current, &moved);
         assert_eq!(m.changes, ["~ table kids -> sdb_billing.children"], "{}", m.script());
+        let children = m.tables.iter().find(|t| t.name == "sdb_billing.children").unwrap();
+        assert_eq!((children.old.as_deref(), children.change), (Some("kids"), diff::TableChange::Renamed));
         both.apply_migration(&m).unwrap();
         let current = both.introspect().unwrap();
         assert!(both.migration(&current, &moved).is_empty(), "{}", both.migration(&current, &moved).script());

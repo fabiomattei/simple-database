@@ -23,6 +23,14 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | **Data** | Browse and edit tables, each in its own tab, 200 rows per page (see below) |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
 
+The sidebar lists the tables of the schema file and of the open database in one list, with
+row counts. Once both are there, each table is marked by how the file differs from the
+database: **+** new, **~** changed, **→** renamed, **−** only in the database (Push drops it).
+The **Migrate** tab shows how many tables differ. Clicking a table moves the caret to it in the
+Schema tab, selects it in the Diagram, and otherwise opens its rows in the Data tab; right-click
+for the others (**Open data**, **Show in schema**, **Show in diagram**, **Show the migration**,
+**Copy name**).
+
 The **Data** tab edits rows in place. Each table opens in its own tab (click it in the sidebar,
 use **➕** next to the tabs, or **Browse data** in the Diagram), and every tab keeps its page,
 filters and unsaved changes while you look at another; a tab with changes waiting is marked •

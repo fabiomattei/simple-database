@@ -1,11 +1,12 @@
 //! The window around the tabs: menu bar, sidebar and status bar.
 
-use crate::{App, DiagramSource, Dialog, Pending, SCHEMA_EDITOR, Tab, error_color, ok_color, warn_color, conns, editor};
+use crate::{App, DiagramSource, Dialog, MigrateSource, Pending, SCHEMA_EDITOR, Tab, error_color, ok_color, warn_color, conns, editor};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 use simple_database::ddl::Dialect;
 use simple_database::parser;
 use simple_database::connections::SafeMode;
 use simple_database::db;
+use simple_database::diff::TableChange;
 use simple_database::validate::Severity;
 use std::path::Path;
 use std::time::Duration;
@@ -114,29 +115,9 @@ impl App {
         ui.add_space(6.0);
         ui.label(RichText::new("SCHEMA").small().strong().weak());
         ui.label(RichText::new(self.file_label()).strong());
-        let schema = self.analysis.last_good.clone();
-        egui::ScrollArea::vertical().id_salt("schema_tables").max_height(ui.available_height() * 0.45).show(ui, |ui| {
-            for t in &schema.tables {
-                let selected = self.er.selected.as_deref() == Some(t.name.as_str());
-                let label = format!("  {}", t.name);
-                let resp = ui.selectable_label(selected, label).on_hover_text(format!("{} columns", t.columns.len()));
-                if resp.clicked() && self.tab == Tab::Schema {
-                    if let Some(line) = parser::locate(&self.analysis.outline, &t.name) {
-                        editor::goto_line(ui.ctx(), SCHEMA_EDITOR, line - 1);
-                    }
-                } else if resp.clicked() {
-                    self.er.selected = Some(t.name.clone());
-                    self.er.set_hidden(&t.name, false);
-                    self.er_source = DiagramSource::SchemaFile;
-                    self.tab = Tab::Diagram;
-                }
-            }
-        });
 
-        ui.add_space(10.0);
-        ui.separator();
+        ui.add_space(6.0);
         ui.label(RichText::new("DATABASE").small().strong().weak());
-        let mut open_table = None;
         match &self.db {
             None => {
                 ui.label(RichText::new("No database open").weak());
@@ -147,7 +128,6 @@ impl App {
                             .add_filter("All files", &["*"])
                             .pick_file()
                     {
-                        open_table = Some(None);
                         self.open_db(&p.to_string_lossy());
                     }
                     if ui.button("New…").clicked()
@@ -208,26 +188,165 @@ impl App {
                     };
                     ui.colored_label(color, RichText::new(format!("{icon} {}", mode.label())).small()).on_hover_text(mode.description());
                 }
-                egui::ScrollArea::vertical().id_salt("db_tables").show(ui, |ui| {
-                    if db.counts.is_empty() {
-                        ui.label(RichText::new("(empty — push a schema)").weak());
-                    }
-                    for (t, n) in &db.counts {
-                        let selected = self.tab == Tab::Data && self.data.table() == Some(t.as_str());
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(selected, format!("  {t}")).clicked() {
-                                open_table = Some(Some(t.clone()));
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(n.to_string()).weak().monospace());
-                            });
-                        });
-                    }
-                });
             }
         }
-        if let Some(Some(t)) = open_table {
-            self.open_table_data(t);
+
+        ui.add_space(6.0);
+        ui.separator();
+        let rows = self.sidebar_rows();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("TABLES").small().strong().weak());
+            if rows.iter().any(|r| r.change.is_some_and(|c| c != TableChange::Unchanged)) {
+                ui.label(RichText::new("(?)").small().weak()).on_hover_text(
+                    "How the schema file differs from the database:\n+ new, not in the database yet\n~ changed\n→ renamed\n− only in the database; Push drops it",
+                );
+            }
+        });
+        if rows.is_empty() {
+            let text = if self.db.is_some() { "No tables yet. Write a schema, then push it (Migrate tab)." } else { "No tables yet." };
+            ui.label(RichText::new(text).weak());
+        }
+        let mut action = None;
+        egui::ScrollArea::vertical().id_salt("tables").show(ui, |ui| {
+            for row in &rows {
+                if let Some(a) = self.sidebar_row(ui, row) {
+                    action = Some(a);
+                }
+            }
+        });
+        if let Some(a) = action {
+            self.sidebar_action(a, ui.ctx());
+        }
+    }
+
+    /// The sidebar's tables: the schema file's and the database's in one
+    /// list, marked by how they differ once both are there.
+    fn sidebar_rows(&mut self) -> Vec<SidebarRow> {
+        let drift = self.table_drift();
+        let counts = |name: &str| self.db.as_ref().and_then(|db| db.counts.iter().find(|(t, _)| t == name).map(|(_, n)| *n));
+        let mut rows = Vec::new();
+        if let Some(drift) = drift {
+            for t in drift {
+                let in_schema = (t.change != TableChange::Dropped).then(|| t.name.clone());
+                let rows_now = t.old.as_deref().and_then(counts);
+                rows.push(SidebarRow { name: t.name, in_schema, in_db: t.old, change: Some(t.change), rows: rows_now });
+            }
+            return rows;
+        }
+        // Not compared (yet): no markers.
+        let schema = &self.analysis.last_good;
+        for t in &schema.tables {
+            let rows_now = counts(&t.name);
+            rows.push(SidebarRow { name: t.name.clone(), in_schema: Some(t.name.clone()), in_db: rows_now.map(|_| t.name.clone()), change: None, rows: rows_now });
+        }
+        if let Some(db) = &self.db {
+            for (t, n) in &db.counts {
+                if schema.table(t).is_none() {
+                    rows.push(SidebarRow { name: t.clone(), in_schema: None, in_db: Some(t.clone()), change: None, rows: Some(*n) });
+                }
+            }
+        }
+        rows
+    }
+
+    fn sidebar_row(&self, ui: &mut egui::Ui, row: &SidebarRow) -> Option<SidebarAction> {
+        let (mark, color, why) = match row.change {
+            Some(TableChange::Created) => ("+", ok_color(ui), "New in the schema file: Push creates it".to_string()),
+            Some(TableChange::Altered) => ("~", warn_color(ui), "Changed in the schema file: see the Migrate tab".to_string()),
+            Some(TableChange::Renamed) => ("→", warn_color(ui), String::new()),
+            Some(TableChange::Dropped) => ("−", error_color(ui), "Not in the schema file: Push drops it".to_string()),
+            Some(TableChange::Unchanged) | None => (" ", ui.visuals().text_color(), String::new()),
+        };
+        let mut hover = match (&row.in_db, row.change) {
+            (Some(old), Some(TableChange::Renamed | TableChange::Altered)) if *old != row.name => format!("Renamed from {old}"),
+            _ => why,
+        };
+        if let Some(t) = row.in_schema.as_deref().and_then(|n| self.analysis.last_good.table(n)) {
+            if !hover.is_empty() {
+                hover.push('\n');
+            }
+            hover.push_str(&format!("{} columns", t.columns.len()));
+        }
+        let selected = match self.tab {
+            Tab::Data => row.in_db.is_some() && self.data.table() == row.in_db.as_deref(),
+            Tab::Diagram => row.in_schema.is_some() && self.er.selected == row.in_schema,
+            _ => false,
+        };
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(RichText::new(mark).monospace().strong().color(color));
+            let mut text = RichText::new(&row.name);
+            if row.change == Some(TableChange::Dropped) {
+                text = text.weak();
+            }
+            let resp = ui.selectable_label(selected, text);
+            let resp = if hover.is_empty() { resp } else { resp.on_hover_text(hover) };
+            if resp.clicked() {
+                action = Some(self.default_sidebar_action(row));
+            }
+            resp.context_menu(|ui| {
+                if let Some(t) = &row.in_db
+                    && ui.button("Open data").clicked()
+                {
+                    action = Some(SidebarAction::Data(t.clone()));
+                }
+                if let Some(t) = &row.in_schema {
+                    if ui.button("Show in schema").clicked() {
+                        action = Some(SidebarAction::Schema(t.clone()));
+                    }
+                    if ui.button("Show in diagram").clicked() {
+                        action = Some(SidebarAction::Diagram(t.clone()));
+                    }
+                }
+                if row.change.is_some_and(|c| c != TableChange::Unchanged) && ui.button("Show the migration").clicked() {
+                    action = Some(SidebarAction::Migrate);
+                }
+                ui.separator();
+                if ui.button("Copy name").clicked() {
+                    ui.ctx().copy_text(row.name.clone());
+                    ui.close();
+                }
+            });
+            if let Some(n) = row.rows {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(n.to_string()).weak().monospace());
+                });
+            }
+        });
+        action
+    }
+
+    /// A click: the table where the current tab can show it.
+    fn default_sidebar_action(&self, row: &SidebarRow) -> SidebarAction {
+        match (self.tab, &row.in_schema, &row.in_db) {
+            (Tab::Schema, Some(t), _) => SidebarAction::Schema(t.clone()),
+            (Tab::Diagram, Some(t), _) => SidebarAction::Diagram(t.clone()),
+            (_, _, Some(t)) => SidebarAction::Data(t.clone()),
+            (_, Some(t), None) => SidebarAction::Schema(t.clone()),
+            (_, None, None) => SidebarAction::Migrate,
+        }
+    }
+
+    fn sidebar_action(&mut self, action: SidebarAction, ctx: &egui::Context) {
+        match action {
+            SidebarAction::Data(t) => self.open_table_data(t),
+            SidebarAction::Schema(t) => {
+                self.tab = Tab::Schema;
+                if let Some(line) = parser::locate(&self.analysis.outline, &t) {
+                    editor::goto_line(ctx, SCHEMA_EDITOR, line - 1);
+                }
+            }
+            SidebarAction::Diagram(t) => {
+                self.er.selected = Some(t.clone());
+                self.er.set_hidden(&t, false);
+                self.er_source = DiagramSource::SchemaFile;
+                self.tab = Tab::Diagram;
+            }
+            SidebarAction::Migrate => {
+                self.migrate_source = MigrateSource::SchemaFile;
+                self.tab = Tab::Migrate;
+            }
         }
     }
 
@@ -259,6 +378,14 @@ impl App {
                     (None, Some(db)) => db.worker.busy().map(|(w, t)| (w.to_string(), t, true)),
                     (None, None) => None,
                 };
+                // Quick jobs (a comparison after each edit) would only flicker.
+                const SHOW_AFTER: Duration = Duration::from_millis(250);
+                let busy = busy.filter(|(_, since, _)| {
+                    if *since < SHOW_AFTER {
+                        ui.ctx().request_repaint_after(SHOW_AFTER - *since);
+                    }
+                    *since >= SHOW_AFTER
+                });
                 if let Some((what, since, cancellable)) = busy {
                     if cancellable && since > Duration::from_millis(300) {
                         self.cancel_button(ui);
@@ -281,4 +408,22 @@ impl App {
             });
         });
     }
+}
+
+/// One table in the sidebar.
+struct SidebarRow {
+    /// As the schema file names it, else as the database does.
+    name: String,
+    in_schema: Option<String>,
+    in_db: Option<String>,
+    /// `None` until compared, or without a database.
+    change: Option<TableChange>,
+    rows: Option<i64>,
+}
+
+enum SidebarAction {
+    Data(String),
+    Schema(String),
+    Diagram(String),
+    Migrate,
 }

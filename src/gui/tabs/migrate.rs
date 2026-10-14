@@ -1,11 +1,11 @@
 //! The Migrate tab: the diff from the open database to the schema, and Push.
 
-use crate::{App, Dialog, MigrateSource, PUSHING, Pending, empty_state, error_color, ok_color, warn_color, conns, highlight::{self, Lang}, worker::Task};
+use crate::{App, Dialog, Drift, MigrateSource, PUSHING, Pending, empty_state, error_color, ok_color, warn_color, conns, highlight::{self, Lang}, worker::Task};
 use eframe::egui::{self, RichText};
 use simple_database::schema::Schema;
 use simple_database::connections::SafeMode;
 use simple_database::db::{self, Database};
-use simple_database::diff::Migration;
+use simple_database::diff::{Migration, TableDrift};
 use simple_database::framework::{self, Framework, Generated};
 use simple_database::validate::Severity;
 
@@ -280,6 +280,40 @@ impl App {
             },
         );
         None
+    }
+
+    /// How each table of the schema file differs from the open database:
+    /// the last answer, while a newer one is on its way. `None` without a
+    /// database, or with an empty schema file (every table would show as dropped).
+    pub(crate) fn table_drift(&mut self) -> Option<Vec<TableDrift>> {
+        let desired = &self.analysis.last_good;
+        let db = self.db.as_mut()?;
+        if desired.tables.is_empty() {
+            return None;
+        }
+        let fresh = db.drift.as_ref().is_some_and(|d| d.desired == *desired && d.current == db.schema);
+        if !fresh && !db.drift_running {
+            if let Some((s, Some(m))) = &db.migration
+                && s == desired
+            {
+                // The Migrate tab has compared these already.
+                db.drift = Some(Drift { desired: desired.clone(), current: db.schema.clone(), tables: m.tables.clone() });
+            } else {
+                db.drift_running = true;
+                let (current, target) = (db.schema.clone(), desired.clone());
+                db.worker.run(
+                    "Comparing schemas",
+                    move |conn| (conn.migration(&current, &target).tables, current, target),
+                    |app: &mut App, (tables, current, desired)| {
+                        if let Some(db) = &mut app.db {
+                            db.drift_running = false;
+                            db.drift = Some(Drift { desired, current, tables });
+                        }
+                    },
+                );
+            }
+        }
+        db.drift.as_ref().map(|d| d.tables.clone())
     }
 
     /// What rows in the open database would make pushing `desired` fail,

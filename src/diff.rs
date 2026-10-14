@@ -14,6 +14,30 @@ pub struct Migration {
     pub statements: Vec<String>,
     /// Queries for existing rows that would make it fail (`Database::preflight`).
     pub checks: Vec<RowCheck>,
+    /// Every table on either side and how it changes, new side first, then the dropped tables.
+    pub tables: Vec<TableDrift>,
+}
+
+/// How a table changes in a migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableChange {
+    Unchanged,
+    Created,
+    /// Renamed, and nothing else.
+    Renamed,
+    /// Columns, keys, indexes or comment change (and maybe the name too).
+    Altered,
+    Dropped,
+}
+
+/// One table of [`Migration::tables`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDrift {
+    /// The table's name on the new side; for a dropped table, on the old one.
+    pub name: String,
+    /// Its name on the old side; `None` for a new table.
+    pub old: Option<String>,
+    pub change: TableChange,
 }
 
 impl Migration {
@@ -181,6 +205,31 @@ impl Plan {
         self.changes.is_empty()
     }
 
+    /// Every table and how it changes, as in [`Migration::tables`].
+    pub fn tables(&self) -> Vec<TableDrift> {
+        let mut out: Vec<TableDrift> = self
+            .new
+            .tables
+            .iter()
+            .map(|t| {
+                let from = self.renames.iter().find(|r| r.table.is_none() && r.to == t.name).map(|r| r.from.clone());
+                let change = if self.created.contains(&t.name) {
+                    TableChange::Created
+                } else if self.altered.contains(&t.name) {
+                    TableChange::Altered
+                } else if from.is_some() {
+                    TableChange::Renamed
+                } else {
+                    TableChange::Unchanged
+                };
+                let old = (change != TableChange::Created).then(|| from.unwrap_or_else(|| t.name.clone()));
+                TableDrift { name: t.name.clone(), old, change }
+            })
+            .collect();
+        out.extend(self.dropped.iter().map(|t| TableDrift { name: t.clone(), old: Some(t.clone()), change: TableChange::Dropped }));
+        out
+    }
+
     /// What changed on `table`, one of `altered`.
     pub fn table_diff(&self, table: &str) -> Option<TableDiff<'_>> {
         Some(TableDiff::compute(self.old.table(table)?, self.new.table(table)?))
@@ -338,7 +387,8 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
     }
 
     let checks = preflight::row_checks(&p);
-    let mut m = Migration { changes: p.changes, warnings: p.warnings, statements: Vec::new(), checks };
+    let tables = p.tables();
+    let mut m = Migration { changes: p.changes, warnings: p.warnings, statements: Vec::new(), checks, tables };
     if body.is_empty() {
         return m;
     }
@@ -1039,6 +1089,23 @@ mod tests {
 
     const OLD: &str = "table users { id int pk autoincrement\n name text\n legacy text }\n table logs { id int pk }";
     const NEW: &str = "table users { id int pk autoincrement\n name text not null default ''\n email text\n index (email) }\n table posts { id int pk\n user_id int -> users.id }";
+
+    #[test]
+    fn tables_say_how_each_table_changes() {
+        let old = parse("table users { id int pk }\ntable tags { id int pk }\ntable logs { id int pk }\ntable posts { id int pk }").unwrap();
+        let new = parse("table users { id int pk\n name text }\ntable labels was tags { id int pk }\ntable posts { id int pk }\ntable comments { id int pk }").unwrap();
+        let drift = |name: &str, old: Option<&str>, change| TableDrift { name: name.into(), old: old.map(Into::into), change };
+        assert_eq!(
+            diff(&old, &new, Dialect::Sqlite).tables,
+            vec![
+                drift("users", Some("users"), TableChange::Altered),
+                drift("labels", Some("tags"), TableChange::Renamed),
+                drift("posts", Some("posts"), TableChange::Unchanged),
+                drift("comments", None, TableChange::Created),
+                drift("logs", Some("logs"), TableChange::Dropped),
+            ]
+        );
+    }
 
     #[test]
     fn cycles_are_created_and_dropped_in_two_steps() {

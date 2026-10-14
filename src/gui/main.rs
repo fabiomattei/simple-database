@@ -25,7 +25,7 @@ use simple_database::parser::{self, ParseError};
 use simple_database::schema::Schema;
 use simple_database::connections::{SafeMode, Store};
 use simple_database::db::{self, Database, QueryResult};
-use simple_database::diff::Migration;
+use simple_database::diff::{Migration, TableChange, TableDrift};
 use simple_database::framework::{Framework, Generated};
 use simple_database::dump;
 use simple_database::history::QueryLog;
@@ -272,6 +272,17 @@ struct Db {
     framework_migration: Option<(Schema, Framework, Option<Generated>)>,
     /// What rows would make pushing to that schema fail, checked as Push asks to confirm.
     preflight: Option<(Schema, Option<Vec<String>>)>,
+    /// How the schema file's tables differ from the database (sidebar, Migrate badge).
+    drift: Option<Drift>,
+    /// A drift comparison is queued; only one at a time, so typing doesn't pile them up.
+    drift_running: bool,
+}
+
+/// [`App::table_drift`]'s answer and the two schemas it compared.
+struct Drift {
+    desired: Schema,
+    current: Schema,
+    tables: Vec<TableDrift>,
 }
 
 /// A connection made in the background, with its schema read.
@@ -722,7 +733,7 @@ impl App {
         self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, safe_mode, writing_functions, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None });
+        self.db = Some(Db { worker, label, dialect, safe_mode, writing_functions, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None, drift: None, drift_running: false });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;
@@ -908,6 +919,10 @@ impl eframe::App for App {
             .min_size(150.0)
             .show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default().show(ui, |ui| {
+            let changed = self.db.as_ref().and_then(|db| db.drift.as_ref()).map(|d| {
+                let count = |c: TableChange| d.tables.iter().filter(|t| t.change == c).count();
+                (count(TableChange::Created), count(TableChange::Altered) + count(TableChange::Renamed), count(TableChange::Dropped))
+            });
             ui.horizontal(|ui| {
                 let has_db = self.db.is_some();
                 for (tab, label, needs_db) in [
@@ -920,7 +935,29 @@ impl eframe::App for App {
                     (Tab::Seed, "🌱 Seed", true),
                 ] {
                     let text = if needs_db && !has_db { RichText::new(label).weak() } else { RichText::new(label) };
-                    ui.selectable_value(&mut self.tab, tab, text);
+                    match changed {
+                        Some((new, altered, dropped)) if tab == Tab::Migrate && new + altered + dropped > 0 => {
+                            let mut job = egui::text::LayoutJob::default();
+                            let style = ui.style().clone();
+                            text.append_to(&mut job, &style, egui::FontSelection::Default, egui::Align::Center);
+                            RichText::new(format!(" {}", new + altered + dropped)).strong().color(warn_color(ui)).append_to(
+                                &mut job,
+                                &style,
+                                egui::FontSelection::Default,
+                                egui::Align::Center,
+                            );
+                            let parts: Vec<String> = [(new, "new"), (altered, "changed"), (dropped, "to drop")]
+                                .into_iter()
+                                .filter(|(n, _)| *n > 0)
+                                .map(|(n, what)| format!("{n} {what}"))
+                                .collect();
+                            ui.selectable_value(&mut self.tab, tab, job)
+                                .on_hover_text(format!("Tables that differ from the database: {}", parts.join(", ")));
+                        }
+                        _ => {
+                            ui.selectable_value(&mut self.tab, tab, text);
+                        }
+                    }
                 }
             });
             ui.separator();
