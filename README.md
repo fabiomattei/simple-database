@@ -203,7 +203,7 @@ verifies the CA, as libpq does:
 | `sdb diagram SCHEMA -f mermaid\|dot` | ER diagram: paste Mermaid into GitHub/GitLab markdown, or `\| dot -Tsvg > er.svg` |
 | `sdb diff FROM TO -d DIALECT [-o file]` | Summary of changes + migration SQL |
 | `sdb push SCHEMA --db app.db [--dry-run] [-y]` | Migrate a database to match the schema |
-| `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database |
+| `sdb pull --db app.db [-o schema.dbs]` | Reverse-engineer a schema from an existing database. What a schema can't describe (views, triggers, functions, enum types, expression and partial indexes, multi-column foreign keys) is listed in comments at the top |
 | `sdb seed --db app.db [-n 10] [-c posts=200] [--only a,b] [--seed 42] [-y]` | Fill tables with realistic fake data (see below) |
 | `sdb query --db app.db "SQL" [-f table\|csv\|json\|markdown] [-y]` | Run SQL, print results. `-y` skips safe mode's question |
 | `sdb exec FILE --db app.db [-1] [--continue] [-v] [-f FORMAT] [-y]` | Run a SQL file statement by statement (see below) |

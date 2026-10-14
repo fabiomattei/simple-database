@@ -337,8 +337,11 @@ fn run(cli: Cli) -> Result<()> {
             println!("Applied {} change(s) to {}.", m.changes.len(), db.label());
         }
         Command::Pull { db, output } => {
-            let s = open_existing(&db)?.introspect()?;
-            emit(output.as_deref(), &format::format_schema(&s))?;
+            let (s, skipped) = open_existing(&db)?.introspect_with_skipped()?;
+            if !skipped.is_empty() {
+                eprintln!("\x1b[33mwarning:\x1b[0m {} object(s) not pulled; they are listed at the top of the schema", skipped.len());
+            }
+            emit(output.as_deref(), &format::note_skipped(&format::format_schema(&s), &skipped))?;
         }
         Command::Query { db, sql, format, yes } => {
             let mut db = open_existing(&db)?;
@@ -577,7 +580,7 @@ fn load_schema(path: &Path) -> Result<Schema> {
     }
     ensure_exists(path)?;
     if sqlite::is_sqlite_file(path) {
-        return sqlite::introspect(&sqlite::open(path)?);
+        return db::Database::open_labeled(&path.to_string_lossy(), path.display().to_string())?.introspect();
     }
     let src = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parser::parse(&src).with_context(|| format!("parsing {}", path.display()))

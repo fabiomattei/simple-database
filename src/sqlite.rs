@@ -24,7 +24,9 @@ pub fn is_sqlite_file(path: &Path) -> bool {
 
 // ---------------------------------------------------------------- introspection
 
-pub fn introspect(conn: &Connection) -> Result<Schema> {
+/// The tables of the database. What a schema can't hold (views, triggers,
+/// some indexes and keys) is described in `skipped`.
+pub fn introspect(conn: &Connection, skipped: &mut Vec<String>) -> Result<Schema> {
     let mut stmt = conn.prepare(
         "SELECT name, sql FROM sqlite_master \
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
@@ -35,7 +37,13 @@ pub fn introspect(conn: &Connection) -> Result<Schema> {
 
     let mut schema = Schema::default();
     for (name, sql) in tables {
-        schema.tables.push(introspect_table(conn, &name, &sql)?);
+        schema.tables.push(introspect_table(conn, &name, &sql, skipped)?);
+    }
+    let mut stmt = conn.prepare("SELECT type, name, tbl_name FROM sqlite_master WHERE type IN ('view', 'trigger') ORDER BY type, name")?;
+    let others = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    for row in others {
+        let (kind, name, table) = row?;
+        skipped.push(if kind == "trigger" { format!("trigger {name} on {table}") } else { format!("{kind} {name}") });
     }
     // Table rebuilds move tables to the end of sqlite_master; present them
     // with referenced tables first instead.
@@ -43,7 +51,7 @@ pub fn introspect(conn: &Connection) -> Result<Schema> {
     Ok(Schema { tables })
 }
 
-fn introspect_table(conn: &Connection, name: &str, create_sql: &str) -> Result<Table> {
+fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &mut Vec<String>) -> Result<Table> {
     let checks = column_checks(create_sql);
     let autoincrement = create_sql.to_ascii_uppercase().contains("AUTOINCREMENT");
 
@@ -91,7 +99,11 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str) -> Result<T
         .collect::<Result<_, _>>()?;
     for (id, ftable, from, to, on_update, on_delete) in &fks {
         if fks.iter().filter(|f| f.0 == *id).count() > 1 {
-            eprintln!("warning: {name}: multi-column foreign key on '{from}' is not supported and was skipped");
+            let cols: Vec<&str> = fks.iter().filter(|f| f.0 == *id).map(|f| f.2.as_str()).collect();
+            let note = format!("multi-column foreign key on {name} ({})", cols.join(", "));
+            if !skipped.contains(&note) {
+                skipped.push(note);
+            }
             continue;
         }
         if let Some(col) = columns.iter_mut().find(|c| c.name == *from) {
@@ -106,20 +118,22 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str) -> Result<T
     }
 
     // PRAGMA index_list: seq, name, unique, origin, partial
-    let mut stmt = conn.prepare("SELECT name, \"unique\", origin FROM pragma_index_list(?1) ORDER BY seq DESC")?;
-    let idx_rows: Vec<(String, bool, String)> = stmt
-        .query_map([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let mut stmt = conn.prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1) ORDER BY seq DESC")?;
+    let idx_rows: Vec<(String, bool, String, bool)> = stmt
+        .query_map([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<Result<_, _>>()?;
     let mut indexes = Vec::new();
-    for (iname, unique, origin) in idx_rows {
+    for (iname, unique, origin, partial) in idx_rows {
         if origin == "pk" {
             continue;
         }
         let mut stmt = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
-        let cols: Vec<String> = stmt
-            .query_map([&iname], |r| r.get::<_, Option<String>>(0))?
-            .filter_map(|c| c.ok().flatten())
-            .collect();
+        // An expression has no column name.
+        let cols: Option<Vec<String>> = stmt.query_map([&iname], |r| r.get::<_, Option<String>>(0))?.collect::<Result<Vec<_>, _>>()?.into_iter().collect();
+        let Some(cols) = cols.filter(|_| !partial) else {
+            skipped.push(format!("index {iname} on {name} (on an expression, or partial)"));
+            continue;
+        };
         if origin == "u" && cols.len() == 1 {
             if let Some(col) = columns.iter_mut().find(|c| c.name == cols[0]) {
                 col.unique = true;
@@ -374,11 +388,42 @@ mod tests {
         let schema = parse(src).unwrap();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&schema_sql(&schema, Dialect::Sqlite)).unwrap();
-        let pulled = introspect(&conn).unwrap();
+        let mut skipped = Vec::new();
+        let pulled = introspect(&conn, &mut skipped).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
         for t in &schema.tables {
             assert_eq!(pulled.table(&t.name), Some(t));
         }
         assert!(crate::diff::diff(&pulled, &schema, Dialect::Sqlite).is_empty());
+    }
+
+    #[test]
+    fn reports_what_it_skips() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE a (x INT, y INT, PRIMARY KEY (x, y));\n\
+             CREATE TABLE b (id INTEGER PRIMARY KEY, x INT, y INT, name TEXT, FOREIGN KEY (x, y) REFERENCES a (x, y));\n\
+             CREATE INDEX b_lower ON b (lower(name));\n\
+             CREATE INDEX b_named ON b (name) WHERE name IS NOT NULL;\n\
+             CREATE INDEX b_x ON b (x);\n\
+             CREATE VIEW names AS SELECT name FROM b;\n\
+             CREATE TRIGGER b_audit AFTER INSERT ON b BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+        let mut skipped = Vec::new();
+        let schema = introspect(&conn, &mut skipped).unwrap();
+        assert_eq!(
+            skipped,
+            [
+                "multi-column foreign key on b (x, y)",
+                "index b_lower on b (on an expression, or partial)",
+                "index b_named on b (on an expression, or partial)",
+                "trigger b_audit on b",
+                "view names",
+            ]
+        );
+        let indexes: Vec<&str> = schema.table("b").unwrap().indexes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(indexes, ["b_x"]);
     }
 
     #[test]

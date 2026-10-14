@@ -211,13 +211,21 @@ impl Database {
     }
 
     pub fn introspect(&mut self) -> Result<Schema> {
+        self.introspect_with_skipped().map(|(schema, _)| schema)
+    }
+
+    /// The schema, and what it leaves out because a schema can't hold it:
+    /// views, triggers, functions, types, and keys, checks and indexes of
+    /// kinds sdb doesn't model (e.g. `view active_users`).
+    pub fn introspect_with_skipped(&mut self) -> Result<(Schema, Vec<String>)> {
+        let mut skipped = Vec::new();
         let schema = match &mut self.conn {
-            Conn::Sqlite(c) => return sqlite::introspect(c),
-            Conn::Postgres(c) => pg::introspect(c)?,
-            Conn::Mysql(c) => mysqldb::introspect(c)?,
+            Conn::Sqlite(c) => return sqlite::introspect(c, &mut skipped).map(|s| (s, skipped)),
+            Conn::Postgres(c) => pg::introspect(c, &mut skipped)?,
+            Conn::Mysql(c) => mysqldb::introspect(c, &mut skipped)?,
         };
         let tables = schema.tables_in_dependency_order().into_iter().cloned().collect();
-        Ok(Schema { tables })
+        Ok((Schema { tables }, skipped))
     }
 
     /// Run one or more `;`-separated statements, returning one result per statement.
@@ -677,7 +685,7 @@ pub fn schema_from_sqlite_ddl(sql: &str) -> std::result::Result<Schema, crate::p
         }
         conn.execute_batch(&stmt).map_err(|e| fail(line, e.to_string()))?;
     }
-    sqlite::introspect(&conn).map_err(|e| fail(1, format!("{e:#}")))
+    sqlite::introspect(&conn, &mut Vec::new()).map_err(|e| fail(1, format!("{e:#}")))
 }
 
 /// `stmt` without `--` and `/* */` comments (statements from `split_statements`).
@@ -1004,6 +1012,7 @@ mod tests {
     fn live_round_trip(url: &str) {
         let mut db = Database::open(url).unwrap();
         let drop_all = |db: &mut Database| {
+            db.run("DROP VIEW IF EXISTS sdb_names").unwrap();
             let current = db.introspect().unwrap();
             let m = db.migration(&current, &Schema::default());
             db.apply_migration(&m).unwrap();
@@ -1047,6 +1056,16 @@ mod tests {
         assert_eq!(plans.len(), 2);
         assert!(plans.iter().all(|p| p.columns == ["QUERY PLAN"] && !p.rows.is_empty()), "{:?}", plans[0].columns);
         assert_eq!(db.query_value("SELECT count(*) FROM post_tags").unwrap(), Cell::Int(15));
+
+        // What a schema can't hold is reported, not pulled.
+        db.run("CREATE VIEW sdb_names AS SELECT name FROM users").unwrap();
+        db.run("CREATE INDEX sdb_expr ON posts ((author_id + 1))").unwrap();
+        let (schema, skipped) = db.introspect_with_skipped().unwrap();
+        assert!(skipped.contains(&"view sdb_names".to_string()), "{skipped:?}");
+        assert!(skipped.iter().any(|s| s.starts_with("index sdb_expr on posts")), "{skipped:?}");
+        assert!(schema.table("sdb_names").is_none() && db.migration(&schema, &edited).is_empty());
+        db.run("DROP VIEW sdb_names").unwrap();
+        db.run(if db.dialect() == Dialect::Mysql { "DROP INDEX sdb_expr ON posts" } else { "DROP INDEX sdb_expr" }).unwrap();
 
         // Staged edits and imports, typed by column, in one transaction.
         live_edits(&mut db, &current);

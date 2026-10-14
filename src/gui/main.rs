@@ -226,6 +226,8 @@ struct Db {
     /// Mirrors the connection's mode (which is what refuses writes), to ask the user.
     safe_mode: SafeMode,
     schema: Schema,
+    /// What the schema leaves out (views, triggers, …), for Pull.
+    skipped: Vec<String>,
     counts: Vec<(String, i64)>,
     /// The Migrate tab's diff: the schema it aims at and, once computed, the migration.
     migration: Option<(Schema, Option<Migration>)>,
@@ -235,6 +237,7 @@ struct Db {
 struct Opened {
     conn: Database,
     schema: Schema,
+    skipped: Vec<String>,
     counts: Vec<(String, i64)>,
 }
 
@@ -494,10 +497,14 @@ impl App {
             }
             Pending::PullIntoEditor => {
                 if let Some(db) = &self.db {
-                    self.schema_text = format::format_schema(&db.schema);
+                    self.schema_text = format::note_skipped(&format::format_schema(&db.schema), &db.skipped);
+                    let note = match db.skipped.len() {
+                        0 => String::new(),
+                        n => format!("; {n} object(s) it can't describe are listed at the top"),
+                    };
                     self.er.reset_layout();
                     self.tab = Tab::Schema;
-                    self.set_status("Replaced the editor with the database schema (not saved yet)", false);
+                    self.set_status(format!("Replaced the editor with the database schema (not saved yet){note}"), false);
                 }
             }
             Pending::Quit => {
@@ -519,12 +526,12 @@ impl App {
     fn start_open(&mut self, what: String, from: OpenFrom, open: impl FnOnce() -> anyhow::Result<Database> + Send + 'static) {
         let task = Task::spawn(what, &self.ctx, move || {
             let mut conn = open().map_err(|e| format!("{e:#}"))?;
-            let read = conn.introspect().and_then(|schema| {
+            let read = conn.introspect_with_skipped().and_then(|(schema, skipped)| {
                 let counts = conn.row_counts(&schema)?;
-                Ok((schema, counts))
+                Ok((schema, skipped, counts))
             });
-            let (schema, counts) = read.map_err(|e| format!("{e:#}"))?;
-            Ok(Opened { conn, schema, counts })
+            let (schema, skipped, counts) = read.map_err(|e| format!("{e:#}"))?;
+            Ok(Opened { conn, schema, skipped, counts })
         });
         self.opening = Some((task, from));
     }
@@ -563,7 +570,7 @@ impl App {
 
     /// Make a newly opened database the current one.
     fn attach_db(&mut self, opened: Opened) {
-        let Opened { conn, schema, counts } = opened;
+        let Opened { conn, schema, skipped, counts } = opened;
         let (label, dialect, safe_mode) = (conn.label().to_string(), conn.dialect(), conn.safe_mode());
         self.set_status(format!("Connected to {label}"), false);
         if let Some(name) = label.strip_prefix('@') {
@@ -580,7 +587,7 @@ impl App {
         self.data.open(schema.tables.first().map(|t| t.name.clone()));
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, safe_mode, schema, counts, migration: None });
+        self.db = Some(Db { worker, label, dialect, safe_mode, schema, skipped, counts, migration: None });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;
@@ -672,18 +679,19 @@ impl App {
         self.db_run(
             "Reading the database",
             |conn| {
-                let schema = conn.introspect()?;
+                let (schema, skipped) = conn.introspect_with_skipped()?;
                 let counts = conn.row_counts(&schema)?;
-                anyhow::Ok((schema, counts))
+                anyhow::Ok((schema, skipped, counts))
             },
             |app, res| {
                 let Some(db) = &mut app.db else { return };
                 match res {
-                    Ok((schema, counts)) => {
+                    Ok((schema, skipped, counts)) => {
                         if schema != db.schema {
                             db.migration = None;
                         }
                         db.schema = schema;
+                        db.skipped = skipped;
                         db.counts = counts;
                         if app.data.table.as_ref().is_none_or(|t| db.schema.table(t).is_none()) {
                             app.data.open(db.schema.tables.first().map(|t| t.name.clone()));
@@ -2248,6 +2256,8 @@ impl App {
         }
         let order: Vec<String> = db.schema.tables_in_dependency_order().iter().map(|t| t.name.clone()).collect();
         let counts: HashMap<String, i64> = db.counts.iter().cloned().collect();
+        // Tables a push dropped would make seeding fail.
+        self.seed.tables.retain(|t, _| order.contains(t));
         for t in &order {
             self.seed.tables.entry(t.clone()).or_insert((true, self.seed.rows));
         }

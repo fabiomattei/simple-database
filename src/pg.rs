@@ -46,7 +46,9 @@ pub fn cancel(token: &postgres::CancelToken, url: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- introspection
 
-pub fn introspect(client: &mut Client) -> Result<Schema> {
+/// The tables of the current schema. What a schema can't hold (views,
+/// functions, triggers, types, some constraints and indexes) is described in `skipped`.
+pub fn introspect(client: &mut Client, skipped: &mut Vec<String>) -> Result<Schema> {
     let tables = client.query(
         "SELECT c.oid, c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') ORDER BY c.oid",
@@ -54,7 +56,35 @@ pub fn introspect(client: &mut Client) -> Result<Schema> {
     )?;
     let mut schema = Schema::default();
     for row in tables {
-        schema.tables.push(introspect_table(client, row.get(0), row.get(1))?);
+        schema.tables.push(introspect_table(client, row.get(0), row.get(1), skipped)?);
+    }
+    // Sequences behind identity and serial columns, and extension objects, belong to something else.
+    let others = client.query(
+        "SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'f' THEN 'foreign table' \
+                ELSE 'sequence' END, c.relname::text \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = current_schema() AND (c.relkind IN ('v', 'm', 'f') OR (c.relkind = 'S' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype IN ('a', 'i', 'e')))) \
+         UNION ALL \
+         SELECT CASE t.typtype WHEN 'e' THEN 'enum type' WHEN 'd' THEN 'domain' ELSE 'range type' END, t.typname::text \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE n.nspname = current_schema() AND t.typtype IN ('e', 'd', 'r') \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e') \
+         UNION ALL \
+         SELECT CASE p.prokind WHEN 'p' THEN 'procedure' WHEN 'a' THEN 'aggregate' WHEN 'w' THEN 'window function' ELSE 'function' END, \
+                p.proname::text \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = current_schema() \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e') \
+         UNION ALL \
+         SELECT 'trigger', t.tgname::text || ' on ' || c.relname::text \
+         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = current_schema() AND NOT t.tgisinternal \
+         ORDER BY 1, 2",
+        &[],
+    )?;
+    for r in others {
+        skipped.push(format!("{} {}", r.get::<_, String>(0), r.get::<_, String>(1)));
     }
     Ok(schema)
 }
@@ -67,7 +97,7 @@ fn attnames(list: &str, rel: &str) -> String {
     )
 }
 
-fn introspect_table(client: &mut Client, oid: u32, name: String) -> Result<Table> {
+fn introspect_table(client: &mut Client, oid: u32, name: String, skipped: &mut Vec<String>) -> Result<Table> {
     let rows = client.query(
         "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
          pg_get_expr(d.adbin, d.adrelid), a.attidentity::text \
@@ -152,7 +182,7 @@ fn introspect_table(client: &mut Client, oid: u32, name: String) -> Result<Table
                     columns[i].check = Some(clean_check(r.get(7)));
                 }
             }
-            _ => eprintln!("warning: {name}: constraint {cname} is not supported and was skipped"),
+            _ => skipped.push(format!("constraint {cname} on {name}")),
         }
     }
 
@@ -170,6 +200,14 @@ fn introspect_table(client: &mut Client, oid: u32, name: String) -> Result<Table
     )?;
     for r in rows {
         indexes.push(Index { name: r.get(0), unique: r.get(1), columns: r.get(2) });
+    }
+    let rows = client.query(
+        "SELECT i.relname::text FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
+         WHERE ix.indrelid = $1 AND (ix.indexprs IS NOT NULL OR ix.indpred IS NOT NULL) ORDER BY i.oid",
+        &[&oid],
+    )?;
+    for r in rows {
+        skipped.push(format!("index {} on {name} (on an expression, or partial)", r.get::<_, String>(0)));
     }
 
     Ok(Table { name, columns, composite_pk, indexes, was: vec![] })

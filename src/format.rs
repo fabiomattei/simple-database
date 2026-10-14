@@ -93,6 +93,19 @@ fn was(names: &[String]) -> String {
     }
 }
 
+/// A pulled schema's `text` headed by comments that list what the database
+/// has but a schema can't hold (from `Database::introspect_with_skipped`).
+pub fn note_skipped(text: &str, skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::from("# Not pulled: sdb schemas don't describe these, and push leaves them alone.\n");
+    for s in skipped {
+        out.push_str(&format!("#   {s}\n"));
+    }
+    out + "\n" + text
+}
+
 /// Re-aligns the column definitions of every table the way `format_schema`
 /// does, keeping comments, blank lines and everything else as written.
 /// `None` when `src` doesn't parse, or if the result would mean something else.
@@ -278,6 +291,16 @@ mod tests {
         // One-line tables and several statements on a line stay as written.
         let src = "table a { id int pk }\ntable b {\n  x int, y int\n}\n";
         assert_eq!(align(src).as_deref(), Some(src));
+    }
+
+    #[test]
+    fn skipped_objects_become_comments() {
+        let schema = parse("table a { id int pk }").unwrap();
+        let text = format_schema(&schema);
+        assert_eq!(note_skipped(&text, &[]), text);
+        let noted = note_skipped(&text, &["view v".into(), "trigger t on a".into()]);
+        assert!(noted.starts_with("# Not pulled") && noted.contains("#   view v\n#   trigger t on a\n\ntable a"), "{noted}");
+        assert_eq!(parse(&noted).unwrap(), schema);
     }
 
     #[test]

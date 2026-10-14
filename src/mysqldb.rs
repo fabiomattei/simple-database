@@ -65,19 +65,30 @@ pub fn cancel(url: &str, id: u32) -> Result<()> {
 
 // ---------------------------------------------------------------- introspection
 
-pub fn introspect(conn: &mut Conn) -> Result<Schema> {
+/// The tables of the database. What a schema can't hold (views, triggers,
+/// routines, events, some keys, checks and indexes) is described in `skipped`.
+pub fn introspect(conn: &mut Conn, skipped: &mut Vec<String>) -> Result<Schema> {
     let names: Vec<String> = conn.query(
         "SELECT TABLE_NAME FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY CREATE_TIME, TABLE_NAME",
     )?;
     let mut schema = Schema::default();
     for name in names {
-        schema.tables.push(introspect_table(conn, name)?);
+        schema.tables.push(introspect_table(conn, name, skipped)?);
     }
+    let others: Vec<(String, String)> = conn.query(
+        "SELECT 'view', TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE() \
+         UNION ALL SELECT 'trigger', CONCAT(TRIGGER_NAME, ' on ', EVENT_OBJECT_TABLE) FROM information_schema.TRIGGERS \
+           WHERE TRIGGER_SCHEMA = DATABASE() \
+         UNION ALL SELECT LOWER(ROUTINE_TYPE), ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() \
+         UNION ALL SELECT 'event', EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE() \
+         ORDER BY 1, 2",
+    )?;
+    skipped.extend(others.into_iter().map(|(kind, name)| format!("{kind} {name}")));
     Ok(schema)
 }
 
-fn introspect_table(conn: &mut Conn, name: String) -> Result<Table> {
+fn introspect_table(conn: &mut Conn, name: String, skipped: &mut Vec<String>) -> Result<Table> {
     type ColumnRow = (String, String, String, Option<String>, String);
     let rows: Vec<ColumnRow> = conn.exec(
         "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS \
@@ -116,7 +127,10 @@ fn introspect_table(conn: &mut Conn, name: String) -> Result<Table> {
     let fk_names: Vec<&String> = fks.iter().map(|f| &f.0).collect();
     for (cname, col, rtable, rcol, on_update, on_delete) in &fks {
         if fk_names.iter().filter(|n| **n == cname).count() > 1 {
-            eprintln!("warning: {name}: multi-column foreign key {cname} is not supported and was skipped");
+            let note = format!("multi-column foreign key {cname} on {name}");
+            if !skipped.contains(&note) {
+                skipped.push(note);
+            }
             continue;
         }
         if let Some(c) = columns.iter_mut().find(|c| c.name == *col) {
@@ -153,7 +167,10 @@ fn introspect_table(conn: &mut Conn, name: String) -> Result<Table> {
     let mut composite_pk = Vec::new();
     let mut indexes = Vec::new();
     for (iname, unique, cols) in grouped {
-        let Some(cols) = cols else { continue };
+        let Some(cols) = cols else {
+            skipped.push(format!("index {iname} on {name} (on an expression)"));
+            continue;
+        };
         if iname == "PRIMARY" {
             if let [only] = cols.as_slice() {
                 if let Some(c) = columns.iter_mut().find(|c| c.name == *only) {
@@ -188,7 +205,7 @@ fn introspect_table(conn: &mut Conn, name: String) -> Result<Table> {
         });
         match target {
             Some(i) => columns[i].check = Some(expr),
-            None => eprintln!("warning: {name}: table-level check {cname} is not supported and was skipped"),
+            None => skipped.push(format!("table-level check {cname} on {name}")),
         }
     }
 
@@ -360,7 +377,7 @@ fn show_create_one(conn: &mut Conn, table: &str) -> Result<String> {
 pub fn show_create(conn: &mut Conn, table: Option<&str>) -> Result<Vec<String>> {
     let names = match table {
         Some(t) => vec![t.to_string()],
-        None => introspect(conn)?.tables.into_iter().map(|t| t.name).collect(),
+        None => introspect(conn, &mut Vec::new())?.tables.into_iter().map(|t| t.name).collect(),
     };
     names.iter().map(|t| show_create_one(conn, t)).collect()
 }
