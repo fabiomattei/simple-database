@@ -91,8 +91,16 @@ impl App {
             Dialog::Connections(_) => {
                 let Some(Dialog::Connections(mut m)) = self.dialog.take() else { unreachable!() };
                 let mut action = None;
-                let resp = egui::Modal::new(egui::Id::new("connections")).show(ctx, |ui| {
-                    action = m.show(ui, &mut self.conns);
+                let p = theme::palette_for_ctx(ctx);
+                let screen = ctx.content_rect();
+                let size = egui::vec2((screen.width() - 80.0).clamp(640.0, 940.0), (screen.height() - 80.0).clamp(420.0, 680.0));
+                let frame = egui::Frame::new()
+                    .fill(p.content)
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .stroke(ctx.global_style().visuals.window_stroke)
+                    .shadow(ctx.global_style().visuals.window_shadow);
+                let resp = egui::Modal::new(egui::Id::new("connections")).frame(frame).show(ctx, |ui| {
+                    action = m.show(ui, &mut self.conns, size);
                 });
                 match action {
                     Some(conns::Action::Connect { target, label, safe_mode }) if self.shows_other_db(&label) => {
