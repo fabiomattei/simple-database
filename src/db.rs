@@ -957,6 +957,39 @@ fn in_trigger_body(stmt: &str) -> bool {
         && w.last().is_none_or(|x| x != "end")
 }
 
+/// The statement to run for a caret at char offset `caret` of `sql`: the one
+/// whose code starts last at or before the caret, else the first. A caret
+/// after `SELECT 1; -- note` or on the blank line after it picks `SELECT 1`.
+pub fn statement_at(sql: &str, caret: usize) -> Option<String> {
+    let caret = sql.char_indices().nth(caret).map_or(sql.len(), |(b, _)| b);
+    let mut from = 0;
+    let mut found = None;
+    for stmt in split_statements(sql) {
+        let start = sql[from..].find(&stmt).map_or(from, |i| from + i);
+        from = (start + stmt.len()).min(sql.len());
+        if found.is_some() && start + code_offset(&stmt) > caret {
+            break;
+        }
+        found = Some(stmt);
+    }
+    found
+}
+
+/// Bytes of whitespace and comments before a statement's code.
+fn code_offset(stmt: &str) -> usize {
+    let mut rest = stmt;
+    loop {
+        let trimmed = rest.trim_start();
+        rest = if let Some(c) = trimmed.strip_prefix("--") {
+            c.find('\n').map_or("", |i| &c[i..])
+        } else if let Some(c) = trimmed.strip_prefix("/*") {
+            c.find("*/").map_or("", |i| &c[i + 2..])
+        } else {
+            return stmt.len() - trimmed.len();
+        };
+    }
+}
+
 /// The statements of a script, each with the 1-based line its code starts on.
 /// Comment lines before a statement's code are left out.
 pub fn statements_with_lines(sql: &str) -> Vec<(usize, String)> {
@@ -1160,6 +1193,20 @@ mod tests {
         assert!(s[1].ends_with("VALUES (1)"));
         assert!(s[2].contains("$$ SELECT 1; $$"));
         assert_eq!(split_statements("SELECT E'it\\'s;'"), vec!["SELECT E'it\\'s;'"]);
+    }
+
+    #[test]
+    fn finds_the_statement_at_the_caret() {
+        let sql = "SELECT 1; -- one\n\n-- two\nSELECT 2;\n/* three */ SELECT 'é'; SELECT 4";
+        let at = |needle: &str, after: usize| statement_at(sql, sql[..sql.find(needle).unwrap() + after].chars().count());
+        assert_eq!(at("SELECT 1", 0).as_deref(), Some("SELECT 1"));
+        assert_eq!(at("-- one", 6).as_deref(), Some("SELECT 1"));
+        assert_eq!(at("\n\n", 1).as_deref(), Some("SELECT 1"));
+        assert!(at("SELECT 2", 3).unwrap().ends_with("SELECT 2"));
+        assert!(at("'é'", 3).unwrap().ends_with("SELECT 'é'"));
+        assert_eq!(at("SELECT 4", 8).as_deref(), Some("SELECT 4"));
+        assert_eq!(statement_at("  SELECT 9", 0).as_deref(), Some("SELECT 9"));
+        assert_eq!(statement_at("-- nothing", 3), None);
     }
 
     #[test]

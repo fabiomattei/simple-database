@@ -164,7 +164,7 @@ impl App {
                 });
                 match answer {
                     Some(true) => match c.write {
-                        Write::Query => self.run_query(),
+                        Write::Query(sql, part) => self.run_query(sql, part),
                         Write::SaveRows(table, changes) => self.save_rows(table, changes),
                         Write::Seed => self.seed_now(),
                     },
@@ -451,7 +451,7 @@ impl App {
                 let running = st.progress.is_some();
                 if show_results && let Some(out) = st.outcome.take() {
                     let selected = out.results.len() - 1;
-                    self.query_out = Some(QueryOutput { results: Ok(out.results), elapsed: out.elapsed, selected });
+                    self.query_out = Some(QueryOutput { results: Ok(out.results), elapsed: out.elapsed, selected, part: None });
                     self.tab = Tab::Query;
                 } else if running || !(close || resp.should_close()) {
                     self.dialog = Some(Dialog::RunScript(st));

@@ -157,7 +157,8 @@ struct IntegrityState {
 
 /// A write held back until the user confirms it.
 enum Write {
-    Query,
+    /// SQL from the Query tab, and whether it is only part of the editor.
+    Query(String, bool),
     SaveRows(String, Vec<simple_database::data::RowChange>),
     Seed,
 }
@@ -308,6 +309,8 @@ struct QueryOutput {
     results: Result<Vec<QueryResult>, String>,
     elapsed: Duration,
     selected: usize,
+    /// What ran, when it was only part of the editor (the selection or one statement).
+    part: Option<String>,
 }
 
 struct SeedState {

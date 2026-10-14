@@ -59,6 +59,8 @@ pub struct Mark {
 struct Shared {
     goto: Option<usize>,
     caret_line: Option<usize>,
+    /// The last selection (char offsets, in order; equal for a bare caret), kept after focus leaves.
+    selection: Option<(usize, usize)>,
 }
 
 fn shared_id(id_salt: &str) -> egui::Id {
@@ -74,6 +76,12 @@ pub fn goto_line(ctx: &egui::Context, id_salt: &str, line: usize) {
 /// The line (0-based) of the caret of editor `id_salt` while it has focus.
 pub fn caret_line(ctx: &egui::Context, id_salt: &str) -> Option<usize> {
     ctx.data(|d| d.get_temp::<Shared>(shared_id(id_salt))).and_then(|s| s.caret_line)
+}
+
+/// The last selection of editor `id_salt` as char offsets `(start, end)`,
+/// also once it lost focus (e.g. to a Run button); `start == end` for a caret.
+pub fn selection(ctx: &egui::Context, id_salt: &str) -> Option<(usize, usize)> {
+    ctx.data(|d| d.get_temp::<Shared>(shared_id(id_salt))).and_then(|s| s.selection)
 }
 
 /// Consumes a key press with exactly these modifiers (`consume_key` would
@@ -399,6 +407,10 @@ pub fn code_editor(
             (out, backdrop, gutter.left())
         })
         .inner;
+    if let Some(r) = out.cursor_range {
+        let (a, b) = (r.primary.index.0, r.secondary.index.0);
+        shared.selection = Some((a.min(b), a.max(b)));
+    }
     let response = out.response.response;
     let galley = out.galley;
     let origin = out.galley_pos;

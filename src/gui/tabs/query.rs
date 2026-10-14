@@ -2,10 +2,14 @@
 
 use crate::{App, ConfirmWrite, Dialog, MAX_QUERY_ROWS, QueryOutput, RUNNING_QUERY, Write, error_color, from_table, warn_color, editor, grid, highlight::{self, Lang}};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
+use simple_database::db;
 use simple_database::ddl::Dialect;
 use simple_database::history;
 use simple_database::output::{self, ExportFormat};
 use std::time::Instant;
+
+/// The Query tab's editor, for its caret and selection.
+const QUERY_EDITOR: &str = "query_editor";
 
 impl App {
     pub(crate) fn tab_query(&mut self, ui: &mut egui::Ui) {
@@ -14,17 +18,25 @@ impl App {
             return;
         }
         let run_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
+        let run_all_shortcut = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter);
         let running = self.db_running(RUNNING_QUERY);
-        let mut run = ui.input_mut(|i| i.consume_shortcut(&run_shortcut));
+        // Exact modifiers: `consume_shortcut` would take Ctrl+Shift+Enter for Ctrl+Enter.
+        let mut run_all = editor::take_key(ui.ctx(), run_all_shortcut.modifiers, Key::Enter);
+        let mut run = editor::take_key(ui.ctx(), run_shortcut.modifiers, Key::Enter);
         let mut explain = false;
         ui.horizontal(|ui| {
             let button = egui::Button::new(RichText::new("▶ Run").strong());
-            if ui.add_enabled(!running, button).on_hover_text(ui.ctx().format_shortcut(&run_shortcut)).clicked() {
+            let hint = format!("Run the selection, or the statement at the caret ({})", ui.ctx().format_shortcut(&run_shortcut));
+            if ui.add_enabled(!running, button).on_hover_text(hint).clicked() {
                 run = true;
             }
+            let hint = format!("Run every statement in the editor ({})", ui.ctx().format_shortcut(&run_all_shortcut));
+            if ui.add_enabled(!running, egui::Button::new("Run all")).on_hover_text(hint).clicked() {
+                run_all = true;
+            }
             let explain_hint = match self.db.as_ref().map(|d| d.dialect) {
-                Some(Dialect::Sqlite) => "Show the query plan (EXPLAIN QUERY PLAN) without running the query",
-                _ => "Run with EXPLAIN ANALYZE in a transaction that is rolled back: real timings, no changes kept",
+                Some(Dialect::Sqlite) => "Show the plan of the selection, or the statement at the caret (EXPLAIN QUERY PLAN), without running it",
+                _ => "Run the selection, or the statement at the caret, with EXPLAIN ANALYZE in a transaction that is rolled back: real timings, no changes kept",
             };
             explain = ui.add_enabled(!running, egui::Button::new("Explain")).on_hover_text(explain_hint).clicked();
             if running {
@@ -42,7 +54,14 @@ impl App {
             if ui.button("💾 Save query…").clicked() {
                 self.save_name = Some(String::new());
             }
-            ui.label(RichText::new(format!("{} runs all statements", ui.ctx().format_shortcut(&run_shortcut))).weak());
+            ui.label(
+                RichText::new(format!(
+                    "{} runs the statement at the caret · {} runs all",
+                    ui.ctx().format_shortcut(&run_shortcut),
+                    ui.ctx().format_shortcut(&run_all_shortcut)
+                ))
+                .weak(),
+            );
         });
         if let Some(name) = &mut self.save_name {
             let mut save = false;
@@ -79,7 +98,7 @@ impl App {
             egui::Panel::left("query_history").resizable(true).default_size(250.0).min_size(160.0).show(ui, |ui| {
                 if let Some((sql, now)) = self.history_panel(ui) {
                     self.query = sql;
-                    run |= now;
+                    run_all |= now;
                 }
             });
         }
@@ -90,20 +109,26 @@ impl App {
             .show(ui, |ui| {
                 let vocab = self.db.as_ref().map(|d| editor::Vocabulary::from_schema(&d.schema)).unwrap_or_default();
                 egui::ScrollArea::both().id_salt("query_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                    editor::code_editor(ui, &mut self.query, Lang::Sql, "query_editor", 8, &vocab, &[]);
+                    editor::code_editor(ui, &mut self.query, Lang::Sql, QUERY_EDITOR, 8, &vocab, &[]);
                 });
             });
 
         if running {
             // One query at a time; its result replaces the shown one.
-        } else if run {
-            self.request_run();
-        } else if explain {
-            self.explain_query();
+        } else if run_all {
+            self.request_run(self.query.clone(), false);
+        } else if run || explain {
+            let (sql, part) = self.sql_at_caret(ui.ctx());
+            if explain {
+                self.explain_query(sql, part);
+            } else {
+                self.request_run(sql, part);
+            }
         }
 
         let d = self.dialect_of_db();
-        let source = from_table(&self.query).unwrap_or_else(|| "result".into());
+        let ran = self.query_out.as_ref().and_then(|o| o.part.as_deref()).unwrap_or(&self.query);
+        let source = from_table(ran).unwrap_or_else(|| "result".into());
         let mut status = None;
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(out) = &mut self.query_out else {
@@ -117,6 +142,13 @@ impl App {
                 Ok(results) => {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{:.2} ms", out.elapsed.as_secs_f64() * 1000.0)).weak());
+                        if let Some(part) = &out.part {
+                            let first = part.trim().lines().next().unwrap_or_default();
+                            let first: String = if first.chars().count() > 60 { format!("{}…", first.chars().take(60).collect::<String>()) } else { first.to_string() };
+                            ui.label(RichText::new(format!("· {first}")).weak().monospace()).on_hover_ui(|ui| {
+                                highlight::code_view(ui, part.trim(), Lang::Sql);
+                            });
+                        }
                         if results.len() > 1 {
                             ui.separator();
                             for (i, r) in results.iter().enumerate() {
@@ -257,23 +289,35 @@ impl App {
         picked
     }
 
-    /// Run the editor's SQL, asking first if the connection's safe mode wants it.
-    fn request_run(&mut self) {
+    /// What Run and Explain take: the selection if there is one, else the
+    /// statement at the caret; whether that is only part of the editor.
+    fn sql_at_caret(&self, ctx: &egui::Context) -> (String, bool) {
+        let Some((start, end)) = editor::selection(ctx, QUERY_EDITOR) else { return (self.query.clone(), false) };
+        let selected: String = self.query.chars().skip(start).take(end - start).collect();
+        let sql = if selected.trim().is_empty() { db::statement_at(&self.query, start) } else { Some(selected) };
+        match sql {
+            Some(sql) if sql.trim() != self.query.trim() => (sql, true),
+            _ => (self.query.clone(), false),
+        }
+    }
+
+    /// Run `sql`, asking first if the connection's safe mode wants it.
+    fn request_run(&mut self, sql: String, part: bool) {
         let Some(db) = &self.db else { return };
-        let asks = db.safe_mode.confirmations(&self.query, &db.writing_functions);
+        let asks = db.safe_mode.confirmations(&sql, &db.writing_functions);
         if asks.is_empty() {
-            self.run_query();
+            self.run_query(sql, part);
         } else {
             let statements = asks
                 .into_iter()
                 .map(|(s, k)| (s, if let simple_database::safety::Kind::Dangerous(why) = k { Some(why) } else { None }))
                 .collect();
-            self.dialog = Some(Dialog::ConfirmWrite(Box::new(ConfirmWrite { statements, write: Write::Query })));
+            self.dialog = Some(Dialog::ConfirmWrite(Box::new(ConfirmWrite { statements, write: Write::Query(sql, part) })));
         }
     }
 
-    fn explain_query(&mut self) {
-        let sql = self.query.clone();
+    fn explain_query(&mut self, sql: String, part: bool) {
+        let shown = part.then(|| sql.clone());
         self.db_run(
             RUNNING_QUERY,
             move |conn| {
@@ -281,12 +325,12 @@ impl App {
                 let results = conn.explain(&sql).map_err(|e| format!("{e:#}"));
                 (results, start.elapsed())
             },
-            |app, (results, elapsed)| app.query_out = Some(QueryOutput { results, elapsed, selected: 0 }),
+            |app, (results, elapsed)| app.query_out = Some(QueryOutput { results, elapsed, selected: 0, part: shown }),
         );
     }
 
-    pub(crate) fn run_query(&mut self) {
-        let sql = self.query.clone();
+    pub(crate) fn run_query(&mut self, sql: String, part: bool) {
+        let shown = part.then(|| sql.clone());
         self.db_run(
             RUNNING_QUERY,
             move |conn| {
@@ -311,7 +355,7 @@ impl App {
                 let selected = results.as_ref().map_or(0, |rs| {
                     rs.iter().rposition(|r| r.changes.is_none()).unwrap_or(rs.len().saturating_sub(1))
                 });
-                app.query_out = Some(QueryOutput { results, elapsed, selected });
+                app.query_out = Some(QueryOutput { results, elapsed, selected, part: shown });
                 if let Err(e) = app.log.record(entry) {
                     app.set_status(format!("Cannot save query history: {e:#}"), true);
                 }
