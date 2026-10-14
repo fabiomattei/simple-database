@@ -1,8 +1,9 @@
 //! Minimal syntax highlighting for the `.dbs` DSL and SQL.
 
 use eframe::egui::{self, Color32, FontId, TextFormat, text::LayoutJob};
+use std::sync::Arc;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     Dbs,
     Sql,
@@ -72,12 +73,35 @@ fn palette(dark: bool) -> Palette {
     }
 }
 
-pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> LayoutJob {
-    let p = palette(ui.visuals().dark_mode);
+/// `text` highlighted as `lang`. Kept from frame to frame while the text,
+/// language and theme stay the same: an editor lays its text out every frame.
+pub fn highlight(ui: &egui::Ui, text: &str, lang: Lang) -> Arc<LayoutJob> {
+    let dark = ui.visuals().dark_mode;
+    ui.ctx().memory_mut(|m| m.caches.cache::<HighlightCache>().get((text, lang, dark)).clone())
+}
+
+type HighlightCache = egui::cache::FrameCache<Arc<LayoutJob>, Highlighter>;
+
+#[derive(Default)]
+struct Highlighter;
+
+impl egui::cache::ComputerMut<(&str, Lang, bool), Arc<LayoutJob>> for Highlighter {
+    fn compute(&mut self, (text, lang, dark): (&str, Lang, bool)) -> Arc<LayoutJob> {
+        Arc::new(highlight_job(text, lang, dark))
+    }
+}
+
+fn highlight_job(text: &str, lang: Lang, dark: bool) -> LayoutJob {
+    let p = palette(dark);
     let font = FontId::monospace(13.5);
     let mut job = LayoutJob::default();
-    let mut push = |s: &str, color: Color32| {
-        job.append(s, 0.0, TextFormat::simple(font.clone(), color));
+    // Neighbors of one color share a section: fewer for egui to lay out.
+    let mut push = |s: &str, color: Color32| match job.sections.last_mut() {
+        Some(last) if last.format.color == color => {
+            job.text.push_str(s);
+            last.byte_range.end = egui::text::ByteIndex(job.text.len());
+        }
+        _ => job.append(s, 0.0, TextFormat::simple(font.clone(), color)),
     };
 
     let bytes = text.as_bytes();
@@ -168,4 +192,36 @@ pub fn code_view(ui: &mut egui::Ui, text: &str, lang: Lang) {
     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
         ui.add(egui::Label::new(job).selectable(true).wrap_mode(egui::TextWrapMode::Extend));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neighbors_of_one_color_share_a_section() {
+        let text = "select a, b from t where x = 'it''s' -- done\nupdate t set y = 1;\n";
+        let job = highlight_job(text, Lang::Sql, true);
+        assert_eq!(job.text, text);
+        let p = palette(true);
+        let parts: Vec<(&str, Color32)> = job.sections.iter().map(|s| (&job.text[s.byte_range.start.0..s.byte_range.end.0], s.format.color)).collect();
+        assert!(parts.windows(2).all(|w| w[0].1 != w[1].1), "{parts:?}");
+        assert_eq!(parts.iter().map(|p| p.0).collect::<String>(), text);
+        assert!(parts.contains(&(" a", p.plain)) && parts.contains(&("'it''s'", p.string)) && parts.contains(&("-- done", p.comment)));
+    }
+
+    #[test]
+    fn highlighting_is_kept_while_the_text_stays() {
+        let ctx = egui::Context::default();
+        let frame = |text: &str, lang: Lang| {
+            let mut job = None;
+            let mut out = ctx.run_ui(Default::default(), |ui| job = Some(highlight(ui, text, lang)));
+            out.textures_delta.clear();
+            job.unwrap()
+        };
+        let first = frame("table t { id int pk }", Lang::Dbs);
+        assert!(Arc::ptr_eq(&first, &frame("table t { id int pk }", Lang::Dbs)));
+        assert!(!Arc::ptr_eq(&first, &frame("table t { id int pk }", Lang::Sql)));
+        assert!(!Arc::ptr_eq(&first, &frame("table t { id bigint pk }", Lang::Dbs)));
+    }
 }

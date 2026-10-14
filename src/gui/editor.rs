@@ -378,7 +378,7 @@ pub fn code_editor(
     }
 
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
-        let mut job = highlight::highlight(ui, buf.as_str(), lang);
+        let mut job = (*highlight::highlight(ui, buf.as_str(), lang)).clone();
         job.wrap.max_width = f32::INFINITY;
         ui.fonts_mut(|f| f.layout_job(job))
     };
