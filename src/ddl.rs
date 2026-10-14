@@ -32,7 +32,7 @@ pub fn quote(name: &str, d: Dialect) -> String {
     }
 }
 
-fn quote_list(cols: &[String], d: Dialect) -> String {
+pub fn quote_list(cols: &[String], d: Dialect) -> String {
     cols.iter().map(|c| quote(c, d)).collect::<Vec<_>>().join(", ")
 }
 
@@ -231,6 +231,11 @@ pub fn canonical_table(t: &Table, d: Dialect) -> Table {
         c.was.clear();
     }
     if d == Dialect::Sqlite {
+        // AUTOINCREMENT needs exactly INTEGER PRIMARY KEY.
+        let single_pk = t.composite_pk.is_empty();
+        for c in t.columns.iter_mut().filter(|c| single_pk && c.primary_key && c.auto_increment && c.data_type.is_integer()) {
+            c.data_type = DataType::Int;
+        }
         return t;
     }
     let keyed: Vec<String> = t.indexes.iter().flat_map(|i| i.columns.clone()).collect();

@@ -1053,6 +1053,8 @@ mod tests {
         let edited_src = src.replace("('new', 'old')", "('new', 'old', 'gone')").replace("default 0.5", "default 0.25");
         live_renames(&mut db, &edited_src);
         drop_all(&mut db);
+        live_key_changes(&mut db);
+        drop_all(&mut db);
         assert!(db.introspect().unwrap().tables.is_empty());
     }
 
@@ -1108,6 +1110,65 @@ mod tests {
         db.apply_migration(&m).unwrap_or_else(|e| panic!("{e:#}\n{}", m.script()));
         let current = db.introspect().unwrap();
         assert!(db.migration(&current, &unlinked).is_empty());
+    }
+
+    /// Primary keys and identities change in place, keeping rows and ids.
+    fn live_key_changes(db: &mut Database) {
+        let count = |db: &mut Database, sql: &str| db.query_value(&format!("SELECT count(*) FROM {sql}")).unwrap();
+        let steps = [
+            // Start: no key, a plain key, a composite key.
+            "table logs { msg text }\ntable codes { id int pk\n name text }\ntable pairs { a int not null\n b int not null\n c int not null\n pk (a, b) }\n\
+             table moves { a int pk\n b int not null unique }",
+            // A new identity key on a table with rows; an identity on a key with rows;
+            // a wider composite key; the key moving to another column.
+            "table logs { id int pk autoincrement\n msg text }\ntable codes { id int pk autoincrement\n name text }\n\
+             table pairs { a int not null\n b int not null\n c int not null\n pk (a, b, c) }\ntable moves { a int not null unique\n b int pk }",
+            // A wider identity type keeps the identity.
+            "table logs { id bigint pk autoincrement\n msg text }\ntable codes { id int pk autoincrement\n name text }\n\
+             table pairs { a int not null\n b int not null\n c int not null\n pk (a, b, c) }\ntable moves { a int not null unique\n b int pk }",
+            // The identity goes; then the key too.
+            "table logs { id bigint pk\n msg text }\ntable codes { id int\n name text }\n\
+             table pairs { a int not null\n b int not null\n c int not null\n pk (a, b, c) }\ntable moves { a int not null unique\n b int pk }",
+        ];
+        for (i, src) in steps.iter().enumerate() {
+            let desired = parse(src).unwrap();
+            let current = db.introspect().unwrap();
+            let m = db.migration(&current, &desired);
+            assert!(m.warnings.is_empty(), "step {i}: {:?}", m.warnings);
+            db.apply_migration(&m).unwrap_or_else(|e| panic!("step {i}: {e:#}\n{}", m.script()));
+            let current = db.introspect().unwrap();
+            let again = db.migration(&current, &desired);
+            assert!(again.is_empty(), "step {i}: {:?}\n{}", again.changes, again.script());
+            match i {
+                0 => db
+                    .run("INSERT INTO logs (msg) VALUES ('a'), ('b'), ('c'); INSERT INTO codes (id, name) VALUES (1, 'x'), (5, 'y'); \
+                          INSERT INTO pairs VALUES (1, 1, 1), (1, 2, 1); INSERT INTO moves VALUES (1, 10), (2, 20)")
+                    .map(drop)
+                    .unwrap(),
+                1 => {
+                    assert_eq!(count(db, "logs WHERE id IS NOT NULL"), Cell::Int(3), "existing rows got ids");
+                    db.run("INSERT INTO logs (msg) VALUES ('d'); INSERT INTO codes (name) VALUES ('z'); INSERT INTO pairs VALUES (1, 1, 2)").unwrap();
+                    assert_eq!(count(db, "codes WHERE id > 5"), Cell::Int(1), "the identity counts on from the ids there");
+                    assert_eq!(count(db, "logs"), Cell::Int(4));
+                    assert!(db.run("INSERT INTO moves VALUES (3, 10)").is_err(), "b is the key now");
+                    db.run("INSERT INTO moves VALUES (1, 30)").unwrap_err();
+                }
+                2 => db.run("INSERT INTO logs (msg) VALUES ('e')").map(drop).unwrap(),
+                _ => {
+                    assert_eq!(count(db, "logs"), Cell::Int(5));
+                    // SQLite lets a key that isn't the rowid be NULL.
+                    if db.dialect() != Dialect::Sqlite {
+                        assert!(db.run("INSERT INTO logs (msg) VALUES ('f')").is_err(), "no identity, no id");
+                    }
+                    db.run("INSERT INTO codes (id, name) VALUES (1, 'dup')").unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_key_changes() {
+        live_key_changes(&mut Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t"));
     }
 
     #[test]
