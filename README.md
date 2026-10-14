@@ -241,6 +241,7 @@ certificate comes from a private CA, pass it with `sslrootcert`:
 |---|---|
 | `sdb init [path]` | Create a starter schema |
 | `sdb check SCHEMA` | Validate, and lint the design: missing primary keys, unindexed foreign keys, FK type mismatches, `SET NULL` on `NOT NULL` columns, etc. |
+| `sdb check [SCHEMA] --db app.db [--sample 5]` | Find rows whose foreign key points at a row that doesn't exist (see below) |
 | `sdb fmt SCHEMA [-w]` | Reformat with aligned columns |
 | `sdb sql SCHEMA -d sqlite\|postgres\|mysql` | Generate DDL (tables in dependency order) |
 | `sdb diagram SCHEMA -f mermaid\|dot` | ER diagram: paste Mermaid into GitHub/GitLab markdown, or `\| dot -Tsvg > er.svg` |
@@ -346,6 +347,20 @@ off during the restore (MySQL), so row order doesn't matter. MySQL commits each 
 on its own, so a failure there leaves the statements before it applied. Check expressions are
 dumped as the server spells them, so a check rewritten by Postgres (`= ANY (ARRAY[...])`) may
 not load into SQLite or MySQL. In the app: **File → Dump database…** and **Restore dump…**.
+
+### Checking foreign keys
+
+`sdb check --db app.db` looks for orphaned rows: rows whose foreign key points at a parent row
+that doesn't exist. They get in when the database doesn't enforce the key (SQLite connections
+that never turned on `PRAGMA foreign_keys`, MySQL MyISAM tables), when checks were off during a
+load, or when the key was never declared. Each foreign key is checked with one query; a row
+with a NULL in any key column references nothing and is fine. The output lists the broken keys
+with their row counts and the first rows (`--sample N`, 0 for none), and the command exits with
+1 if there is anything, so it works as a CI step. With a schema file (`sdb check schema.dbs
+--db app.db`) the schema is validated first and its foreign keys are the ones checked, including
+keys that exist only in the `.dbs`. In the app: **File → Check foreign keys…** lists the broken
+keys; **Show rows** opens the orphaned rows in the Data tab, filtered with a WHERE condition you
+can edit or clear.
 
 ### Typical workflow
 

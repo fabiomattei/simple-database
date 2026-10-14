@@ -63,6 +63,13 @@ impl App {
                 if ui.add_enabled(self.db.is_some(), egui::Button::new("Run SQL file…")).on_hover_text("Run a .sql script against the open database").clicked() {
                     self.pick_script();
                 }
+                if ui
+                    .add_enabled(self.db.is_some(), egui::Button::new("Check foreign keys…"))
+                    .on_hover_text("Find rows whose foreign key points at a row that doesn't exist")
+                    .clicked()
+                {
+                    self.check_integrity();
+                }
                 let writable = self.db.as_ref().is_some_and(|d| d.safe_mode != SafeMode::ReadOnly);
                 if ui.add_enabled(writable, egui::Button::new("Restore dump…")).on_hover_text("Run a SQL dump file against the open database").clicked() {
                     self.pick_restore();

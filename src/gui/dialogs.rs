@@ -509,6 +509,74 @@ impl App {
                 }
                 skip || resp.should_close()
             }
+            Dialog::Integrity(st) => {
+                let report = st.report.clone();
+                let mut show = None;
+                let mut again = false;
+                let resp = egui::Modal::new(egui::Id::new("integrity")).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading("Foreign key check");
+                    ui.label(RichText::new("Rows whose foreign key points at a row that doesn't exist.").weak());
+                    ui.add_space(6.0);
+                    match &report {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking…");
+                            });
+                        }
+                        Some(Err(e)) => {
+                            ui.colored_label(error_color(ui), e);
+                        }
+                        Some(Ok(r)) if r.is_clean() => {
+                            ui.colored_label(ok_color(ui), format!("✔ {} foreign key(s) checked: no orphaned rows.", r.checked));
+                        }
+                        Some(Ok(r)) => {
+                            ui.label(format!("{} foreign key(s) checked, {} with problems:", r.checked, r.problems.len()));
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                                egui::Grid::new("orphans").num_columns(3).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
+                                    for o in &r.problems {
+                                        ui.label(RichText::new(o.describe()).monospace());
+                                        match &o.error {
+                                            Some(e) => {
+                                                ui.colored_label(warn_color(ui), "check failed").on_hover_text(e);
+                                                ui.label("");
+                                            }
+                                            None => {
+                                                ui.colored_label(error_color(ui), format!("{} row(s)", o.count));
+                                                if ui.button("Show rows").on_hover_text("Open them in the Data tab").clicked() {
+                                                    show = Some((o.table.clone(), o.condition.clone()));
+                                                }
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(report.is_some(), egui::Button::new("Check again")).clicked() {
+                            again = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            self.dialog = None;
+                        }
+                    });
+                });
+                if let Some((table, condition)) = show {
+                    self.dialog = None;
+                    self.open_table_where(table, condition);
+                    return;
+                }
+                if again {
+                    self.check_integrity();
+                    return;
+                }
+                resp.should_close()
+            }
             Dialog::Example => {
                 let resp = egui::Modal::new(egui::Id::new("example")).show(ctx, |ui| {
                     ui.set_width(620.0);

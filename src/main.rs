@@ -30,8 +30,21 @@ enum Command {
         #[arg(default_value = "schema.dbs")]
         path: PathBuf,
     },
-    /// Validate a schema and lint it for design problems
-    Check { schema: PathBuf },
+    /// Validate a schema, or check a database's rows for broken foreign keys
+    ///
+    /// With --db, every foreign key is checked for rows pointing at a parent
+    /// row that doesn't exist. The keys come from SCHEMA when given (so keys the
+    /// database doesn't enforce are checked too), else from the database.
+    #[command(arg_required_else_help = true)]
+    Check {
+        schema: Option<PathBuf>,
+        /// Database whose rows to check
+        #[arg(long)]
+        db: Option<String>,
+        /// Orphaned rows to show per foreign key
+        #[arg(long, default_value_t = 5)]
+        sample: usize,
+    },
     /// Reformat a schema file (prints to stdout unless --write)
     Fmt {
         schema: PathBuf,
@@ -274,13 +287,31 @@ fn run(cli: Cli) -> Result<()> {
             println!("  sdb diagram {}", path.display());
             println!("  sdb push {} --db app.db", path.display());
         }
-        Command::Check { schema } => {
-            let s = load_schema(&schema)?;
-            let issues = validate::validate(&s);
-            print_issues(&issues);
-            let cols: usize = s.tables.iter().map(|t| t.columns.len()).sum();
-            println!("{} tables, {cols} columns", s.tables.len());
-            if issues.iter().any(|i| i.severity == Severity::Error) {
+        Command::Check { schema, db, sample } => {
+            let mut failed = false;
+            let s = match &schema {
+                Some(path) => {
+                    let s = load_schema(path)?;
+                    let issues = validate::validate(&s);
+                    print_issues(&issues);
+                    let cols: usize = s.tables.iter().map(|t| t.columns.len()).sum();
+                    println!("{} tables, {cols} columns", s.tables.len());
+                    failed = issues.iter().any(|i| i.severity == Severity::Error);
+                    Some(s)
+                }
+                None => None,
+            };
+            if let Some(target) = &db {
+                let mut db = open_existing(target)?;
+                let s = match s {
+                    Some(s) => s,
+                    None => db.introspect()?,
+                };
+                let report = integrity::check_foreign_keys(&mut db, &s, sample)?;
+                print_integrity(&report);
+                failed |= !report.is_clean();
+            }
+            if failed {
                 std::process::exit(1);
             }
         }
@@ -664,6 +695,27 @@ fn emit(output: Option<&Path>, text: &str) -> Result<()> {
         None => print!("{text}"),
     }
     Ok(())
+}
+
+fn print_integrity(r: &integrity::Report) {
+    for o in &r.problems {
+        match &o.error {
+            Some(e) => println!("\x1b[31merror\x1b[0m {}: {e}", o.describe()),
+            None => println!("\x1b[31m{} orphaned row(s)\x1b[0m in {}", o.count, o.describe()),
+        }
+        if let Some(sample) = &o.sample {
+            println!("{}", output::render(sample, OutputFormat::Table));
+            if o.count > sample.rows.len() as i64 {
+                println!("\x1b[2m… and {} more\x1b[0m", o.count - sample.rows.len() as i64);
+            }
+        }
+    }
+    let bad = r.problems.len();
+    if bad == 0 {
+        println!("{} foreign key(s) checked: no orphaned rows.", r.checked);
+    } else {
+        println!("{} foreign key(s) checked: {bad} with problems.", r.checked);
+    }
 }
 
 fn print_changes(m: &diff::Migration) {

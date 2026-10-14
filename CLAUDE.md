@@ -53,6 +53,7 @@ Core library (`src/`, exported from `lib.rs`):
 | `data.rs` | Data tab logic: `View` (filters, raw WHERE, sort → `page_sql` / `count_sql` / `all_sql`), `literal` (a `Cell` as SQL for a column type; checks text against the type), `RowChange` (staged update/insert/delete by primary key) |
 | `safety.rs` | `SafeMode` (off / warn / confirm / read-only) and `classify` (read, write, dangerous) over comment- and string-free words with their parenthesis depth. In read-only mode it is the only client-side gate, so anything that could lift the server-side read-only setting (`SET … READ WRITE`, `BEGIN READ WRITE`, `PRAGMA query_only(0)`, Postgres `set_config(...)` anywhere) or write from a "read" (`SELECT … INTO`, `PRAGMA x(v)`) must classify as a write |
 | `history.rs` | `QueryLog`: query history (`history.json`, 500 entries, 0600) and saved queries (`queries.json`) in `config_dir()` |
+| `integrity.rs` | `check_foreign_keys`: orphaned rows (a foreign key with no parent row), one `NOT EXISTS` count per key of a `Schema`; `orphan_condition` is also the Data tab's WHERE for **Show rows** (CLI `check --db`, GUI File → Check foreign keys) |
 | `import.rs` | CSV/TSV/JSON/JSONL → `Rows`, `plan` (match columns by name), batched INSERTs, `import` in one transaction |
 | `dump.rs` | `dump` a database to SQL (DDL in dependency order, batched INSERTs, Postgres `setval`; any target dialect); `prepare` + `restore` run a dump file through `write_statements` (BEGIN/COMMIT dropped, `--clean` drops existing tables, SQLite defers FKs, MySQL turns FK checks off) |
 | `discover.rs` | Find databases in a project folder: `.env` URLs and Laravel `DB_*`, compose services (lenient line-based YAML scan), Prisma datasource |
@@ -75,7 +76,7 @@ Binaries:
 | `src/gui/tabs/*.rs` | One file per tab (`schema`, `diagram`, `sql`, `migrate`, `query`, `data`, `seed`): its `tab_*` method and the actions that belong to it (e.g. `migration_for`, `run_query`, `load_data`) |
 | `src/gui/panels.rs` | Menu bar, sidebar and status bar |
 | `src/gui/dialogs.rs` | The modal `Dialog`s |
-| `src/gui/file_menu.rs` | File menu actions on the database: dump, restore, run SQL file |
+| `src/gui/file_menu.rs` | File menu actions on the database: dump, restore, run SQL file, check foreign keys (`Dialog::Integrity`) |
 | `src/gui/er.rs` | ER diagram canvas painted by hand (drag, pan, zoom). `ErAction::OpenData` opens a table in the Data tab (`App::open_table_data`, shared with the sidebar). When editable, `ui` returns `ErAction`s (context menu, double-click, drag a column handle to link) that `App::diagram_action` applies via `format::patch_renamed` |
 | `src/gui/er_layout.rs` | Where table boxes go, pure and unit-tested: `layout` (connected groups in FK-depth layers, barycenter ordering, tall layers wrapped, groups shelf-packed, loners last), `place` (one new box in free space next to its related tables), `separate` (remove overlaps; `pinned` boxes stay, used when a box grows) |
 | `src/gui/table_edit.rs` | Diagram's table editor dialog: column grid → DSL lines → `parser::parse`, renames via `Schema::rename_table` / `rename_column`; refuses edits that add validation errors |

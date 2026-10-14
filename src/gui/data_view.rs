@@ -289,6 +289,20 @@ impl DataView {
         self.table = table;
     }
 
+    /// Show only the rows matching `where_sql`, from the first page. Refused
+    /// (false) while changes are pending.
+    pub fn filter_where(&mut self, where_sql: String) -> bool {
+        if self.pending() > 0 {
+            return false;
+        }
+        self.view = View { where_sql, sort: self.view.sort.clone(), ..View::default() };
+        self.draft = self.view.clone();
+        self.show_filters = true;
+        self.page = 0;
+        self.reset();
+        true
+    }
+
     /// Forget the loaded page and staged changes; the next frame reloads.
     pub fn reset(&mut self) {
         self.out = None;

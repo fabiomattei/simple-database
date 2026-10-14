@@ -384,3 +384,20 @@ fn server_pipeline(url: &str, name: &str) {
 
     s.ok(&["push", empty, "--db", url, "-y"]);
 }
+
+#[test]
+fn check_finds_orphaned_rows() {
+    let s = Scratch::new("check-orphans");
+    s.ok(&["init"]);
+    s.ok(&["push", "schema.dbs", "--db", "app.db", "-y"]);
+    s.ok(&["seed", "--db", "app.db", "-n", "3", "--seed", "1"]);
+    assert!(s.ok(&["check", "--db", "app.db"]).contains("no orphaned rows"));
+
+    s.ok(&["query", "--db", "app.db", "PRAGMA foreign_keys = OFF; UPDATE posts SET author_id = 999 WHERE id = 1"]);
+    let out = s.fails(&["check", "--db", "app.db"]);
+    assert!(out.contains("1 orphaned row(s)") && out.contains("posts (author_id) -> users (id)"), "{out}");
+    assert!(out.contains("999"), "the orphaned row is shown:\n{out}");
+    // With the schema file: validated, then its foreign keys checked.
+    let out = s.fails(&["check", "schema.dbs", "--db", "app.db", "--sample", "0"]);
+    assert!(out.contains("4 tables") && out.contains("1 with problems") && !out.contains("999"), "{out}");
+}

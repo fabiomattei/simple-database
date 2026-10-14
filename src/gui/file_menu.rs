@@ -1,14 +1,43 @@
-//! File menu actions on the open database: dump, restore and running SQL files.
+//! File menu actions on the open database: dump, restore, running SQL files
+//! and checking foreign keys.
 
-use crate::{App, Dialog, MAX_QUERY_ROWS, MAX_SCRIPT_RESULTS, RestoreState, ScriptOutcome, ScriptState};
+use crate::{App, Dialog, IntegrityState, MAX_QUERY_ROWS, MAX_SCRIPT_RESULTS, RestoreState, ScriptOutcome, ScriptState};
 use simple_database::db;
 use simple_database::dump;
+use simple_database::integrity;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 impl App {
+    /// Look for rows whose foreign key points at a missing parent row, showing
+    /// the outcome in the Integrity dialog.
+    pub(crate) fn check_integrity(&mut self) {
+        let Some(db) = &self.db else { return };
+        let (label, schema) = (db.label.clone(), db.schema.clone());
+        self.dialog = Some(Dialog::Integrity(Box::new(IntegrityState { db: label.clone(), report: None })));
+        self.db_run(
+            "Checking foreign keys",
+            move |conn| integrity::check_foreign_keys(conn, &schema, 0).map_err(|e| format!("{e:#}")),
+            move |app, res| {
+                if let Some(Dialog::Integrity(st)) = &mut app.dialog
+                    && st.db == label
+                {
+                    st.report = Some(res);
+                }
+            },
+        );
+    }
+
+    /// Open `table` in the Data tab showing only the rows matching `condition`.
+    pub(crate) fn open_table_where(&mut self, table: String, condition: String) {
+        self.open_table_data(table.clone());
+        if !self.data.current_mut().is_some_and(|v| v.filter_where(condition)) {
+            self.set_status(format!("{table} has unsaved changes; save or discard them to filter it"), true);
+        }
+    }
+
     /// Save the open database as a SQL dump in its own dialect.
     pub(crate) fn dump_db(&mut self) {
         let Some(db) = &self.db else { return };

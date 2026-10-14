@@ -143,6 +143,13 @@ enum Dialog {
     Import(Box<ImportState>),
     Restore(Box<RestoreState>),
     RunScript(Box<ScriptState>),
+    Integrity(Box<IntegrityState>),
+}
+
+/// The foreign key check of the database `db`; `report` is None while it runs.
+struct IntegrityState {
+    db: String,
+    report: Option<Result<simple_database::integrity::Report, String>>,
 }
 
 /// A write held back until the user confirms it.
