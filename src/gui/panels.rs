@@ -106,6 +106,13 @@ impl App {
                 if ui.button("Example schema").clicked() {
                     self.dialog = Some(Dialog::Example);
                 }
+                #[cfg(target_os = "linux")]
+                if ui.button("Add to applications menu").on_hover_text("Install a .desktop file and the icon, which Wayland needs to show it").clicked() {
+                    match crate::desktop_entry::install() {
+                        Ok(entry) => self.set_status(format!("Installed {}", entry.display()), false),
+                        Err(e) => self.set_status(format!("Could not add to the applications menu: {e}"), true),
+                    }
+                }
             });
         });
     }

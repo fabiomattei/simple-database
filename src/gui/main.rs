@@ -6,6 +6,7 @@
 mod conns;
 mod data_view;
 mod date_edit;
+mod desktop_entry;
 mod dialogs;
 mod editor;
 mod er;
@@ -48,14 +49,16 @@ const SETTINGS_KEY: &str = "sdb-gui";
 const SCHEMA_EDITOR: &str = "schema_editor";
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("sdb — database designer")
-            .with_app_id("sdb-gui")
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([760.0, 480.0]),
-        ..Default::default()
-    };
+    // Wayland ignores the icon and shows the one of the `.desktop` file named after the app id.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("sdb — database designer")
+        .with_app_id(desktop_entry::APP_ID)
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([760.0, 480.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(desktop_entry::APP_ICON_PNG) {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("sdb-gui", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
