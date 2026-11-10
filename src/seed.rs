@@ -51,7 +51,8 @@ const BATCH: usize = 100;
 
 pub fn seed(db: &mut Database, opts: &SeedOptions) -> Result<Vec<TableReport>> {
     db.ensure_writable()?;
-    let schema = db.introspect()?;
+    let mut schema = db.introspect()?;
+    schema.tables.retain(|t| t.name != crate::migrations::HISTORY_TABLE);
     for name in opts.only.iter().chain(opts.counts.keys()) {
         anyhow::ensure!(schema.table(name).is_some(), "no such table: {name}");
     }

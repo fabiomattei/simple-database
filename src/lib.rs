@@ -15,6 +15,7 @@ pub mod framework;
 pub mod history;
 pub mod import;
 pub mod integrity;
+pub mod migrations;
 pub mod mysqldb;
 pub mod output;
 pub mod parser;

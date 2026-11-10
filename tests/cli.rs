@@ -513,3 +513,56 @@ fn imports_more_rows_than_one_insert_holds() {
     s.fails(&["import", "--db", "app.db", "again.csv", "-t", "tags", "-y"]);
     assert_eq!(s.count("app.db", "tags"), 1234);
 }
+
+#[test]
+fn migration_files_up_status_down() {
+    let s = Scratch::new("migration-files");
+    s.ok(&["init", "schema.dbs"]);
+    assert!(s.fails(&["migrate", "new", "schema.dbs"]).contains("--dialect"));
+    assert!(s.ok(&["migrate", "new", "schema.dbs", "-d", "sqlite"]).contains("0001_initial_schema.sql"));
+    assert!(s.ok(&["migrate", "new", "schema.dbs"]).contains("No changes"));
+    s.ok(&["migrate", "up", "--db", "app.db", "-y"]);
+    s.ok(&["seed", "--db", "app.db", "-n", "5", "--seed", "1", "-y"]);
+    assert_eq!(s.count("app.db", "_sdb_migrations"), 1, "seed leaves the history alone");
+    let push = s.ok(&["push", "schema.dbs", "--db", "app.db", "--dry-run"]);
+    assert!(push.contains("already up to date") && push.contains("managed by migration files"), "{push}");
+    assert!(!s.ok(&["pull", "--db", "app.db"]).contains("table _sdb_migrations {"));
+
+    s.edit("schema.dbs", "  title       text       not null", "  headline text not null was title");
+    s.ok(&["migrate", "new", "schema.dbs", "--name", "headline"]);
+    s.ok(&["migrate", "new", "--empty", "--name", "backfill"]);
+    let status = s.ok(&["migrate", "status", "--db", "app.db"]);
+    assert!(status.contains("applied   0001_initial_schema") && status.contains("pending   0003_backfill") && status.contains("1 applied, 2 pending"), "{status}");
+    assert!(s.ok(&["migrate", "up", "--db", "app.db", "--dry-run"]).contains("RENAME COLUMN title TO headline"));
+    s.ok(&["migrate", "up", "--db", "app.db", "--to", "0002", "-y"]);
+    assert!(s.ok(&["push", "schema.dbs", "--db", "app.db", "--dry-run"]).contains("already up to date"));
+    s.ok(&["migrate", "up", "--db", "app.db", "-y"]);
+    assert_eq!(s.count("app.db", "_sdb_migrations"), 3);
+
+    // The empty migration has no way back, so nothing is rolled back.
+    assert!(s.fails(&["migrate", "down", "--db", "app.db", "-n", "2", "-y"]).contains("no down section"));
+    let backfill = std::path::Path::new("migrations").join("0003_backfill.sql");
+    s.edit(&backfill.to_string_lossy(), "-- sdb:down\n", "-- sdb:down\nSELECT 1;\n");
+    let down = s.ok(&["migrate", "down", "--db", "app.db", "-n", "2", "-y"]);
+    assert!(down.contains("Rolled back 0003_backfill") && down.contains("Rolled back 0002_headline"), "{down}");
+    assert!(s.ok(&["migrate", "status", "--db", "app.db"]).contains("1 applied, 2 pending"));
+    assert_eq!(s.count("app.db", "posts"), 5, "rows survive");
+}
+
+#[test]
+fn diff_down_and_push_step() {
+    let s = Scratch::new("down-step");
+    std::fs::write(s.path("a.dbs"), "table people { id int pk\n full_name text }\n").unwrap();
+    std::fs::write(s.path("b.dbs"), "table users was people { id int pk\n name text was full_name\n age int }\n").unwrap();
+    let down = s.ok(&["diff", "a.dbs", "b.dbs", "--down"]);
+    assert!(down.contains("ALTER TABLE users RENAME TO people;") && down.contains("DROP COLUMN age"), "{down}");
+    s.fails(&["diff", "a.dbs", "b.dbs", "--down", "-f", "rails"]);
+
+    s.ok(&["push", "a.dbs", "--db", "app.db", "-y"]);
+    let out = s.run_with_input(&["push", "b.dbs", "--db", "app.db", "--step"], "y\nn\n");
+    let text = output_text(&out);
+    assert!(!out.status.success() && text.contains("-- statement 2") && text.contains("rolled back"), "{text}");
+    assert!(s.ok(&["push", "a.dbs", "--db", "app.db", "--dry-run"]).contains("already up to date"), "nothing applied");
+    s.run_with_input(&["push", "b.dbs", "--db", "app.db", "--step"], "y\ny\ny\n");
+    assert!(s.ok(&["push", "b.dbs", "--db", "app.db", "--dry-run"]).contains("already up to date"));
+}

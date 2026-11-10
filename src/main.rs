@@ -87,6 +87,9 @@ enum Command {
         /// The ActiveRecord::Migration[...] version of a rails migration
         #[arg(long, default_value = "8.0")]
         rails_version: String,
+        /// Write the way back instead: TO turned into FROM, renames undone
+        #[arg(long)]
+        down: bool,
     },
     /// Migrate a database to match a schema file
     Push {
@@ -103,7 +106,18 @@ enum Command {
         /// Apply even when rows in the database would make the migration fail
         #[arg(long)]
         force: bool,
+        /// Show each statement and ask before running it (on MySQL, each one commits on its own)
+        #[arg(long, conflicts_with = "yes")]
+        step: bool,
     },
+    /// Versioned migration files, and the record of those a database has
+    ///
+    /// `migrate new` writes the next file (`migrations/0002_add_tags.sql`) from
+    /// what changed in a schema since the last one, with an up and a down
+    /// section. `migrate up` applies the files a database hasn't had yet and
+    /// records them in its `_sdb_migrations` table.
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
     /// Reverse-engineer a schema file from a database
     Pull {
         #[arg(long)]
@@ -239,6 +253,73 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum MigrateCommand {
+    /// Write the next migration file from what changed in SCHEMA since the last one
+    New {
+        /// The schema the migrations lead to (not needed with --empty)
+        #[arg(required_unless_present = "empty")]
+        schema: Option<PathBuf>,
+        #[arg(long, default_value = "migrations")]
+        dir: PathBuf,
+        /// Database the SQL is for; needed for the first migration, then kept in the directory's snapshot.dbs
+        #[arg(short, long, value_enum)]
+        dialect: Option<Dialect>,
+        /// File name after the number (default: from the changes)
+        #[arg(long)]
+        name: Option<String>,
+        /// Write a file with empty sections to fill in by hand (e.g. moving data)
+        #[arg(long, conflicts_with = "schema", requires = "name")]
+        empty: bool,
+    },
+    /// Apply the migrations the database hasn't had, oldest first
+    Up {
+        #[arg(long)]
+        db: String,
+        #[arg(long, default_value = "migrations")]
+        dir: PathBuf,
+        /// Stop after this version
+        #[arg(long)]
+        to: Option<String>,
+        /// Only print the SQL
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short, long)]
+        yes: bool,
+        /// Show each statement and ask before running it
+        #[arg(long, conflicts_with = "yes")]
+        step: bool,
+        /// Record the migrations as applied without running them (a database that already has them)
+        #[arg(long, conflicts_with_all = ["dry_run", "step"])]
+        record_only: bool,
+    },
+    /// Roll back the latest applied migrations with their down sections
+    Down {
+        #[arg(long)]
+        db: String,
+        #[arg(long, default_value = "migrations")]
+        dir: PathBuf,
+        /// How many migrations to roll back
+        #[arg(short = 'n', long, default_value_t = 1)]
+        steps: usize,
+        /// Only print the SQL
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short, long)]
+        yes: bool,
+        /// Show each statement and ask before running it
+        #[arg(long, conflicts_with = "yes")]
+        step: bool,
+    },
+    /// List the migrations and whether the database has them
+    Status {
+        #[arg(long)]
+        db: String,
+        #[arg(long, default_value = "migrations")]
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConnCommand {
     /// List saved connections
     List,
@@ -360,7 +441,7 @@ fn run(cli: Cli) -> Result<()> {
             let s = load_schema(&schema)?;
             emit(output.as_deref(), &diagram::render(&s, format))?;
         }
-        Command::Diff { from, to, dialect, output, format, name, rails_version } => {
+        Command::Diff { from, to, dialect, output, format, name, rails_version, down } => {
             let old = load_schema(&from)?;
             let new = load_valid_schema(&to)?;
             let fw = match format {
@@ -369,10 +450,13 @@ fn run(cli: Cli) -> Result<()> {
                 DiffFormat::Rails => Some(framework::Framework::Rails),
             };
             if let Some(fw) = fw {
+                if down {
+                    bail!("--down is for SQL: a {} migration has its down part already", fw.label());
+                }
                 let opts = framework::Options { name, rails_version, ..Default::default() };
                 return write_framework_migration(framework::generate(&old, &new, dialect, fw, &opts), output.as_deref());
             }
-            let m = diff::diff(&old, &new, dialect);
+            let m = if down { diff::down(&old, &new, dialect) } else { diff::diff(&old, &new, dialect) };
             if m.is_empty() {
                 eprintln!("Schemas are identical.");
                 return Ok(());
@@ -386,10 +470,18 @@ fn run(cli: Cli) -> Result<()> {
                 None => print!("\n{}", m.script()),
             }
         }
-        Command::Push { schema, db, dry_run, yes, force } => {
+        Command::Push { schema, db, dry_run, yes, force, step } => {
             let desired = load_valid_schema(&schema)?;
             let mut db = open_db(&db)?;
             let current = db.introspect()?;
+            if current.table(migrations::HISTORY_TABLE).is_some() {
+                eprintln!(
+                    "{} {} is managed by migration files ({} table); push changes it without them",
+                    Paint::Yellow.err("warning:"),
+                    db.label(),
+                    migrations::HISTORY_TABLE
+                );
+            }
             let m = db.migration(&current, &desired);
             if m.is_empty() {
                 println!("Database is already up to date.");
@@ -407,15 +499,19 @@ fn run(cli: Cli) -> Result<()> {
             if !problems.is_empty() && !force {
                 bail!("the migration would fail on the rows above; fix them first, or pass --force to try anyway");
             }
-            if !yes && !confirm("\nApply these changes?")? {
+            if step {
+                db.apply_migration_with(&m, &mut ask_statement)?;
+            } else if !yes && !confirm("\nApply these changes?")? {
                 println!("Aborted.");
                 return Ok(());
+            } else {
+                db.apply_migration(&m)?;
             }
-            db.apply_migration(&m)?;
             println!("Applied {} change(s) to {}.", m.changes.len(), db.label());
         }
         Command::Pull { db, output } => {
             let (s, skipped) = open_existing(&db)?.introspect_with_skipped()?;
+            let (s, skipped) = migrations::strip_history(s, skipped);
             if !skipped.is_empty() {
                 eprintln!("{} {} object(s) not pulled; they are listed at the top of the schema", Paint::Yellow.err("warning:"), skipped.len());
             }
@@ -559,8 +655,160 @@ fn run(cli: Cli) -> Result<()> {
             shell::run(db)?;
         }
         Command::Conn(cmd) => conn_command(cmd)?,
+        Command::Migrate(cmd) => migrate_command(cmd)?,
     }
     Ok(())
+}
+
+fn migrate_command(cmd: MigrateCommand) -> Result<()> {
+    use migrations::{Direction, State};
+    match cmd {
+        MigrateCommand::New { schema, dir, dialect, name, empty: _ } => {
+            let schema = schema.as_deref().map(load_valid_schema).transpose()?;
+            let Some(draft) = migrations::draft(&dir, schema.as_ref(), dialect, name.as_deref())? else {
+                eprintln!("No changes since the last migration in {}.", dir.display());
+                return Ok(());
+            };
+            print_changes(&diff::Migration { changes: draft.changes.clone(), warnings: draft.warnings.clone(), ..Default::default() });
+            draft.write()?;
+            let what = if draft.snapshot.is_some() { "" } else { " (empty: fill in its up and down sections)" };
+            println!("Wrote {}{what}", draft.path.display());
+        }
+        MigrateCommand::Up { db, dir, to, dry_run, yes, step, record_only } => {
+            let files = migrations::read_dir(&dir)?;
+            if files.is_empty() {
+                bail!("no migrations in {}; write one with `sdb migrate new`", dir.display());
+            }
+            let mut db = open_db(&db)?;
+            let applied = migrations::applied(&mut db)?;
+            let entries = migrations::status(&files, &applied);
+            warn_drift(&entries);
+            if let Some(v) = &to
+                && !files.iter().any(|f| &f.version == v)
+            {
+                bail!("no migration {v} in {}", dir.display());
+            }
+            let last = to.as_ref().and_then(|v| files.iter().position(|f| &f.version == v));
+            let pending: Vec<&migrations::File> = entries
+                .iter()
+                .filter(|e| e.state == State::Pending)
+                .filter_map(|e| e.file)
+                .filter(|f| last.is_none_or(|i| files.iter().position(|x| x == *f).is_some_and(|p| p <= i)))
+                .collect();
+            if pending.is_empty() {
+                println!("{} is up to date.", db.label());
+                return Ok(());
+            }
+            for f in &pending {
+                eprintln!("{} {}", Paint::Green.err("+"), f.id());
+            }
+            if dry_run {
+                for f in &pending {
+                    print!("\n-- {}\n{}", f.id(), migrations::plan(f, Direction::Up, db.dialect())?.script());
+                }
+                return Ok(());
+            }
+            let verb = if record_only { "Record" } else { "Apply" };
+            if !yes && !step && !confirm(&format!("\n{verb} {} migration(s) to {}?", pending.len(), db.label()))? {
+                println!("Aborted.");
+                return Ok(());
+            }
+            for f in pending {
+                if record_only {
+                    migrations::record(&mut db, f)?;
+                    println!("Recorded {}", f.id());
+                } else {
+                    if step {
+                        eprintln!("\n{}:", f.id());
+                    }
+                    migrations::apply(&mut db, f, Direction::Up, &mut asker(step))?;
+                    println!("Applied {}", f.id());
+                }
+            }
+        }
+        MigrateCommand::Down { db, dir, steps, dry_run, yes, step } => {
+            let files = migrations::read_dir(&dir)?;
+            let mut db = open_db(&db)?;
+            let applied = migrations::applied(&mut db)?;
+            let entries = migrations::status(&files, &applied);
+            warn_drift(&entries);
+            let back: Vec<&migrations::Entry> = entries.iter().rev().filter(|e| e.state != State::Pending).take(steps).collect();
+            if back.is_empty() {
+                println!("{} has no applied migrations.", db.label());
+                return Ok(());
+            }
+            let mut files = Vec::new();
+            for e in &back {
+                let f = e.file.with_context(|| format!("{}_{} was applied, but its file is gone from {}", e.version, e.name, dir.display()))?;
+                // Refuse before running anything.
+                migrations::plan(f, Direction::Down, db.dialect())?;
+                eprintln!("{} {}", Paint::Red.err("-"), f.id());
+                files.push(f);
+            }
+            if dry_run {
+                for f in &files {
+                    print!("\n-- {}\n{}", f.id(), migrations::plan(f, Direction::Down, db.dialect())?.script());
+                }
+                return Ok(());
+            }
+            if !yes && !step && !confirm(&format!("\nRoll back {} migration(s) on {}?", files.len(), db.label()))? {
+                println!("Aborted.");
+                return Ok(());
+            }
+            for f in files {
+                if step {
+                    eprintln!("\n{}:", f.id());
+                }
+                migrations::apply(&mut db, f, Direction::Down, &mut asker(step))?;
+                println!("Rolled back {}", f.id());
+            }
+        }
+        MigrateCommand::Status { db, dir } => {
+            let files = migrations::read_dir(&dir)?;
+            let mut db = open_existing(&db)?;
+            let applied = migrations::applied(&mut db)?;
+            let entries = migrations::status(&files, &applied);
+            if entries.is_empty() {
+                println!("No migrations in {}.", dir.display());
+            }
+            for e in &entries {
+                let state = match e.state {
+                    State::Applied => Paint::Green.out("applied "),
+                    State::Pending => Paint::Yellow.out("pending "),
+                    State::Modified => Paint::Red.out("modified"),
+                    State::Missing => Paint::Red.out("missing "),
+                };
+                let at = e.applied_at.as_deref().map(|a| Paint::Dim.out(format!("  {a}"))).unwrap_or_default();
+                println!("{state}  {}_{}{at}", e.version, e.name);
+            }
+            let pending = entries.iter().filter(|e| e.state == State::Pending).count();
+            println!("{} applied, {pending} pending", applied.len());
+        }
+    }
+    Ok(())
+}
+
+/// Warns about applied migrations whose file changed or is gone.
+fn warn_drift(entries: &[migrations::Entry]) {
+    for e in entries {
+        let what = match e.state {
+            migrations::State::Modified => "was edited after it was applied",
+            migrations::State::Missing => "was applied, but its file is gone",
+            _ => continue,
+        };
+        eprintln!("{} {}_{} {what}", Paint::Yellow.err("warning:"), e.version, e.name);
+    }
+}
+
+/// With `step`, `ask_statement`; else runs everything.
+fn asker(step: bool) -> impl FnMut(usize, &str) -> Result<bool> {
+    move |n, stmt| if step { ask_statement(n, stmt) } else { Ok(true) }
+}
+
+/// Shows statement `n` and asks whether to run it (`--step`).
+fn ask_statement(n: usize, stmt: &str) -> Result<bool> {
+    eprintln!("\n{}\n{stmt}", Paint::Dim.err(format!("-- statement {n}")));
+    confirm("Run it?")
 }
 
 fn conn_command(cmd: ConnCommand) -> Result<()> {

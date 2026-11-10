@@ -75,7 +75,7 @@ impl Generated {
 /// way back (`down`) worked out from the reverse diff.
 pub fn generate(old: &Schema, new: &Schema, d: Dialect, fw: Framework, opts: &Options) -> Generated {
     let up = diff::plan(old, new, d);
-    let (from, to) = reversed(old, new, &up);
+    let (from, to) = diff::reversed(old, new, &up);
     let down = diff::plan(&from, &to, d);
     let name = snake_case(opts.name.as_deref().unwrap_or(&default_name(&up)));
     let name = if name.is_empty() { "update_schema".to_string() } else { name };
@@ -106,43 +106,6 @@ impl Notes {
             self.0.push(w);
         }
     }
-}
-
-/// `(new, old)` with the renames of `up` turned around as `was` hints on
-/// `old`, so that diffing them gives the way back.
-fn reversed(old: &Schema, new: &Schema, up: &Plan) -> (Schema, Schema) {
-    let strip = |s: &Schema| {
-        let mut s = s.clone();
-        for t in &mut s.tables {
-            t.was.clear();
-            for c in &mut t.columns {
-                c.was.clear();
-            }
-        }
-        s
-    };
-    let (from, mut to) = (strip(new), strip(old));
-    // Column renames name the table as it is after the table renames.
-    let old_table = |name: &str| {
-        up.renames.iter().find(|r| r.table.is_none() && r.to == name).map_or(name.to_string(), |r| r.from.clone())
-    };
-    for r in &up.renames {
-        let table = match &r.table {
-            None => to.tables.iter_mut().find(|t| t.name == r.from),
-            Some(t) => {
-                let name = old_table(t);
-                let Some(t) = to.tables.iter_mut().find(|x| x.name == name) else { continue };
-                if let Some(c) = t.columns.iter_mut().find(|c| c.name == r.from) {
-                    c.was.push(r.to.clone());
-                }
-                continue;
-            }
-        };
-        if let Some(t) = table {
-            t.was.push(r.to.clone());
-        }
-    }
-    (from, to)
 }
 
 /// One thing a migration does, in order.
@@ -246,7 +209,7 @@ pub(crate) fn sqlite_needs_sql(t: &Table) -> bool {
 }
 
 /// A name for the migration, from what it does.
-fn default_name(p: &Plan) -> String {
+pub(crate) fn default_name(p: &Plan) -> String {
     match (p.created.as_slice(), p.altered.as_slice(), p.dropped.as_slice(), p.renames.is_empty()) {
         ([t], [], [], true) => format!("create_{t}_table"),
         ([], [t], [], true) => format!("update_{t}_table"),
@@ -356,7 +319,7 @@ mod tests {
         let new = parse("table users was people { id int pk\n name text was full_name }").unwrap();
         let up = diff::plan(&old, &new, Dialect::Postgres);
         assert_eq!(up.renames.len(), 2);
-        let (from, to) = reversed(&old, &new, &up);
+        let (from, to) = diff::reversed(&old, &new, &up);
         let down = diff::plan(&from, &to, Dialect::Postgres);
         let renames: Vec<_> = down.renames.iter().map(|r| (r.table.clone(), r.from.as_str(), r.to.as_str())).collect();
         assert_eq!(renames, [(None, "users", "people"), (Some("people".into()), "name", "full_name")]);

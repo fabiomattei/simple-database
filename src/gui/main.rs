@@ -36,7 +36,7 @@ use simple_database::import;
 use simple_database::seed::{self, TableReport};
 use simple_database::sqlite;
 use simple_database::validate::{self, Issue};
-use simple_database::{format, STARTER_SCHEMA};
+use simple_database::{format, migrations, STARTER_SCHEMA};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -603,8 +603,9 @@ impl App {
             }
             Pending::PullIntoEditor => {
                 if let Some(db) = &self.db {
-                    self.schema_text = format::note_skipped(&format::format_schema(&db.schema), &db.skipped);
-                    let note = match db.skipped.len() {
+                    let (schema, skipped) = migrations::strip_history(db.schema.clone(), db.skipped.clone());
+                    self.schema_text = format::note_skipped(&format::format_schema(&schema), &skipped);
+                    let note = match skipped.len() {
                         0 => String::new(),
                         n => format!("; {n} object(s) it can't describe are listed at the top"),
                     };

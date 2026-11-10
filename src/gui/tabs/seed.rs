@@ -3,6 +3,7 @@
 use crate::{App, ConfirmWrite, Dialog, SEEDING, Write, empty_state, error_color, ok_color, warn_color};
 use eframe::egui::{self, RichText};
 use simple_database::connections::SafeMode;
+use simple_database::migrations;
 use simple_database::seed::{self, SeedOptions, TableReport};
 use std::collections::HashMap;
 
@@ -16,7 +17,13 @@ impl App {
             empty_state(ui, "The database has no tables", "Push a schema from the Migrate tab first.");
             return;
         }
-        let order: Vec<String> = db.schema.tables_in_dependency_order().iter().map(|t| t.name.clone()).collect();
+        let order: Vec<String> = db
+            .schema
+            .tables_in_dependency_order()
+            .iter()
+            .filter(|t| t.name != migrations::HISTORY_TABLE)
+            .map(|t| t.name.clone())
+            .collect();
         let counts: HashMap<String, i64> = db.counts.iter().cloned().collect();
         // Tables a push dropped would make seeding fail.
         self.seed.tables.retain(|t, _| order.contains(t));

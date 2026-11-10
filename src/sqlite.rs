@@ -531,9 +531,11 @@ pub fn row_counts(conn: &Connection, schema: &Schema) -> Result<Vec<(String, i64
 ///
 /// Statements run one at a time so `PRAGMA foreign_key_check` can act as a
 /// gate: any violation aborts, and the open transaction is rolled back.
-pub fn apply_migration(conn: &Connection, m: &crate::diff::Migration) -> Result<()> {
+/// Runs `m`; `ask` may stop it before a statement (rolled back like a failure).
+pub fn apply_migration(conn: &Connection, m: &crate::diff::Migration, ask: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
     let result = (|| {
         for stmt in &m.statements {
+            ask(stmt).context("the transaction was rolled back")?;
             if stmt.starts_with("PRAGMA foreign_key_check") {
                 let violations = run(conn, stmt)?.remove(0).rows.len();
                 anyhow::ensure!(

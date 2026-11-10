@@ -241,7 +241,7 @@ pub fn plan(old: &Schema, new: &Schema, d: Dialect) -> Plan {
     let mut changes = Vec::new();
     let mut warnings = Vec::new();
     let mut renames = Vec::new();
-    let old = apply_renames(canonical(old, d), new, d, &mut changes, &mut renames);
+    let old = apply_renames(without_history(canonical(old, d), new), new, d, &mut changes, &mut renames);
     let declared = new;
     let new = canonical(new, d);
 
@@ -386,10 +386,18 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
         }
     }
     body.extend(forward.iter().map(|(t, fk)| add_fk_sql(t, fk, d)));
+    let checks = preflight::row_checks(&p);
+    // Statements of tables whose rows can make them fail, for MySQL's warning.
+    let mut risky = Vec::new();
     for name in &p.altered {
         let td = p.table_diff(name).expect("altered table");
         needs_fk_off |= d == Dialect::Sqlite && sqlite_needs_rebuild(&td);
+        let start = body.len();
         body.extend(alter_statements(&td, d));
+        let before = p.renames.iter().find(|r| r.table.is_none() && r.to == *name).map_or(name.as_str(), |r| r.from.as_str());
+        if checks.iter().any(|c| c.table == before) {
+            risky.extend((start..body.len()).map(|i| (i, name.as_str())));
+        }
     }
     // Tables in a cycle can't be dropped while the other still points at them.
     let dropped: Vec<&Table> = p.dropped.iter().rev().map(|name| p.old.table(name).expect("dropped table")).collect();
@@ -398,36 +406,146 @@ pub fn diff(old: &Schema, new: &Schema, d: Dialect) -> Migration {
         body.extend(drop_table_statements(p.old.table(name).expect("dropped table"), d));
     }
 
-    let checks = preflight::row_checks(&p);
     let tables = p.tables();
     let mut m = Migration { changes: p.changes, warnings: p.warnings, statements: Vec::new(), checks, tables };
-    if body.is_empty() {
-        return m;
+    if let Some(w) = partial_failure_warning(&risky, d) {
+        m.warnings.push(w);
     }
+    m.statements = wrap(body, d, needs_fk_off);
+    m
+}
+
+/// `body` as a migration runs it: on SQLite and Postgres in one transaction
+/// (SQLite with foreign keys off when `fk_off`, gated by
+/// `PRAGMA foreign_key_check`); MySQL DDL is not transactional, so wrapping
+/// it would be misleading.
+pub fn wrap(body: Vec<String>, d: Dialect, fk_off: bool) -> Vec<String> {
+    if body.is_empty() {
+        return body;
+    }
+    let mut out = Vec::new();
     match d {
         Dialect::Sqlite => {
-            if needs_fk_off {
-                m.statements.push("PRAGMA foreign_keys = OFF;".into());
+            if fk_off {
+                out.push("PRAGMA foreign_keys = OFF;".into());
             }
-            m.statements.push("BEGIN;".into());
-            m.statements.extend(body);
-            if needs_fk_off {
-                m.statements.push("PRAGMA foreign_key_check;".into());
+            out.push("BEGIN;".into());
+            out.extend(body);
+            if fk_off {
+                out.push("PRAGMA foreign_key_check;".into());
             }
-            m.statements.push("COMMIT;".into());
-            if needs_fk_off {
-                m.statements.push("PRAGMA foreign_keys = ON;".into());
+            out.push("COMMIT;".into());
+            if fk_off {
+                out.push("PRAGMA foreign_keys = ON;".into());
             }
         }
         Dialect::Postgres => {
-            m.statements.push("BEGIN;".into());
-            m.statements.extend(body);
-            m.statements.push("COMMIT;".into());
+            out.push("BEGIN;".into());
+            out.extend(body);
+            out.push("COMMIT;".into());
         }
-        // MySQL DDL is not transactional; wrapping it would be misleading.
-        Dialect::Mysql => m.statements.extend(body),
+        Dialect::Mysql => out.extend(body),
     }
-    m
+    out
+}
+
+/// On MySQL, which commits each schema change on its own: the statements
+/// (`(index, table)`, from 0) that existing rows can make fail, grouped by
+/// table, when any has statements before it that would stay applied.
+fn partial_failure_warning(risky: &[(usize, &str)], d: Dialect) -> Option<String> {
+    if d != Dialect::Mysql || !risky.iter().any(|(i, _)| *i > 0) {
+        return None;
+    }
+    let mut tables: Vec<(&str, Vec<usize>)> = Vec::new();
+    for &(i, t) in risky {
+        match tables.iter_mut().find(|(x, _)| *x == t) {
+            Some((_, ix)) => ix.push(i + 1),
+            None => tables.push((t, vec![i + 1])),
+        }
+    }
+    let groups: Vec<String> = tables
+        .iter()
+        .map(|(t, ix)| {
+            let what = if ix.len() == 1 { "statement" } else { "statements" };
+            format!("{t} ({what} {})", ranges(ix))
+        })
+        .collect();
+    Some(format!(
+        "MySQL commits each schema change on its own: if one fails, the ones before it stay applied. \
+         Existing rows can make these fail: {}; `sdb push` counts those rows first, and `--step` (push, migrate up) asks before each statement",
+        groups.join(", ")
+    ))
+}
+
+/// `[4, 5, 6, 9]` → `4-6, 9`.
+fn ranges(ix: &[usize]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < ix.len() {
+        let mut j = i;
+        while j + 1 < ix.len() && ix[j + 1] == ix[j] + 1 {
+            j += 1;
+        }
+        out.push(if j == i { ix[i].to_string() } else { format!("{}-{}", ix[i], ix[j]) });
+        i = j + 1;
+    }
+    out.join(", ")
+}
+
+/// The way back from `diff(old, new, d)`: `new` turned into `old`, with the
+/// renames undone.
+pub fn down(old: &Schema, new: &Schema, d: Dialect) -> Migration {
+    let (from, to) = reversed(old, new, &plan(old, new, d));
+    diff(&from, &to, d)
+}
+
+/// `(new, old)` with the renames of `up` turned around as `was` hints on
+/// `old`, so that diffing them gives the way back.
+pub fn reversed(old: &Schema, new: &Schema, up: &Plan) -> (Schema, Schema) {
+    let (from, mut to) = (without_hints(new), without_hints(old));
+    // Column renames name the table as it is after the table renames.
+    let old_table = |name: &str| {
+        up.renames.iter().find(|r| r.table.is_none() && r.to == name).map_or(name.to_string(), |r| r.from.clone())
+    };
+    for r in &up.renames {
+        let table = match &r.table {
+            None => to.tables.iter_mut().find(|t| t.name == r.from),
+            Some(t) => {
+                let name = old_table(t);
+                let Some(t) = to.tables.iter_mut().find(|x| x.name == name) else { continue };
+                if let Some(c) = t.columns.iter_mut().find(|c| c.name == r.from) {
+                    c.was.push(r.to.clone());
+                }
+                continue;
+            }
+        };
+        if let Some(t) = table {
+            t.was.push(r.to.clone());
+        }
+    }
+    (from, to)
+}
+
+/// `s` without its `was` hints.
+pub fn without_hints(s: &Schema) -> Schema {
+    let mut s = s.clone();
+    for t in &mut s.tables {
+        t.was.clear();
+        for c in &mut t.columns {
+            c.was.clear();
+        }
+    }
+    s
+}
+
+/// `old` without sdb's migration history table, unless `new` has it too:
+/// a diff must never drop it.
+fn without_history(mut old: Schema, new: &Schema) -> Schema {
+    let history = crate::migrations::HISTORY_TABLE;
+    if new.table(history).is_none() {
+        old.tables.retain(|t| t.name != history);
+    }
+    old
 }
 
 // ---------------------------------------------------------------- Renames
@@ -1101,6 +1219,41 @@ mod tests {
 
     const OLD: &str = "table users { id int pk autoincrement\n name text\n legacy text }\n table logs { id int pk }";
     const NEW: &str = "table users { id int pk autoincrement\n name text not null default ''\n email text\n index (email) }\n table posts { id int pk\n user_id int -> users.id }";
+
+    #[test]
+    fn down_undoes_up() {
+        let old = parse("table people { id int pk\n full_name text }\ntable logs { id int pk }").unwrap();
+        let new = parse("table users was people { id int pk\n name text not null was full_name }\ntable tags { id int pk }").unwrap();
+        let down = down(&old, &new, Dialect::Postgres);
+        let sql = down.script();
+        for part in ["ALTER TABLE users RENAME TO people;", "RENAME COLUMN name TO full_name", "DROP NOT NULL", "CREATE TABLE logs", "DROP TABLE tags;"] {
+            assert!(sql.contains(part), "{part}:\n{sql}");
+        }
+        assert!(diff(&new, &old, Dialect::Postgres).script().contains("DROP TABLE users;"), "without hints it would drop");
+    }
+
+    #[test]
+    fn mysql_warns_about_statements_rows_can_fail() {
+        let old = parse("table users { id int pk\n email varchar(100) }\ntable posts { id int pk\n body text }").unwrap();
+        let new = parse("table users { id int pk\n email varchar(100) unique not null }\ntable posts { id int pk\n body text\n extra int }\ntable tags { id int pk }").unwrap();
+        let m = diff(&old, &new, Dialect::Mysql);
+        let w = m.warnings.iter().find(|w| w.contains("commits each schema change")).unwrap_or_else(|| panic!("{:?}", m.warnings));
+        let at = m.statements.iter().position(|s| s.contains("users")).unwrap() + 1;
+        assert!(w.contains(&format!("users (statement {at}")), "{w}\n{}", m.script());
+        assert!(!w.contains("posts"), "{w}");
+        // Nothing before the risky statement, or another dialect: no warning.
+        let alone = parse("table users { id int pk\n email varchar(100) unique not null }\ntable posts { id int pk\n body text }").unwrap();
+        assert!(!diff(&old, &alone, Dialect::Mysql).warnings.iter().any(|w| w.contains("commits")));
+        assert!(!diff(&old, &new, Dialect::Postgres).warnings.iter().any(|w| w.contains("commits")));
+        assert_eq!(ranges(&[1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8");
+    }
+
+    #[test]
+    fn diffs_keep_the_migration_history() {
+        let old = parse("table _sdb_migrations { version varchar(255) pk }\ntable t { id int pk }").unwrap();
+        let new = parse("table t { id int pk }").unwrap();
+        assert!(diff(&old, &new, Dialect::Sqlite).is_empty());
+    }
 
     #[test]
     fn indexes_other_databases_cannot_make_are_left_out() {

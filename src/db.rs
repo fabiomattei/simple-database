@@ -517,11 +517,29 @@ impl Database {
 
     /// Execute a migration produced by [`Database::migration`].
     pub fn apply_migration(&mut self, m: &Migration) -> Result<()> {
+        self.apply_migration_with(m, &mut |_, _| Ok(true))
+    }
+
+    /// Like [`Database::apply_migration`], calling `ask(number, statement)`
+    /// before each statement that changes the schema (not BEGIN, COMMIT,
+    /// PRAGMAs or comments); `false` stops there, rolling back where the
+    /// database can.
+    pub fn apply_migration_with(&mut self, m: &Migration, ask: &mut dyn FnMut(usize, &str) -> Result<bool>) -> Result<()> {
         self.ensure_writable()?;
+        let mut asked = 0;
+        let mut ask = |stmt: &str| -> Result<()> {
+            if is_transaction_control(stmt) || stmt.starts_with("PRAGMA") || is_comment(stmt) {
+                return Ok(());
+            }
+            asked += 1;
+            anyhow::ensure!(ask(asked, stmt)?, "stopped before:\n{stmt}");
+            Ok(())
+        };
         match &mut self.conn {
-            Conn::Sqlite(c) => sqlite::apply_migration(c, m),
+            Conn::Sqlite(c) => sqlite::apply_migration(c, m, &mut ask),
             Conn::Postgres(c) => {
                 let result = m.statements.iter().filter(|s| !is_comment(s)).try_for_each(|stmt| {
+                    ask(stmt).context("the transaction was rolled back")?;
                     c.batch_execute(stmt)
                         .map_err(anyhow::Error::from)
                         .with_context(|| format!("migration failed at:\n{stmt}\nthe transaction was rolled back"))
@@ -534,12 +552,9 @@ impl Database {
             Conn::Mysql(c) => {
                 use mysql::prelude::Queryable;
                 for (done, stmt) in m.statements.iter().filter(|s| !is_comment(s)).enumerate() {
-                    c.query_drop(stmt).map_err(anyhow::Error::from).with_context(|| {
-                        format!(
-                            "migration failed at:\n{stmt}\nMySQL cannot roll back schema changes; \
-                             the {done} statement(s) before this one were applied"
-                        )
-                    })?;
+                    let applied = || format!("MySQL cannot roll back schema changes; the {done} statement(s) before this one were applied");
+                    ask(stmt).with_context(applied)?;
+                    c.query_drop(stmt).map_err(anyhow::Error::from).with_context(|| format!("migration failed at:\n{stmt}\n{}", applied()))?;
                 }
                 Ok(())
             }
@@ -1732,7 +1747,8 @@ mod tests {
             let desired = parse(src).unwrap();
             let current = db.introspect().unwrap();
             let m = db.migration(&current, &desired);
-            assert!(m.warnings.is_empty(), "step {i}: {:?}", m.warnings);
+            // MySQL warns that a failing statement leaves the earlier ones applied.
+            assert!(m.warnings.iter().all(|w| w.starts_with("MySQL commits")), "step {i}: {:?}", m.warnings);
             db.apply_migration(&m).unwrap_or_else(|e| panic!("step {i}: {e:#}\n{}", m.script()));
             let current = db.introspect().unwrap();
             let again = db.migration(&current, &desired);
