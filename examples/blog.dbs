@@ -13,6 +13,9 @@
 #
 # table-level:  index (a, b)   unique index name (a, b)   pk (a, b)
 #               fk (a, b) -> table (x, y)  on delete|update <action>
+# index extras: index (lower(email))  (an expression)
+#               index (a) where (deleted_at is null)  (partial; not on MySQL)
+#               index (data) using gin  (Postgres method; left out elsewhere)
 # table:        table name was old_name comment 'text' { ... }  (was, comment optional)
 #               name may be schema.name (Postgres): table billing.invoices, -> billing.invoices.id
 

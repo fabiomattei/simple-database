@@ -40,14 +40,31 @@ fn format_table(t: &Table) -> String {
     }
     for idx in &t.indexes {
         let name = if idx.name == Index::default_name(&t.name, &idx.columns, idx.unique) { String::new() } else { format!("{} ", idx.name) };
-        out.push_str(&format!(
-            "  {}index {name}({})\n",
-            if idx.unique { "unique " } else { "" },
-            idx.columns.join(", ")
-        ));
+        let parts: Vec<&str> = idx.columns.iter().map(|c| index_part(c)).collect();
+        out.push_str(&format!("  {}index {name}({})", if idx.unique { "unique " } else { "" }, parts.join(", ")));
+        if let Some(m) = &idx.method {
+            out.push_str(&format!(" using {m}"));
+        }
+        if let Some(p) = &idx.predicate {
+            out.push_str(&format!(" where ({p})"));
+        }
+        out.push('\n');
     }
     out.push_str("}\n");
     out
+}
+
+/// An index part as written in the DSL: `(lower(email))` as `lower(email)`,
+/// which the parser puts back in parentheses. Kept in them when the inside
+/// would read as a column, or is in parentheses itself.
+fn index_part(part: &str) -> &str {
+    match Index::expression(part) {
+        Some(e) if e == &part[1..part.len() - 1]
+            && !crate::parser::is_word(e)
+            && Index::expression(e).is_none()
+            && crate::parser::split_top_level(e).len() == 1 => e,
+        _ => part,
+    }
 }
 
 fn modifiers(c: &Column) -> Vec<String> {
@@ -401,6 +418,9 @@ mod tests {
             "1 + 2", "lower('A')", "gen_random_uuid()", "x || ')'", "a in ('b', 'c''d')", "\"q\" > 0",
             "(a)", "n between 1 and 9", "s <> '#' and s <> '//'", "current_date",
         ];
+        const INDEX_EXPRS: &[&str] = &[
+            "lower(email)", "(a + b)", "a, b", "(a) + (b)", "x || ','", "coalesce(a, 0)", "( a )", "name", "s = '#'",
+        ];
         const STRINGS: &[&str] = &["", "it's", "a, b; c", "# not a comment", "// nor this", "{ }", "->", "\"", "x\ny", "(", "é"];
         const NUMBERS: &[&str] = &["0", "-1", "3.14", "1e3", "1."];
         const ACTIONS: [RefAction; 5] =
@@ -461,13 +481,19 @@ mod tests {
                 let mut indexes = Vec::new();
                 for _ in 0..if cols.is_empty() { 0 } else { rng.range(0, 2) } {
                     let unique = rng.chance(0.5);
-                    let columns = vec![rng.pick(&cols).clone()];
+                    let mut columns = vec![rng.pick(&cols).clone()];
+                    if rng.chance(0.3) {
+                        columns.push(Index::expression_part(rng.pick(INDEX_EXPRS)));
+                    }
                     let name = if rng.chance(0.5) {
                         Index::default_name(&tname, &columns, unique)
                     } else {
                         format!("{}_ix", rng.pick(NAMES))
                     };
-                    indexes.push(Index { name, columns, unique });
+                    let mut index = Index::new(name, columns, unique);
+                    index.method = rng.chance(0.2).then(|| rng.pick(&["gin", "gist", "hash"]).to_string());
+                    index.predicate = rng.chance(0.2).then(|| rng.pick(EXPRS).to_string());
+                    indexes.push(index);
                 }
                 let mut foreign_keys = Vec::new();
                 if cols.len() >= 2 && rng.chance(0.3) {

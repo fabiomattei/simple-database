@@ -4,7 +4,7 @@ use crate::db::{Cell, QueryResult};
 use crate::ddl;
 use crate::schema::*;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, fallible_iterator::FallibleIterator, types::ValueRef};
+use rusqlite::{Connection, OptionalExtension, fallible_iterator::FallibleIterator, types::ValueRef};
 use std::path::Path;
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -137,38 +137,31 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &m
     }
 
     // PRAGMA index_list: seq, name, unique, origin, partial
-    let mut stmt = conn.prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1) ORDER BY seq DESC")?;
-    let idx_rows: Vec<(String, bool, String, bool)> = stmt
-        .query_map([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+    let mut stmt = conn.prepare("SELECT name, \"unique\", origin FROM pragma_index_list(?1) ORDER BY seq DESC")?;
+    let idx_rows: Vec<(String, bool, String)> = stmt
+        .query_map([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?;
     let mut indexes = Vec::new();
-    for (iname, unique, origin, partial) in idx_rows {
+    for (iname, unique, origin) in idx_rows {
         if origin == "pk" {
             continue;
         }
-        let mut stmt = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
-        // An expression has no column name.
-        let cols: Option<Vec<String>> = stmt.query_map([&iname], |r| r.get::<_, Option<String>>(0))?.collect::<Result<Vec<_>, _>>()?.into_iter().collect();
-        let Some(cols) = cols.filter(|_| !partial) else {
-            skipped.push(format!("index {iname} on {name} (on an expression, or partial)"));
+        let Some(index) = read_index(conn, &iname, unique)? else {
+            skipped.push(format!("index {iname} on {name} (with a collation or in descending order)"));
             continue;
         };
-        if origin == "u" && cols.len() == 1 {
-            if let Some(col) = columns.iter_mut().find(|c| c.name == cols[0]) {
-                col.unique = true;
+        if origin == "u" {
+            let cols = index.columns;
+            if let [only] = cols.as_slice() {
+                if let Some(col) = columns.iter_mut().find(|c| c.name == *only) {
+                    col.unique = true;
+                }
+                continue;
             }
-            continue;
-        }
-        let iname = if origin == "u" {
-            format!("{}_{}_key", unqualified(name), cols.join("_"))
+            indexes.push(Index::new(format!("{}_{}_key", unqualified(name), cols.join("_")), cols, true));
         } else {
-            iname
-        };
-        indexes.push(Index {
-            name: iname,
-            columns: cols,
-            unique,
-        });
+            indexes.push(index);
+        }
     }
 
     let composite_pk = if pk_cols.len() > 1 {
@@ -180,6 +173,72 @@ fn introspect_table(conn: &Connection, name: &str, create_sql: &str, skipped: &m
     // The pragma lists foreign keys last to first.
     foreign_keys.reverse();
     Ok(Table { columns, composite_pk, indexes, foreign_keys, comment: table_comment, ..Table::new(name) })
+}
+
+/// Index `iname`: its columns from `pragma_index_xinfo`, and its expressions
+/// and predicate from the `CREATE INDEX` text SQLite keeps. `None` for an
+/// index with a collation or a descending part.
+fn read_index(conn: &Connection, iname: &str, unique: bool) -> Result<Option<Index>> {
+    let mut stmt = conn.prepare("SELECT cid, name, \"desc\", coll FROM pragma_index_xinfo(?1) WHERE key ORDER BY seqno")?;
+    let parts: Vec<(i64, Option<String>, bool, Option<String>)> =
+        stmt.query_map([iname], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let sql: Option<String> = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1", [iname], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let (texts, predicate) = sql.as_deref().map(index_sql_parts).unwrap_or_default();
+    let mut columns = Vec::new();
+    for (i, (cid, name, desc, coll)) in parts.into_iter().enumerate() {
+        if desc || coll.is_some_and(|c| !c.eq_ignore_ascii_case("binary")) {
+            return Ok(None);
+        }
+        match (cid, name) {
+            (-2, _) => match texts.get(i) {
+                Some(t) => columns.push(Index::expression_part(t)),
+                None => return Ok(None),
+            },
+            (_, Some(n)) => columns.push(n),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(Index { predicate, ..Index::new(iname, columns, unique) }))
+}
+
+/// The parts of a `CREATE INDEX … ON t (a, lower(b)) WHERE p` statement:
+/// the texts in its column list, and the `WHERE` condition.
+fn index_sql_parts(sql: &str) -> (Vec<String>, Option<String>) {
+    let mut quote: Option<char> = None;
+    let mut depth = 0;
+    let mut open = None;
+    for (i, c) in sql.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(c),
+            (None, '[') => quote = Some(']'),
+            (None, '(') => {
+                depth += 1;
+                open.get_or_insert(i);
+            }
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(start) = open
+                {
+                    let texts = crate::parser::split_top_level(&sql[start + 1..i]).into_iter().map(|t| t.trim().to_string()).collect();
+                    let rest = sql[i + 1..].trim().trim_end_matches(';').trim_end();
+                    let predicate = rest
+                        .get(..5)
+                        .filter(|w| w.eq_ignore_ascii_case("where"))
+                        .map(|_| rest[5..].trim().to_string())
+                        .filter(|p| !p.is_empty());
+                    return (texts, predicate);
+                }
+            }
+            _ => {}
+        }
+    }
+    (Vec::new(), None)
 }
 
 /// The primary key columns of `table`, in key order.
@@ -562,7 +621,8 @@ mod tests {
                    role text not null default 'member' check (role in ('member', 'admin'))\n \
                    active bool not null default true\n score decimal(8,2) default 0\n \
                    team_id int -> teams.id on delete set null\n created_at timestamp default now\n \
-                   index (team_id)\n unique index users_role_email (role, email) }\n\
+                   index (team_id)\n unique index users_role_email (role, email)\n \
+                   index (lower(email), team_id) where (active and score > 0)\n index users_scored (score) using hash }\n\
                    table memberships { user_id int not null -> users.id on delete cascade\n team_id int not null -> teams.id\n pk (user_id, team_id) }";
         let schema = parse(src).unwrap();
         let conn = Connection::open_in_memory().unwrap();
@@ -570,6 +630,7 @@ mod tests {
         let mut skipped = Vec::new();
         let pulled = introspect(&conn, &mut skipped).unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
+        let schema = ddl::canonical(&schema, Dialect::Sqlite);
         for t in &schema.tables {
             assert_eq!(pulled.table(&t.name), Some(t));
         }
@@ -585,6 +646,7 @@ mod tests {
              CREATE INDEX b_lower ON b (lower(name));\n\
              CREATE INDEX b_named ON b (name) WHERE name IS NOT NULL;\n\
              CREATE INDEX b_x ON b (x);\n\
+             CREATE INDEX b_desc ON b (x DESC);\n\
              CREATE VIEW names AS SELECT name FROM b;\n\
              CREATE TRIGGER b_audit AFTER INSERT ON b BEGIN SELECT 1; END;",
         )
@@ -594,14 +656,17 @@ mod tests {
         assert_eq!(
             skipped,
             [
-                "index b_lower on b (on an expression, or partial)",
-                "index b_named on b (on an expression, or partial)",
+                "index b_desc on b (with a collation or in descending order)",
                 "trigger b_audit on b",
                 "view names",
             ]
         );
-        let indexes: Vec<&str> = schema.table("b").unwrap().indexes.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(indexes, ["b_x"]);
+        let b = schema.table("b").unwrap();
+        let indexes: Vec<(&str, String, Option<&str>)> = b.indexes.iter().map(|i| (i.name.as_str(), i.columns.join(","), i.predicate.as_deref())).collect();
+        assert_eq!(
+            indexes,
+            [("b_lower", "(lower(name))".into(), None), ("b_named", "name".into(), Some("name IS NOT NULL")), ("b_x", "x".into(), None)]
+        );
         let fk = &schema.table("b").unwrap().foreign_keys;
         assert_eq!((fk[0].columns.join(","), fk[0].table.as_str(), fk[0].ref_columns.join(",")), ("x,y".into(), "a", "x,y".into()));
     }
@@ -758,9 +823,15 @@ mod tests {
                 let mut indexes = Vec::new();
                 if names.len() >= 2 && rng.chance(0.5) {
                     let unique = rng.chance(0.5);
-                    let cols = vec![names[names.len() - 1].clone()];
+                    let mut cols = vec![names[names.len() - 1].clone()];
+                    let q = ddl::quote(&names[1], Dialect::Sqlite);
+                    if rng.chance(0.4) {
+                        cols.push(Index::expression_part(&format!("length({q}) + 1")));
+                    }
                     let name = format!("{tname}_{}_{}", cols[0], if unique { "key" } else { "idx" });
-                    indexes.push(Index { name, columns: cols, unique });
+                    let mut index = Index::new(name, cols, unique);
+                    index.predicate = rng.chance(0.3).then(|| format!("{q} IS NOT NULL AND {q} <> ')'"));
+                    indexes.push(index);
                 }
                 let comment = rng.chance(0.3).then(|| rng.pick(COMMENTS).to_string());
                 schema.tables.push(Table { columns, composite_pk, indexes, foreign_keys, comment, ..Table::new(tname) });

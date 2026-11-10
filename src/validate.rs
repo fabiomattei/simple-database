@@ -73,7 +73,7 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
         }
 
         for idx in &t.indexes {
-            for c in &idx.columns {
+            for c in idx.plain_columns() {
                 if t.column(c).is_none() {
                     error(
                         format!("{}.{}", t.name, idx.name),
@@ -144,7 +144,7 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
             let same = |a: &[String]| a.len() == fk.ref_columns.len() && a.iter().all(|c| fk.ref_columns.contains(c));
             let target_is_key = same(&target_table.primary_key())
                 || (single && targets[0].unique)
-                || target_table.indexes.iter().any(|i| i.unique && same(&i.columns));
+                || target_table.indexes.iter().any(|i| i.unique && i.predicate.is_none() && same(&i.columns));
             let shown = if single { format!("{}.{}", fk.table, fk.ref_columns[0]) } else { format!("{} ({})", fk.table, fk.ref_columns.join(", ")) };
             if !target_is_key {
                 error(loc.clone(), format!("{what}references {shown} which is neither a primary key nor unique"));
@@ -160,7 +160,7 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
             }
             // An index whose first columns are the key's, in any order.
             let leads = |idx: &[String]| idx.len() >= fk.columns.len() && fk.columns.iter().all(|c| idx[..fk.columns.len()].contains(c));
-            let indexed = t.indexes.iter().any(|i| leads(&i.columns)) || leads(&t.primary_key()) || (single && cols[0].unique);
+            let indexed = t.indexes.iter().any(|i| i.predicate.is_none() && leads(&i.columns)) || leads(&t.primary_key()) || (single && cols[0].unique);
             if !indexed {
                 warn(
                     loc.clone(),
@@ -232,6 +232,18 @@ mod tests {
         assert!(joined.contains("Error c: foreign key (x, y) references a (x, s) which is neither a primary key nor unique"), "{joined}");
         assert!(joined.contains("Error c: foreign key (y, z) uses unknown column 'z'"), "{joined}");
         assert!(!joined.contains("Error b: foreign key (x, y) references"), "the key's columns in another order: {joined}");
+    }
+
+    #[test]
+    fn index_expressions_and_predicates() {
+        let m = messages(
+            "table a { id int pk\n code text\n gone bool\n unique index a_live (code) where (not gone)\n index (lower(code), nope) }\n\
+             table b { id int pk\n a_code text -> a.code\n index (a_code) where (a_code is not null) }",
+        );
+        let joined = m.join("\n");
+        assert!(joined.contains("index references unknown column 'nope'") && !joined.contains("'(lower(code))'"), "{joined}");
+        assert!(joined.contains("references a.code which is neither a primary key nor unique"), "a partial index is no key: {joined}");
+        assert!(joined.contains("foreign key is not indexed"), "a partial index doesn't cover every row: {joined}");
     }
 
     #[test]

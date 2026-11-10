@@ -279,16 +279,92 @@ impl TableForeignKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     pub name: String,
+    /// Column names, or expressions in parentheses (`(lower(email))`, see
+    /// [`Index::expression`]).
     pub columns: Vec<String>,
     pub unique: bool,
+    /// `using gin`: the Postgres access method, lowercase; `None` is B-tree.
+    pub method: Option<String>,
+    /// `where (expr)`: a partial index, over the rows that match.
+    pub predicate: Option<String>,
 }
 
 impl Index {
+    pub fn new(name: impl Into<String>, columns: Vec<String>, unique: bool) -> Self {
+        Index { name: name.into(), columns, unique, method: None, predicate: None }
+    }
+
     /// The name of an index the schema doesn't name: `posts_author_id_idx`,
     /// `users_email_key` (unique), after the table without its schema.
+    /// Expressions contribute their words: `(lower(email))` → `lower_email`.
     pub fn default_name(table: &str, columns: &[String], unique: bool) -> String {
-        format!("{}_{}_{}", unqualified(table), columns.join("_"), if unique { "key" } else { "idx" })
+        let parts: Vec<String> = columns
+            .iter()
+            .map(|c| match Index::expression(c) {
+                Some(e) => e.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_"),
+                None => c.clone(),
+            })
+            .collect();
+        format!("{}_{}_{}", unqualified(table), parts.join("_"), if unique { "key" } else { "idx" })
     }
+
+    /// The expression of an index part that is one, without its parentheses:
+    /// `(lower(email))` → `lower(email)`. `None` for a column.
+    pub fn expression(part: &str) -> Option<&str> {
+        wrapped(part).then(|| part[1..part.len() - 1].trim())
+    }
+
+    /// An index part for expression `e`: `e` in parentheses, unless it is
+    /// already wholly in them.
+    pub fn expression_part(e: &str) -> String {
+        let e = e.trim();
+        if wrapped(e) { e.to_string() } else { format!("({e})") }
+    }
+
+    /// The parts that are columns, not expressions.
+    pub fn plain_columns(&self) -> impl Iterator<Item = &String> {
+        self.columns.iter().filter(|c| Index::expression(c).is_none())
+    }
+
+    /// Whether `column` is one of the index's columns, or a word of its
+    /// expressions or predicate.
+    pub fn mentions(&self, column: &str) -> bool {
+        let lower = column.to_ascii_lowercase();
+        let texts = self.columns.iter().filter_map(|c| Index::expression(c)).chain(self.predicate.as_deref());
+        self.plain_columns().any(|c| c == column) || texts.flat_map(crate::safety::words).any(|w| w == lower)
+    }
+
+    /// Whether the index holds every row by its columns alone: no expression,
+    /// no predicate.
+    pub fn is_plain(&self) -> bool {
+        self.predicate.is_none() && self.columns.iter().all(|c| Index::expression(c).is_none())
+    }
+}
+
+/// Whether `s` is `( … )` with the first parenthesis closed by the last
+/// character (quotes respected).
+fn wrapped(s: &str) -> bool {
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return false;
+    }
+    let mut depth = 0;
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == s.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,6 +508,12 @@ impl Schema {
         for n in names.filter(|n| *n == old) {
             *n = new.to_string();
         }
+        // Expressions and predicates, as the database rewrites them.
+        for i in &mut t.indexes {
+            for e in i.columns.iter_mut().filter(|c| Index::expression(c).is_some()).chain(i.predicate.as_mut()) {
+                *e = crate::diff::rename_ident(e, old, new);
+            }
+        }
         for fk in self.foreign_keys_mut().filter(|fk| fk.table == table && fk.column == old) {
             fk.column = new.to_string();
         }
@@ -447,7 +529,7 @@ impl Schema {
         let Some(t) = self.table_mut(table) else { return };
         t.columns.retain(|c| c.name != column);
         t.composite_pk.retain(|c| c != column);
-        t.indexes.retain(|i| !i.columns.iter().any(|c| c == column));
+        t.indexes.retain(|i| !i.mentions(column));
         t.foreign_keys.retain(|fk| !fk.columns.iter().any(|c| c == column));
         for c in self.tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
             if c.references.as_ref().is_some_and(|fk| fk.table == table && fk.column == column) {
@@ -500,7 +582,8 @@ impl Schema {
 mod tests {
     use crate::parser::parse;
 
-    const SRC: &str = "table users {\n  id int pk\n  email text\n  index (email)\n}\n\ntable posts {\n  id int pk\n  author int -> users.id\n  parent int -> posts.id\n}\n";
+    const SRC: &str = "table users {\n  id int pk\n  email text\n  gone bool\n  index (email)\n  index users_lower (lower(email)) where (not gone)\n}\n\n\
+                       table posts {\n  id int pk\n  author int -> users.id\n  parent int -> posts.id\n}\n";
 
     #[test]
     fn rename_and_drop_follow_references() {
@@ -511,6 +594,9 @@ mod tests {
         let fk = s.table("posts").unwrap().column("author").unwrap().references.clone().unwrap();
         assert_eq!((fk.table.as_str(), fk.column.as_str()), ("people", "pid"));
         assert_eq!(s.table("people").unwrap().indexes[0].columns, vec!["mail"]);
+        s.rename_column("people", "gone", "removed");
+        let lower = &s.table("people").unwrap().indexes[1];
+        assert_eq!((lower.columns[0].as_str(), lower.predicate.as_deref()), ("(lower(mail))", Some("not removed")));
         assert_eq!(s.table("posts").unwrap().column("parent").unwrap().references.as_ref().unwrap().table, "posts");
 
         s.drop_column("people", "mail");

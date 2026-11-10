@@ -226,6 +226,14 @@ pub(crate) fn unique_name(table: &str, column: &str, d: Dialect) -> String {
     }
 }
 
+/// Why indexes need sdb's SQL: the builders write indexes over columns only.
+pub(crate) const SQL_INDEX: &str = "expression, partial and `using` indexes are written as SQL";
+
+/// Whether an index is more than columns: an expression, a predicate, a method.
+pub(crate) fn sql_index(i: &Index) -> bool {
+    !i.is_plain() || i.method.is_some()
+}
+
 /// Whether a column carries something SQLite keeps only in sdb's own
 /// CREATE TABLE text, which a framework would write differently.
 pub(crate) fn sqlite_text_only(c: &Column) -> bool {
@@ -386,6 +394,16 @@ mod tests {
                 assert_eq!(g.code.contains("$withinTransaction = false") || g.code.contains("disable_ddl_transaction!"), rebuilds, "{}", g.code);
                 assert!(!g.code.contains("\"-- ") && !g.code.contains("'-- "), "a comment run as SQL:\n{}", g.code);
             }
+        }
+    }
+
+    #[test]
+    fn special_indexes_are_sql() {
+        let old = parse("table t { id int pk\n email text }").unwrap();
+        let new = parse("table t { id int pk\n email text\n unique index t_live (lower(email)) where (id > 0) }").unwrap();
+        for fw in Framework::ALL {
+            let g = generate(&old, &new, Dialect::Postgres, fw, &opts());
+            assert!(g.code.contains("CREATE UNIQUE INDEX t_live ON t ((lower(email))) WHERE id > 0;"), "{fw:?}:\n{}", g.code);
         }
     }
 

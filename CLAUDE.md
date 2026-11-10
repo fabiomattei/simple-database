@@ -39,6 +39,9 @@ A single-column foreign key is always `Column::references`; only keys over sever
 column). `Table::all_foreign_keys` gives both in one shape, for code that doesn't care.
 Structural edits go through `Schema::rename_table` / `drop_table` / `rename_column` /
 `drop_column`, which keep composite keys, indexes and foreign keys pointing at the right names.
+An `Index` part is a column name, or an expression kept in parentheses (`(lower(email))`;
+`Index::expression` / `expression_part`; the DSL writes `index (lower(email))`); `plain_columns`
+gives the columns only. `predicate` is a partial index's `where`, `method` Postgres's `using`.
 
 Core library (`src/`, exported from `lib.rs`):
 
@@ -103,9 +106,11 @@ leading `#` comment lines. Keep that header accurate when the DSL changes.
 - **Round-trip with Postgres/MySQL**: introspecting what `push` created must equal
   `canonical(normalize_checks(s))`. `ddl::canonical` holds what the server changes for sure
   (MySQL: indexed `text` → `varchar(255)`, padded decimal defaults; both: `DEFAULT NULL`
-  dropped, composite-pk columns NOT NULL). `diff` applies it to both sides. Check expressions
-  are rewritten by the server itself in a scratch temp table (`Database::normalize_checks`,
-  cached). Tests: `db::tests::{postgres,mysql,mariadb}_round_trip`, which run only with
+  dropped, composite-pk columns NOT NULL; MySQL: partial indexes left out; elsewhere than Postgres:
+  index methods dropped, and indexes with one other than `btree` / `hash` left out; `diff` warns). `diff` applies it to both sides. Check expressions, index
+  expressions and index predicates are rewritten by the server itself in a scratch temp table
+  (`Database::normalize_checks`, cached), read back by the same code introspection uses
+  (`pg::index_query`, `mysqldb::group_indexes`). Tests: `db::tests::{postgres,mysql,mariadb}_round_trip`, which run only with
   `SDB_TEST_POSTGRES` / `SDB_TEST_MYSQL` / `SDB_TEST_MARIADB` set to a scratch database URL (they drop all tables).
 - **Round-trip with SQLite**: `introspect(execute(schema_sql(s, Sqlite)))` must equal `s`, so
   push on an up-to-date database reports no changes. This is why SQLite DDL emits specific

@@ -2,7 +2,7 @@
 //!
 //! Only the database named in the connection URL is read.
 
-use crate::db::{Cell, QueryResult, strip_outer_parens};
+use crate::db::{Cell, Normalized, QueryResult, strip_outer_parens};
 use crate::ddl::{Dialect, check_name, quote};
 use crate::schema::*;
 use anyhow::{Context, Result};
@@ -192,32 +192,21 @@ fn introspect_table(conn: &mut Conn, name: String, mariadb: bool, skipped: &mut 
         }
     }
 
-    // One row per index column; expression indexes have no column name.
-    let stats: Vec<(String, i64, Option<String>)> = conn.exec(
-        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME FROM information_schema.STATISTICS \
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+    // One row per index column; an expression has no column name. MariaDB
+    // has no expression indexes.
+    let stats: Vec<IndexRow> = conn.exec(
+        format!(
+            "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, {}, COLLATION FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            if mariadb { "NULL" } else { "EXPRESSION" }
+        ),
         (&name,),
     )?;
-    let mut grouped: Vec<(String, bool, Option<Vec<String>>)> = Vec::new();
-    for (iname, non_unique, col) in stats {
-        if grouped.last().is_none_or(|g| g.0 != iname) {
-            grouped.push((iname, non_unique == 0, Some(vec![])));
-        }
-        let cols = &mut grouped.last_mut().unwrap().2;
-        match col {
-            Some(c) => {
-                if let Some(cols) = cols {
-                    cols.push(c);
-                }
-            }
-            None => *cols = None,
-        }
-    }
     let mut composite_pk = Vec::new();
     let mut indexes = Vec::new();
-    for (iname, unique, cols) in grouped {
+    for (iname, unique, cols) in group_indexes(stats) {
         let Some(cols) = cols else {
-            skipped.push(format!("index {iname} on {name} (on an expression)"));
+            skipped.push(format!("index {iname} on {name} (in descending order)"));
             continue;
         };
         if iname == "PRIMARY" {
@@ -238,7 +227,7 @@ fn introspect_table(conn: &mut Conn, name: String, mariadb: bool, skipped: &mut 
                 c.unique = true;
             }
         } else {
-            indexes.push(Index { name: iname, columns: cols, unique });
+            indexes.push(Index::new(iname, cols, unique));
         }
     }
 
@@ -334,6 +323,34 @@ fn single_literal(s: &str) -> Option<String> {
 /// Rewrite MySQL's spelling of an expression into plainer SQL: drop charset
 /// introducers (`_utf8mb4'x'`), use `''` instead of backslash escapes, and
 /// unquote identifiers that don't need quoting. Also returns the identifiers.
+/// A row of `information_schema.STATISTICS` (or `SHOW INDEX`): index name,
+/// non-unique, column name, expression, collation (`D` for descending).
+type IndexRow = (String, i64, Option<String>, Option<String>, Option<String>);
+
+/// The rows of each index together, in order: its name, whether it is
+/// unique, its parts (expressions in parentheses), `None` if it has a
+/// descending part, which a schema can't hold.
+fn group_indexes(rows: Vec<IndexRow>) -> Vec<(String, bool, Option<Vec<String>>)> {
+    let mut grouped: Vec<(String, bool, Option<Vec<String>>)> = Vec::new();
+    for (iname, non_unique, col, expr, collation) in rows {
+        if grouped.last().is_none_or(|g| g.0 != iname) {
+            grouped.push((iname, non_unique == 0, Some(vec![])));
+        }
+        let parts = &mut grouped.last_mut().expect("just pushed").2;
+        let part = match (col, expr) {
+            _ if collation.as_deref() == Some("D") => None,
+            (Some(c), _) => Some(c),
+            (None, Some(e)) => Some(Index::expression_part(&clean_expr(&e).0)),
+            (None, None) => None,
+        };
+        match (parts.as_mut(), part) {
+            (Some(list), Some(p)) => list.push(p),
+            _ => *parts = None,
+        }
+    }
+    grouped
+}
+
 fn clean_expr(raw: &str) -> (String, Vec<String>) {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::new();
@@ -482,12 +499,27 @@ pub fn show_create(conn: &mut Conn, table: Option<&str>) -> Result<Vec<String>> 
 
 /// Create the temporary scratch table `ddl` and return its check constraints
 /// as (name, cleaned expression).
-pub(crate) fn normalize_checks(conn: &mut Conn, ddl: &str) -> Result<Vec<(String, String)>> {
+pub(crate) fn normalize_checks(conn: &mut Conn, ddl: &[String]) -> Result<Normalized> {
     conn.query_drop("DROP TEMPORARY TABLE IF EXISTS _sdb_check")?;
-    conn.query_drop(ddl)?;
-    let create = show_create_one(conn, "_sdb_check");
+    let result = (|| {
+        for stmt in ddl {
+            conn.query_drop(stmt)?;
+        }
+        let create = show_create_one(conn, "_sdb_check")?;
+        let checks = check_constraints(&create).into_iter().map(|(n, e)| (n, clean_expr(&e).0)).collect();
+        let rows: Vec<IndexRow> = conn
+            .query_map("SHOW INDEX FROM _sdb_check", |r: mysql::Row| {
+                let unique: i64 = r.get("Non_unique").unwrap_or(1);
+                (r.get("Key_name").unwrap_or_default(), unique, r.get("Column_name").flatten(), r.get("Expression").flatten(), r.get("Collation").flatten())
+            })?;
+        let indexes = group_indexes(rows)
+            .into_iter()
+            .filter_map(|(name, unique, parts)| Some(Index::new(name, parts?, unique)))
+            .collect();
+        Ok(Normalized { checks, indexes })
+    })();
     conn.query_drop("DROP TEMPORARY TABLE IF EXISTS _sdb_check")?;
-    Ok(check_constraints(&create?).into_iter().map(|(n, e)| (n, clean_expr(&e).0)).collect())
+    result
 }
 
 // ---------------------------------------------------------------- queries

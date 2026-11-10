@@ -5,7 +5,7 @@
 //! the `search_path`. The first is the default: its tables keep plain names,
 //! the others' are qualified (`billing.invoices`).
 
-use crate::db::{Cell, QueryResult, split_statements, strip_outer_parens};
+use crate::db::{Cell, Normalized, QueryResult, split_statements, strip_outer_parens};
 use crate::schema::*;
 use anyhow::{Context, Result, bail};
 use crate::tls::{self, SslMode};
@@ -172,19 +172,7 @@ pub fn introspect(client: &mut Client, schemas: &[String], skipped: &mut Vec<Str
         ),
         8,
     )?;
-    let mut indexes = per_table(
-        client,
-        &format!(
-            "SELECT i.relname::text, ix.indisunique, {}, ix.indexprs IS NULL AND ix.indpred IS NULL, ix.indrelid \
-             FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
-             WHERE ix.indrelid IN {in_schemas} \
-             AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = ix.indexrelid \
-                             AND c.conrelid = ix.indrelid AND c.contype IN ('p', 'u', 'x')) \
-             ORDER BY ix.indrelid, i.oid",
-            attnames("ix.indkey::int2[]", "ix.indrelid")
-        ),
-        4,
-    )?;
+    let mut indexes = per_table(client, &index_query(&in_schemas), 7)?;
     let mut schema = Schema::default();
     for row in tables {
         let oid: u32 = row.get(0);
@@ -255,6 +243,40 @@ fn attnames(list: &str, rel: &str) -> String {
     )
 }
 
+/// The indexes of the tables `rels` (a subquery or list in parentheses)
+/// that aren't a constraint's, for [`index_from_row`]; the table oid last.
+fn index_query(rels: &str) -> String {
+    format!(
+        "SELECT i.relname::text, ix.indisunique, \
+         ARRAY(SELECT a.attname::text FROM generate_series(1, ix.indnkeyatts) k(ord) \
+               LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = ix.indkey[k.ord - 1] ORDER BY k.ord), \
+         ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k.ord, true) FROM generate_series(1, ix.indnkeyatts) k(ord) ORDER BY k.ord), \
+         ix.indnatts = ix.indnkeyatts AND NOT EXISTS (SELECT 1 FROM generate_series(0, ix.indnkeyatts - 1) k(n) \
+               JOIN pg_opclass o ON o.oid = ix.indclass[k.n] WHERE NOT o.opcdefault OR ix.indoption[k.n] <> 0), \
+         am.amname::text, pg_get_expr(ix.indpred, ix.indrelid, true), ix.indrelid \
+         FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_am am ON am.oid = i.relam \
+         WHERE ix.indrelid IN {rels} \
+         AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = ix.indexrelid \
+                         AND c.conrelid = ix.indrelid AND c.contype IN ('p', 'u', 'x')) \
+         ORDER BY ix.indrelid, i.oid"
+    )
+}
+
+/// An index from a row of [`index_query`]; `None` for one a schema can't
+/// hold (operator classes, ordering, included columns).
+fn index_from_row(r: &Row) -> Option<Index> {
+    if !r.get::<_, bool>(4) {
+        return None;
+    }
+    let names: Vec<Option<String>> = r.get(2);
+    let texts: Vec<String> = r.get(3);
+    let columns = names.into_iter().zip(texts).map(|(n, t)| n.unwrap_or_else(|| Index::expression_part(&clean_check(&t)))).collect();
+    let mut index = Index::new(r.get::<_, String>(0), columns, r.get(1));
+    index.method = Some(r.get::<_, String>(5)).filter(|m| m != "btree");
+    index.predicate = r.get::<_, Option<String>>(6).map(|p| clean_check(&p));
+    Some(index)
+}
+
 /// The rows of `sql` keyed by the table oid in column `oid_col`, in query order.
 fn per_table(client: &mut Client, sql: &str, oid_col: usize) -> Result<HashMap<u32, Vec<Row>>> {
     let mut out: HashMap<u32, Vec<Row>> = HashMap::new();
@@ -321,7 +343,7 @@ fn build_table(name: String, rows: Vec<Row>, constraints: Vec<Row>, index_rows: 
                     columns[i].unique = true;
                 }
             }
-            "u" => indexes.push(Index { name: cname, columns: cols, unique: true }),
+            "u" => indexes.push(Index::new(cname, cols, true)),
             "f" if cols.len() > 1 => foreign_keys.push(TableForeignKey {
                 columns: cols,
                 table: r.get(3),
@@ -350,11 +372,9 @@ fn build_table(name: String, rows: Vec<Row>, constraints: Vec<Row>, index_rows: 
     }
 
     for r in index_rows {
-        let iname: String = r.get(0);
-        if r.get::<_, bool>(3) {
-            indexes.push(Index { name: iname, unique: r.get(1), columns: r.get(2) });
-        } else {
-            skipped.push(format!("index {iname} on {name} (on an expression, or partial)"));
+        match index_from_row(&r) {
+            Some(i) => indexes.push(i),
+            None => skipped.push(format!("index {} on {name} (with an operator class, ordering or included columns)", r.get::<_, String>(0))),
         }
     }
 
@@ -455,18 +475,23 @@ fn clean_check(def: &str) -> String {
     out
 }
 
-/// Create the scratch table `ddl` in a rolled-back transaction and return
-/// its check constraints as (name, cleaned expression).
-pub(crate) fn normalize_checks(client: &mut Client, ddl: &str) -> Result<Vec<(String, String)>> {
+/// Create the scratch table `ddl` (and its indexes) in a rolled-back
+/// transaction and return its check constraints as (name, cleaned
+/// expression), and its indexes as introspection reads them.
+pub(crate) fn normalize_checks(client: &mut Client, ddl: &[String]) -> Result<Normalized> {
     client.batch_execute("BEGIN")?;
     let result = (|| {
-        client.batch_execute(ddl)?;
+        for stmt in ddl {
+            client.batch_execute(stmt)?;
+        }
         let rows = client.query(
             "SELECT conname::text, pg_get_constraintdef(oid) FROM pg_constraint \
              WHERE conrelid = '_sdb_check'::regclass AND contype = 'c'",
             &[],
         )?;
-        Ok(rows.iter().map(|r| (r.get(0), clean_check(r.get(1)))).collect())
+        let checks = rows.iter().map(|r| (r.get(0), clean_check(r.get(1)))).collect();
+        let rows = client.query(&index_query("('_sdb_check'::regclass)"), &[])?;
+        Ok(Normalized { checks, indexes: rows.iter().filter_map(index_from_row).collect() })
     })();
     client.batch_execute("ROLLBACK")?;
     result

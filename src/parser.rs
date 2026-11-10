@@ -11,6 +11,7 @@
 //!
 //!   index (team_id)
 //!   unique index users_email_role (email, role)
+//!   index (lower(email)) where (team_id is not null)
 //!   fk (team_id, role) -> team_roles (team_id, role)
 //! }
 //! ```
@@ -380,13 +381,23 @@ impl Parser {
                 Tok::Word(_) => Some(self.expect_word("index name")?),
                 _ => None,
             };
-            let columns = self.expect_paren_list("index columns")?;
+            let columns = self.expect_index_parts()?;
             let name = explicit_name.unwrap_or_else(|| Index::default_name(&table.name, &columns, unique));
-            table.indexes.push(Index {
-                name,
-                columns,
-                unique,
-            });
+            let mut index = Index::new(name, columns, unique);
+            loop {
+                let line = self.line();
+                if self.eat_keyword("using") {
+                    index.method = Some(self.expect_word("index method after 'using'")?.to_ascii_lowercase());
+                } else if self.eat_keyword("where") {
+                    match self.next() {
+                        Tok::Paren(expr) if !expr.is_empty() => index.predicate = Some(expr),
+                        other => return err(line, format!("expected (condition) after 'where', found {other}")),
+                    }
+                } else {
+                    break;
+                }
+            }
+            table.indexes.push(index);
             return Ok(());
         }
 
@@ -440,6 +451,26 @@ impl Parser {
             }
             other => err(line, format!("expected ({what}), found {other}")),
         }
+    }
+
+    /// An index's `(a, lower(b))`: column names, and expressions kept in
+    /// parentheses (see [`Index::expression`]).
+    fn expect_index_parts(&mut self) -> Result<Vec<String>, ParseError> {
+        let line = self.line();
+        let p = match self.next() {
+            Tok::Paren(p) => p,
+            other => return err(line, format!("expected (index columns), found {other}")),
+        };
+        let parts: Vec<String> = split_top_level(&p)
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| if is_word(&s) { s } else { Index::expression_part(&s) })
+            .collect();
+        if parts.is_empty() {
+            return err(line, "empty list of index columns");
+        }
+        Ok(parts)
     }
 
     fn parse_column(&mut self) -> Result<Column, ParseError> {
@@ -596,6 +627,33 @@ impl Parser {
             other => return err(line, format!("expected a default value, found {other}")),
         })
     }
+}
+
+/// Whether `s` reads as one word token: a name, not an expression.
+pub(crate) fn is_word(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+}
+
+/// `s` split at the commas outside parentheses and quotes.
+pub(crate) fn split_top_level(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut quote, mut start) = (0, None, 0);
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
 }
 
 pub fn parse(src: &str) -> Result<Schema, ParseError> {

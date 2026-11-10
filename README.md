@@ -201,6 +201,7 @@ table tag_votes {
 | Referential actions | `cascade` `set_null` `set_default` `restrict` `no_action` |
 | Defaults | `'text'` `42` `true` `null` `now` `fn()` `(any sql expression)` |
 | Table level | `index [name] (a, b)` `unique index [name] (a, b)` `pk (a, b)` `fk (a, b) -> table (x, y) [on delete <a>] [on update <a>]` (or `foreign key (a, b) references table (x, y)`) |
+| Index options | expressions among the columns `index (lower(email), team_id)`; after the list, `using <method>` (`gin`, `gist`, `hash`, `brin`, …) and `where (<condition>)` for a partial index |
 | Table header | `table people was users comment 'text' { ... }` (`was` and `comment` are optional); `table billing.invoices` is in Postgres schema `billing` |
 | Comments | `# ...` or `// ...` (kept in the file only; `comment '...'` goes to the database) |
 
@@ -214,6 +215,14 @@ table tag_votes {
 * **Comments** become Postgres `COMMENT ON`, MySQL `COMMENT`, and on SQLite a `-- comment` at the end
   of the column's line in `CREATE TABLE` (one line, since SQLite can only keep them in that text).
   `pull` reads them all back.
+* **Indexes** can be on expressions (`index (lower(email))`), partial (`unique index (email) where
+  (deleted_at is null)`) and use a Postgres method (`index (data) using gin`). Expression indexes
+  work on SQLite, Postgres and MySQL 8.0.13+, not MariaDB. Partial indexes work on SQLite and
+  Postgres; MySQL has none, so `push` leaves them out and warns. `using` is for Postgres;
+  elsewhere `btree` and `hash` make an ordinary index, and other methods (`gin`, `gist`, …),
+  which index what an ordinary index can't, are left out with a warning. Servers rewrite expressions (`lower(email::text)`), and
+  `sdb` compares them the way it compares checks (below), so an unchanged index is not a change.
+  Laravel and Rails migrations write these indexes as SQL.
 * **Postgres schemas**: `table billing.invoices { ... }` is table `invoices` in schema `billing`;
   refer to it as `-> billing.invoices.id`. Tables in the connection's default schema have no
   prefix. Constraint and index names leave the schema out (`fk_invoices_user_id`); the enum type is

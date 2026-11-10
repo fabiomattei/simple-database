@@ -92,7 +92,7 @@ impl<'a> TableDiff<'a> {
         let mut dropped_indexes: Vec<&Index> = old.indexes.iter().filter(|i| !new.indexes.contains(i)).collect();
         let mut renamed_indexes = Vec::new();
         dropped_indexes.retain(|o| {
-            let same = added_indexes.iter().position(|n| n.columns == o.columns && n.unique == o.unique);
+            let same = added_indexes.iter().position(|n| n.columns == o.columns && n.unique == o.unique && n.method == o.method && n.predicate == o.predicate);
             same.map(|i| renamed_indexes.push((*o, added_indexes.remove(i)))).is_none()
         });
         TableDiff {
@@ -242,6 +242,7 @@ pub fn plan(old: &Schema, new: &Schema, d: Dialect) -> Plan {
     let mut warnings = Vec::new();
     let mut renames = Vec::new();
     let old = apply_renames(canonical(old, d), new, d, &mut changes, &mut renames);
+    let declared = new;
     let new = canonical(new, d);
 
     let mut created = Vec::new();
@@ -332,6 +333,17 @@ pub fn plan(old: &Schema, new: &Schema, d: Dialect) -> Plan {
     for t in &dropped {
         changes.push(format!("- table {t}"));
         warnings.push(format!("dropping table {t} deletes all its data"));
+    }
+    // Indexes `canonical` leaves out.
+    for t in created.iter().chain(&altered).filter_map(|t| declared.table(t)) {
+        for i in &t.indexes {
+            let why = match &i.method {
+                Some(m) if d != Dialect::Postgres && !ordinary_method(i) => format!("{} has no {m} indexes", d.name()),
+                _ if d == Dialect::Mysql && i.predicate.is_some() => "MySQL has no partial indexes".to_string(),
+                _ => continue,
+            };
+            warnings.push(format!("{why}: index {} on {} is left out", i.name, t.name));
+        }
     }
 
     Plan { dialect: d, old, new, renames, created, altered, dropped, changes, warnings }
@@ -469,7 +481,7 @@ fn apply_renames(mut old: Schema, new: &Schema, d: Dialect, changes: &mut Vec<St
 
 /// `expr` with the identifier `old` (bare or quoted) renamed to `new`;
 /// string literals are left alone.
-fn rename_ident(expr: &str, old: &str, new: &str) -> String {
+pub(crate) fn rename_ident(expr: &str, old: &str, new: &str) -> String {
     rename_idents(expr, |word, quoted| (if quoted { word == old } else { word.eq_ignore_ascii_case(old) }).then(|| new.to_string()))
 }
 
@@ -734,7 +746,7 @@ pub fn sqlite_needs_rebuild(td: &TableDiff) -> bool {
         !c.primary_key
             && !c.unique
             && c.references.is_none()
-            && !td.old.indexes.iter().any(|i| i.columns.contains(&c.name))
+            && !td.old.indexes.iter().any(|i| i.mentions(&c.name))
     };
     !td.altered.is_empty()
         || td.pk_changed
@@ -1089,6 +1101,31 @@ mod tests {
 
     const OLD: &str = "table users { id int pk autoincrement\n name text\n legacy text }\n table logs { id int pk }";
     const NEW: &str = "table users { id int pk autoincrement\n name text not null default ''\n email text\n index (email) }\n table posts { id int pk\n user_id int -> users.id }";
+
+    #[test]
+    fn indexes_other_databases_cannot_make_are_left_out() {
+        let new = parse(
+            "table t { id int pk\n data json\n gone bool\n index t_data (data) using gin\n index t_hash (id) using hash\n \
+             unique index t_live (id) where (not gone) }",
+        )
+        .unwrap();
+        let script = |d| {
+            let m = diff(&Schema::default(), &new, d);
+            (m.script(), m.warnings)
+        };
+        let (sql, warnings) = script(Dialect::Mysql);
+        assert!(sql.contains("CREATE INDEX t_hash ON t (id);") && !sql.contains("t_data ON") && !sql.contains("t_live ON"), "{sql}");
+        assert_eq!(
+            warnings,
+            ["MySQL has no gin indexes: index t_data on t is left out", "MySQL has no partial indexes: index t_live on t is left out"]
+        );
+        let (sql, warnings) = script(Dialect::Sqlite);
+        assert!(sql.contains("CREATE UNIQUE INDEX t_live ON t (id) WHERE not gone;") && !sql.contains("t_data ON"), "{sql}");
+        assert_eq!(warnings, ["SQLite has no gin indexes: index t_data on t is left out"]);
+        let (sql, warnings) = script(Dialect::Postgres);
+        assert!(sql.contains("CREATE INDEX t_data ON t USING gin (data);") && sql.contains("USING hash (id)"), "{sql}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
 
     #[test]
     fn tables_say_how_each_table_changes() {

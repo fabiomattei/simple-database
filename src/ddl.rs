@@ -10,6 +10,16 @@ pub enum Dialect {
     Mysql,
 }
 
+impl Dialect {
+    pub fn name(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "SQLite",
+            Dialect::Postgres => "PostgreSQL",
+            Dialect::Mysql => "MySQL",
+        }
+    }
+}
+
 const RESERVED: &[&str] = &[
     "all", "and", "as", "asc", "between", "by", "case", "check", "column", "constraint", "create",
     "default", "delete", "desc", "distinct", "drop", "else", "end", "exists", "foreign", "from",
@@ -365,12 +375,19 @@ pub fn comment_sql(table: &str, column: Option<&str>, comment: Option<&str>) -> 
 }
 
 pub fn create_index_sql(table: &str, idx: &Index, d: Dialect) -> String {
+    // Expressions keep their parentheses, which MySQL requires.
+    let parts: Vec<String> = idx.columns.iter().map(|c| if Index::expression(c).is_some() { c.clone() } else { quote(c, d) }).collect();
+    let method = match &idx.method {
+        Some(m) if d == Dialect::Postgres => format!(" USING {m}"),
+        _ => String::new(),
+    };
+    let predicate = idx.predicate.as_ref().map_or(String::new(), |p| format!(" WHERE {p}"));
     format!(
-        "CREATE {}INDEX {} ON {} ({});",
+        "CREATE {}INDEX {} ON {}{method} ({}){predicate};",
         if idx.unique { "UNIQUE " } else { "" },
         quote(&idx.name, d),
         quote_table(table, d),
-        quote_list(&idx.columns, d)
+        parts.join(", ")
     )
 }
 
@@ -403,6 +420,7 @@ pub fn canonical_table(t: &Table, d: Dialect) -> Table {
         for c in t.columns.iter_mut().filter(|c| single_pk && c.primary_key && c.auto_increment && c.data_type.is_integer()) {
             c.data_type = DataType::Int;
         }
+        only_ordinary_indexes(&mut t);
         return t;
     }
     // MySQL lists foreign keys by name, and InnoDB treats RESTRICT as NO ACTION
@@ -424,7 +442,12 @@ pub fn canonical_table(t: &Table, d: Dialect) -> Table {
             same(&mut fk.on_update);
         }
     }
-    let keyed: Vec<String> = t.indexes.iter().flat_map(|i| i.columns.clone()).collect();
+    if d == Dialect::Mysql {
+        // MySQL has no partial indexes (`diff` warns).
+        t.indexes.retain(|i| i.predicate.is_none());
+        only_ordinary_indexes(&mut t);
+    }
+    let keyed: Vec<String> = t.indexes.iter().flat_map(|i| i.plain_columns().cloned()).collect();
     for c in &mut t.columns {
         if t.composite_pk.contains(&c.name) {
             c.nullable = false;
@@ -448,6 +471,21 @@ pub fn canonical_table(t: &Table, d: Dialect) -> Table {
         }
     }
     t
+}
+
+/// Whether an index's method (Postgres `using`) leaves it an ordinary
+/// B-tree index elsewhere: none, `btree` or `hash`. Others (`gin`, `gist`, …)
+/// index what a B-tree can't, so SQLite and MySQL leave them out (`diff` warns).
+pub fn ordinary_method(i: &Index) -> bool {
+    i.method.as_deref().is_none_or(|m| m == "btree" || m == "hash")
+}
+
+/// Outside Postgres: indexes without a method, the others left out.
+fn only_ordinary_indexes(t: &mut Table) {
+    t.indexes.retain(ordinary_method);
+    for i in &mut t.indexes {
+        i.method = None;
+    }
 }
 
 pub fn canonical(schema: &Schema, d: Dialect) -> Schema {

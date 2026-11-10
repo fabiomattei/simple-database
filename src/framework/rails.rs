@@ -155,6 +155,9 @@ fn create_blocker(t: &Table, d: Dialect) -> Option<&'static str> {
     if set_default(&t.all_foreign_keys()) {
         return Some("Rails has no SET DEFAULT foreign key action");
     }
+    if t.indexes.iter().any(sql_index) {
+        return Some(SQL_INDEX);
+    }
     if d == Dialect::Sqlite && sqlite_needs_sql(t) {
         return Some("checks, enums and comments are part of SQLite's table text");
     }
@@ -167,6 +170,9 @@ fn alter_blocker(td: &TableDiff, d: Dialect) -> Option<&'static str> {
     }
     if td.added.iter().any(|c| c.auto_increment) {
         return Some("a new autoincrement column");
+    }
+    if td.added_indexes.iter().any(|i| sql_index(i)) {
+        return Some(SQL_INDEX);
     }
     if set_default(&td.new.all_foreign_keys()) {
         return Some("Rails has no SET DEFAULT foreign key action");

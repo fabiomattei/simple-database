@@ -143,6 +143,9 @@ fn create_blocker(t: &Table, d: Dialect) -> Option<&'static str> {
     if t.columns.iter().any(|c| c.auto_increment && !(single_pk && c.primary_key && is_int(&c.data_type))) {
         return Some("autoincrement on a column that isn't an integer primary key");
     }
+    if t.indexes.iter().any(sql_index) {
+        return Some(SQL_INDEX);
+    }
     if d == Dialect::Sqlite && sqlite_needs_sql(t) {
         return Some("checks, enums and comments are part of SQLite's table text");
     }
@@ -155,6 +158,9 @@ fn alter_blocker(td: &TableDiff, d: Dialect) -> Option<&'static str> {
     }
     if td.added.iter().any(|c| c.auto_increment) {
         return Some("a new autoincrement column");
+    }
+    if td.added_indexes.iter().any(|i| sql_index(i)) {
+        return Some(SQL_INDEX);
     }
     let columns = td.added.iter().chain(td.dropped.iter()).copied().chain(td.altered.iter().flat_map(|(o, n)| [*o, *n]));
     if let Some(why) = columns.clone().find_map(|c| column_blocker(c, d)) {

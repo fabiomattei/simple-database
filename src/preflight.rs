@@ -134,15 +134,24 @@ pub fn row_checks(p: &Plan) -> Vec<RowCheck> {
         let existing = |cols: &[String]| cols.iter().all(|c| td.old.column(c).is_some());
         let mut check = |what: String, sql: String| out.push(RowCheck { table: table.clone(), what, sql });
         let count = |cond: String| format!("SELECT count(*) FROM {from} WHERE {cond}");
-        let duplicates = |cols: &[String]| {
-            let cs: Vec<String> = cols.iter().map(|c| col(c)).collect();
-            let set: Vec<String> = cs.iter().map(|c| format!("{c} IS NOT NULL")).collect();
+        // Rows that repeat a key: index expressions and a predicate (`where`) as well as columns.
+        let duplicates_where = |cols: &[String], predicate: Option<&str>| {
+            let cs: Vec<String> = cols
+                .iter()
+                .map(|c| match Index::expression(c) {
+                    Some(e) => format!("({})", names.expr(name, e, d)),
+                    None => col(c),
+                })
+                .collect();
+            let mut set: Vec<String> = cs.iter().map(|c| format!("{c} IS NOT NULL")).collect();
+            set.extend(predicate.map(|p| format!("({})", names.expr(name, p, d))));
             format!(
                 "SELECT coalesce(sum(n), 0) FROM (SELECT count(*) AS n FROM {from} WHERE {} GROUP BY {} HAVING count(*) > 1) sdb_dup",
                 set.join(" AND "),
                 cs.join(", ")
             )
         };
+        let duplicates = |cols: &[String]| duplicates_where(cols, None);
         let orphans = |fk: &TableForeignKey| {
             let mut conds: Vec<String> = fk.columns.iter().map(|c| format!("{} IS NOT NULL", col(c))).collect();
             // A parent made by this migration has no rows yet.
@@ -188,8 +197,11 @@ pub fn row_checks(p: &Plan) -> Vec<RowCheck> {
                 check(format!("have {} pointing at no row of {}", n.name, fk.table), orphans(&fk));
             }
         }
-        for i in td.added_indexes.iter().filter(|i| i.unique && existing(&i.columns)) {
-            check(format!("repeat a value of ({}), which becomes unique", i.columns.join(", ")), duplicates(&i.columns));
+        // Only over columns that are there now.
+        let over_existing = |i: &Index| td.new.columns.iter().filter(|c| i.mentions(&c.name)).all(|c| td.old.column(&c.name).is_some());
+        for i in td.added_indexes.iter().filter(|i| i.unique && over_existing(i)) {
+            let parts: Vec<&str> = i.columns.iter().map(|c| Index::expression(c).unwrap_or(c)).collect();
+            check(format!("repeat a value of ({}), which becomes unique", parts.join(", ")), duplicates_where(&i.columns, i.predicate.as_deref()));
         }
         let pk = td.new.primary_key();
         if td.pk_changed && !pk.is_empty() && existing(&pk) {

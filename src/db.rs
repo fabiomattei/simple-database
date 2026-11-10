@@ -25,8 +25,8 @@ pub struct Database {
     pub conn: Conn,
     label: String,
     safe_mode: SafeMode,
-    /// Server-normalized check expressions per scratch table definition.
-    check_cache: HashMap<String, Vec<(String, String)>>,
+    /// Server-normalized checks and indexes per scratch table definition.
+    check_cache: HashMap<String, Normalized>,
     cancel: Arc<Canceller>,
     tls_warning: Option<String>,
     /// Postgres: the schemas a `schema=` URL parameter lists, the default first.
@@ -360,9 +360,10 @@ impl Database {
         }
     }
 
-    /// `desired` with each check expression replaced by the server's own
-    /// spelling of it, so diffs against [`Database::introspect`] compare like
-    /// with like. Checks the server rejects are left as written.
+    /// `desired` with each check expression, and each index expression and
+    /// predicate, replaced by the server's own spelling of it, so diffs
+    /// against [`Database::introspect`] compare like with like. What the
+    /// server rejects is left as written.
     pub fn normalize_checks(&mut self, desired: &Schema) -> Schema {
         let d = self.dialect();
         let mut out = desired.clone();
@@ -376,33 +377,59 @@ impl Database {
                 .iter()
                 .filter_map(|c| c.check.clone().map(|e| (c.name.clone(), e)))
                 .collect();
-            if checks.is_empty() {
+            let indexes: Vec<&Index> = t_canon.indexes.iter().filter(|i| !i.is_plain()).collect();
+            if checks.is_empty() && indexes.is_empty() {
                 continue;
             }
-            let key = scratch_table_sql(&t_canon, &checks, d);
+            let mut ddl = vec![scratch_table_sql(&t_canon, &checks, d)];
+            for (i, idx) in indexes.iter().enumerate() {
+                ddl.push(ddl::create_index_sql("_sdb_check", &Index { name: format!("sdb_index_{i}"), ..(*idx).clone() }, d));
+            }
+            let key = ddl.join("\n");
             if !self.check_cache.contains_key(&key) {
-                let normalized = match &mut self.conn {
-                    Conn::Postgres(c) => pg::normalize_checks(c, &key),
-                    Conn::Mysql(c) => mysqldb::normalize_checks(c, &key),
-                    Conn::Sqlite(_) => unreachable!(),
-                };
-                let Ok(normalized) = normalized else { continue };
-                let by_column = normalized
+                // Without the indexes if one of them is refused, so the checks still are.
+                let Some(normalized) = self.scratch(&ddl).or_else(|| self.scratch(&ddl[..1])) else { continue };
+                let checks = normalized
+                    .checks
                     .into_iter()
                     .filter_map(|(name, expr)| {
                         let i: usize = name.strip_prefix("sdb_check_")?.parse().ok()?;
                         Some((checks.get(i)?.0.clone(), expr))
                     })
                     .collect();
-                self.check_cache.insert(key.clone(), by_column);
+                let indexes = normalized
+                    .indexes
+                    .into_iter()
+                    .filter_map(|n| {
+                        let i: usize = n.name.strip_prefix("sdb_index_")?.parse().ok()?;
+                        Some(Index { name: indexes.get(i)?.name.clone(), ..n })
+                    })
+                    .collect();
+                self.check_cache.insert(key.clone(), Normalized { checks, indexes });
             }
-            for (col, expr) in &self.check_cache[&key] {
+            let normalized = &self.check_cache[&key];
+            for (col, expr) in &normalized.checks {
                 if let Some(c) = t.columns.iter_mut().find(|c| c.name == *col) {
                     c.check = Some(expr.clone());
                 }
             }
+            for n in &normalized.indexes {
+                if let Some(i) = t.indexes.iter_mut().find(|i| i.name == n.name) {
+                    i.columns = n.columns.clone();
+                    i.predicate = n.predicate.clone();
+                }
+            }
         }
         out
+    }
+
+    /// Creates the scratch table `ddl` and reads it back; `None` if the server refuses it.
+    fn scratch(&mut self, ddl: &[String]) -> Option<Normalized> {
+        match &mut self.conn {
+            Conn::Postgres(c) => pg::normalize_checks(c, ddl).ok(),
+            Conn::Mysql(c) => mysqldb::normalize_checks(c, ddl).ok(),
+            Conn::Sqlite(_) => None,
+        }
     }
 
     /// The migration that turns `current` (introspected from this database)
@@ -412,6 +439,13 @@ impl Database {
         let named = self.normalize_checks(&named);
         let mut m = diff::diff(current, &named, self.dialect());
         m.warnings.extend(warnings);
+        if self.mariadb {
+            for t in &desired.tables {
+                for i in t.indexes.iter().filter(|i| i.columns.iter().any(|c| Index::expression(c).is_some())) {
+                    m.warnings.push(format!("MariaDB has no expression indexes: creating index {} on {} fails", i.name, t.name));
+                }
+            }
+        }
         // `tables` by the names `desired` gives them (`public.users`, not `users`).
         for t in &mut m.tables {
             if t.change != diff::TableChange::Dropped
@@ -764,6 +798,13 @@ fn is_comment(stmt: &str) -> bool {
 
 /// A throwaway table with `t`'s column types and the given checks, named
 /// `sdb_check_<i>`, used to learn how the server rewrites check expressions.
+/// What the server makes of a scratch table: its checks as (name or column,
+/// expression), and its indexes as introspection reads them.
+pub(crate) struct Normalized {
+    pub checks: Vec<(String, String)>,
+    pub indexes: Vec<Index>,
+}
+
 fn scratch_table_sql(t: &Table, checks: &[(String, String)], d: Dialect) -> String {
     let mut lines: Vec<String> = t
         .columns
@@ -1329,8 +1370,9 @@ mod tests {
         }
         let (schema, skipped) = db.introspect_with_skipped().unwrap();
         assert!(skipped.contains(&"view sdb_names".to_string()), "{skipped:?}");
-        assert!(!expr_index || skipped.iter().any(|s| s.starts_with("index sdb_expr on posts")), "{skipped:?}");
-        assert!(schema.table("sdb_names").is_none() && db.migration(&schema, &edited).is_empty());
+        let pulled_expr = schema.table("posts").unwrap().indexes.iter().any(|i| i.name == "sdb_expr" && i.columns == ["(author_id + 1)"]);
+        assert_eq!(pulled_expr, expr_index, "{:?}", schema.table("posts").unwrap().indexes);
+        assert!(schema.table("sdb_names").is_none() && db.migration(&schema, &schema).is_empty());
         db.run("DROP VIEW sdb_names").unwrap();
         if expr_index {
             db.run(if db.dialect() == Dialect::Mysql { "DROP INDEX sdb_expr ON posts" } else { "DROP INDEX sdb_expr" }).unwrap();
@@ -1344,6 +1386,8 @@ mod tests {
         live_key_changes(&mut db);
         drop_all(&mut db);
         live_enums_comments_and_keys(&mut db);
+        drop_all(&mut db);
+        live_indexes(&mut db);
         drop_all(&mut db);
         live_cycles(&mut db);
         drop_all(&mut db);
@@ -1551,6 +1595,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Expression, partial and `using` indexes: created, changed and renamed,
+    /// with nothing left to migrate after each step.
+    fn live_indexes(db: &mut Database) {
+        // MariaDB has no expression indexes.
+        let (lower, twice) = if db.server_name() == "MariaDB" { ("email", "score") } else { ("lower(email)", "(score * 2)") };
+        let steps = [
+            format!(
+                "table docs {{ id int pk\n email varchar(100)\n score int\n deleted_at timestamp\n \
+                 index ({lower}, score)\n unique index docs_live (email) where (deleted_at is null)\n index docs_hash (email) using hash }}"
+            ),
+            // The predicate and an expression change, an index is renamed.
+            format!(
+                "table docs {{ id int pk\n email varchar(100)\n score int\n deleted_at timestamp\n \
+                 index ({lower}, {twice})\n unique index docs_live (email) where (deleted_at is null and score > 0)\n index docs_by_hash (email) using hash }}"
+            ),
+        ];
+        for (i, src) in steps.iter().enumerate() {
+            let desired = parse(src).unwrap();
+            let current = db.introspect().unwrap();
+            let m = db.migration(&current, &desired);
+            assert_eq!(m.warnings.iter().any(|w| w.contains("no partial indexes")), db.dialect() == Dialect::Mysql, "step {i}: {:?}", m.warnings);
+            db.apply_migration(&m).unwrap_or_else(|e| panic!("step {i}: {e:#}\n{}", m.script()));
+            let (current, skipped) = db.introspect_with_skipped().unwrap();
+            assert!(skipped.is_empty(), "step {i}: {skipped:?}");
+            let again = db.migration(&current, &desired);
+            assert!(again.is_empty(), "step {i}: {:?}\n{}", again.changes, again.script());
+            let pulled = parse(&crate::format::format_schema(&current)).unwrap();
+            assert!(db.migration(&current, &pulled).is_empty(), "step {i}: pulled schema differs");
+        }
+        if db.dialect() != Dialect::Mysql {
+            db.run("INSERT INTO docs (id, email, score) VALUES (1, 'a', 1)").unwrap();
+            assert!(db.run("INSERT INTO docs (id, email, score) VALUES (2, 'a', 1)").is_err(), "partial unique index");
+            db.run("INSERT INTO docs (id, email, score) VALUES (3, 'A', 0)").unwrap();
+            // Preflight counts repeats by the expression, among the rows the predicate takes.
+            let current = db.introspect().unwrap();
+            for (index, repeats) in [("(lower(email)) where (score > 0)", 0), ("(lower(email))", 2)] {
+                let desired = parse(&format!("table docs {{ id int pk\n email varchar(100)\n score int\n deleted_at timestamp\n unique index docs_once {index} }}")).unwrap();
+                let m = db.migration(&current, &desired);
+                let problems = db.preflight(&m);
+                // Postgres spells it `lower(email::text)`.
+                let found: Vec<String> = problems.iter().map(|p| p.replace("::text", "")).collect();
+                let expected: Vec<String> = (repeats > 0).then(|| format!("{repeats} row(s) of docs repeat a value of (lower(email)), which becomes unique")).into_iter().collect();
+                assert_eq!(found, expected, "{index}");
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_indexes() {
+        live_indexes(&mut Database::from_sqlite(rusqlite::Connection::open_in_memory().unwrap(), "t"));
     }
 
     #[test]

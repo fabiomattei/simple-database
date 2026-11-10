@@ -1351,6 +1351,15 @@ fn dbs_candidates(before: &[char], vocab: &Vocabulary) -> Vec<Candidate> {
                 }
                 _ => vec![],
             },
+            // `index name (…) using gin where (…)`
+            (Some("index" | "unique"), _) => match last {
+                "using" => words(&["btree", "hash", "gin", "gist", "brin", "spgist"], Kind::Keyword),
+                _ if last.ends_with(')') || lower.len() >= 2 && lower[lower.len() - 2] == "using" => {
+                    let list: Vec<&str> = [("using", has("using")), ("where", has("where"))].into_iter().filter(|(_, used)| !used).map(|(w, _)| w).collect();
+                    words(&list, Kind::Keyword)
+                }
+                _ => vec![],
+            },
             _ => vec![],
         };
     }
@@ -1608,6 +1617,11 @@ bx");
         assert_eq!(names(&at("table x {\n  a int\n  fk (a) -> posts (ti")), vec!["title"]);
         assert_eq!(names(&at("table x {\n  a int\n  fk (a) -> posts (id) o")), vec!["on delete", "on update"]);
         assert_eq!(names(&at("table x {\n  x int not null com")), vec!["comment"]);
+        // After an index's columns: its method and predicate.
+        assert_eq!(names(&at("table x {\n  a int\n  index (lower(a)) u")), vec!["using"]);
+        assert_eq!(names(&at("table x {\n  a int\n  index (a) using g")), vec!["gin", "gist"]);
+        assert_eq!(names(&at("table x {\n  a int\n  unique index x_a (a) using gin w")), vec!["where"]);
+        assert_eq!(names(&at("table x {\n  a int\n  index (a) where (a > 0) w")), Vec::<&str>::new());
     }
 
     fn press(key: Key, modifiers: Modifiers) -> Event {
