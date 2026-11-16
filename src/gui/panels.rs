@@ -27,6 +27,13 @@ impl App {
                 if ui.button("Save as…").clicked() {
                     self.save_schema(true);
                 }
+                if ui
+                    .button("Open project folder…")
+                    .on_hover_text("A Laravel project: Migrate and Diagram show its migrations the database hasn't run")
+                    .clicked()
+                {
+                    self.open_project_folder();
+                }
                 ui.separator();
                 let shortcut = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
                 if ui
@@ -321,6 +328,7 @@ impl App {
             Tab::Diagram => match self.er_source {
                 DiagramSource::Database => db_name().unwrap_or_else(|| "Diagram".into()),
                 DiagramSource::SchemaFile => self.file_label(),
+                DiagramSource::PendingMigrations => "With pending migrations".into(),
             },
             Tab::Migrate => "Migration".into(),
             Tab::Query => "Query".into(),

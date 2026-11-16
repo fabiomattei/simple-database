@@ -1,6 +1,6 @@
 //! The Diagram tab: the ER canvas, and the schema edits made on it.
 
-use crate::{App, DiagramSource, Dialog, warn_color, editor, er, table_edit};
+use crate::{App, DiagramSource, Dialog, error_color, warn_color, editor, er, table_edit, theme};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 use simple_database::diagram::{self, DiagramFormat};
 use simple_database::schema::Schema;
@@ -16,12 +16,22 @@ impl App {
         }
         let browsable: HashSet<String> = self.db.as_ref().map(|d| d.schema.tables.iter().map(|t| t.name.clone()).collect()).unwrap_or_default();
         let undo_key = self.dialog.is_none() && editor::take_key(ui.ctx(), Modifiers::COMMAND, Key::Z);
+        let has_migrations = db_schema.is_some() && self.has_framework_migrations();
+        if self.er_source == DiagramSource::PendingMigrations && !has_migrations {
+            self.er_source = DiagramSource::Database;
+        }
+        let pending = if self.er_source == DiagramSource::PendingMigrations { self.pending_migrations() } else { None };
         ui.horizontal(|ui| {
             ui.label("Source:");
             let before = self.er_source;
             ui.selectable_value(&mut self.er_source, DiagramSource::SchemaFile, "Schema file");
             ui.add_enabled_ui(db_schema.is_some(), |ui| {
                 ui.selectable_value(&mut self.er_source, DiagramSource::Database, "Database");
+            });
+            ui.add_enabled_ui(has_migrations, |ui| {
+                ui.selectable_value(&mut self.er_source, DiagramSource::PendingMigrations, "With pending migrations")
+                    .on_hover_text("The database once the project folder's pending migrations run, what they add in green")
+                    .on_disabled_hover_text("Open a database, and a project folder with database/migrations (File → Open project folder…)");
             });
             if before != self.er_source {
                 self.er.reset_layout();
@@ -128,9 +138,28 @@ impl App {
                 ui.label(RichText::new("Read-only; switch to Schema file to edit").weak());
             }
         });
+        // On its own line: the toolbar is often wider than the window.
+        if self.er_source == DiagramSource::PendingMigrations {
+            ui.horizontal(|ui| match &pending {
+                None => {
+                    ui.spinner();
+                    ui.label("Reading the pending migrations…");
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(error_color(ui), format!("✖ {e}"));
+                }
+                Some(Ok(_)) => {
+                    ui.colored_label(theme::palette(ui).added, "Green: added by the pending migrations.");
+                    ui.label(RichText::new("Read-only; Migrate → From → Pending migrations lists the files").weak());
+                }
+            });
+        }
         ui.add_space(4.0);
         let schema = self.diagram_schema(&db_schema);
         self.er.row_counts = self.db.as_ref().map(|d| d.counts.iter().cloned().collect()).unwrap_or_default();
+        let explored = self.explored().filter(|_| self.er_source == DiagramSource::PendingMigrations);
+        self.er.new_tables = explored.iter().flat_map(|e| e.exploration.new_tables.iter().cloned()).collect();
+        self.er.new_columns = explored.iter().flat_map(|e| e.exploration.new_columns.iter().cloned()).collect();
         if let Some(action) = self.er.ui(ui, &schema, editable, &browsable) {
             self.diagram_action(action, &schema);
         }
@@ -209,6 +238,7 @@ impl App {
     fn diagram_schema(&self, db_schema: &Option<Schema>) -> Schema {
         match (self.er_source, db_schema) {
             (DiagramSource::Database, Some(s)) => s.clone(),
+            (DiagramSource::PendingMigrations, Some(s)) => self.explored().map_or_else(|| s.clone(), |e| e.exploration.result.clone()),
             _ => self.analysis.last_good.clone(),
         }
     }

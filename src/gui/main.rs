@@ -14,6 +14,7 @@ mod er_layout;
 mod file_menu;
 mod grid;
 mod highlight;
+mod migration_files;
 mod panels;
 mod table_edit;
 mod tabs;
@@ -78,6 +79,8 @@ struct Settings {
     hide_sidebar: bool,
     /// The Migrate tab's format: 0 SQL, 1 Laravel, 2 Rails.
     migrate_format: u8,
+    /// Opened with File → Open project folder, for its framework migrations.
+    project_dir: Option<PathBuf>,
     /// Read from older settings only: Data tabs now live in their own file, shared by all windows.
     #[serde(skip_serializing)]
     data_tabs: Vec<data_view::SavedTabs>,
@@ -125,6 +128,8 @@ impl Tab {
 enum DiagramSource {
     SchemaFile,
     Database,
+    /// The database once the project folder's pending migrations run.
+    PendingMigrations,
 }
 
 /// Something that would throw away unsaved edits, waiting for the user's answer.
@@ -135,6 +140,8 @@ enum Pending {
     ExampleSchema,
     OpenSchema,
     PullIntoEditor,
+    /// Replace the editor with the schema the pending migrations leave.
+    MigrationsResultIntoEditor,
     Quit,
 }
 
@@ -233,6 +240,8 @@ enum MigrateSource {
     SchemaFile,
     /// Another database's schema, read when it was picked.
     Database { label: String, schema: Schema },
+    /// The project folder's framework migrations the database hasn't run; shown, never pushed.
+    PendingMigrations,
 }
 
 struct Analysis {
@@ -285,6 +294,8 @@ struct Db {
     drift: Option<Drift>,
     /// A drift comparison is queued; only one at a time, so typing doesn't pile them up.
     drift_running: bool,
+    /// The project folder's pending migrations against this database.
+    framework_files: Option<migration_files::FrameworkFiles>,
 }
 
 /// [`App::table_drift`]'s answer and the two schemas it compared.
@@ -368,6 +379,10 @@ struct App {
     data_loading: Option<(String, String)>,
     migrate_source: MigrateSource,
     migrate_reading: Option<SourceRead>,
+    /// See [`Settings::project_dir`].
+    project_dir: Option<PathBuf>,
+    /// The migration file shown in the Migrate tab's pending migrations; `None` shows the resulting schema.
+    selected_migration: Option<String>,
     seed: SeedState,
     status: Option<(String, bool, Instant)>,
     dialog: Option<Dialog>,
@@ -428,6 +443,8 @@ impl App {
             data_loading: None,
             migrate_source: MigrateSource::SchemaFile,
             migrate_reading: None,
+            project_dir: settings.project_dir.clone(),
+            selected_migration: None,
             seed: SeedState {
                 rows: 10,
                 seed: seed::random_seed(),
@@ -614,6 +631,14 @@ impl App {
                     self.set_status(format!("Replaced the editor with the database schema (not saved yet){note}"), false);
                 }
             }
+            Pending::MigrationsResultIntoEditor => {
+                if let Some(explored) = self.explored() {
+                    self.schema_text = explored.text.clone();
+                    self.er.reset_layout();
+                    self.tab = Tab::Schema;
+                    self.set_status("Replaced the editor with the schema after the pending migrations (not saved yet)", false);
+                }
+            }
             Pending::Quit => {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -754,7 +779,7 @@ impl App {
         self.data.restore(self.saved_tabs.iter().find(|s| s.db == label), &schema);
         self.data_loading = None;
         let worker = Worker::spawn(conn, self.ctx.clone());
-        self.db = Some(Db { worker, label, dialect, server, safe_mode, writing_functions, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None, drift: None, drift_running: false });
+        self.db = Some(Db { worker, label, dialect, server, safe_mode, writing_functions, schema, skipped, counts, tls_warning, migration: None, framework_migration: None, preflight: None, drift: None, drift_running: false, framework_files: None });
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;
@@ -992,6 +1017,7 @@ impl eframe::App for App {
                 Some(Framework::Laravel) => 1,
                 Some(Framework::Rails) => 2,
             },
+            project_dir: self.project_dir.clone(),
             data_tabs: Vec::new(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);

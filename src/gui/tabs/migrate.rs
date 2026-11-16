@@ -15,17 +15,29 @@ impl App {
             self.no_database(ui, "Open or create a SQLite database, or connect to a server (File menu or sidebar), to push this schema into it.");
             return;
         }
-        // Pick what to compare with: the schema file or another database.
+        // Pick what to compare with: the schema file, the pending migrations or another database.
         let mut pick: Option<Option<String>> = None;
+        let mut pick_pending = false;
+        let has_migrations = self.has_framework_migrations();
         ui.horizontal(|ui| {
             ui.label("From");
             let current = match &self.migrate_source {
                 MigrateSource::SchemaFile => format!("📄 {}", self.file_label()),
                 MigrateSource::Database { label, .. } => format!("🗄 {label}"),
+                MigrateSource::PendingMigrations => "📄 Pending migrations".to_string(),
             };
             ui.menu_button(format!("{current} ⏷"), |ui| {
                 if ui.button(format!("📄 Schema file ({})", self.file_label())).clicked() {
                     pick = Some(None);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(has_migrations, egui::Button::new("📄 Pending migrations"))
+                    .on_hover_text("The project folder's migration files the database hasn't run")
+                    .on_disabled_hover_text("Open a project folder with database/migrations first (File → Open project folder…)")
+                    .clicked()
+                {
+                    pick_pending = true;
                     ui.close();
                 }
                 ui.separator();
@@ -60,6 +72,9 @@ impl App {
                 pick = Some(Some(label.clone()));
             }
         });
+        if pick_pending {
+            self.migrate_source = MigrateSource::PendingMigrations;
+        }
         if let Some(choice) = pick {
             match choice {
                 None => self.migrate_source = MigrateSource::SchemaFile,
@@ -78,10 +93,15 @@ impl App {
             });
             return;
         }
+        if matches!(self.migrate_source, MigrateSource::PendingMigrations) {
+            self.pending_migrations_view(ui);
+            return;
+        }
 
         let from_file = matches!(self.migrate_source, MigrateSource::SchemaFile);
         let (schema, source_label) = match &self.migrate_source {
             MigrateSource::Database { label, schema } => (schema.clone(), label.clone()),
+            MigrateSource::PendingMigrations => return,
             MigrateSource::SchemaFile => match &self.analysis.result {
                 Err(e) => {
                     empty_state(ui, "Schema has a syntax error", &e.to_string());
@@ -247,11 +267,13 @@ impl App {
     }
 
     /// The schema the open database should get: the schema file's, or the
-    /// source database's when comparing two databases.
+    /// source database's when comparing two databases. None for the pending
+    /// migrations, which are never pushed.
     pub(crate) fn desired_schema(&self) -> Option<Schema> {
         match &self.migrate_source {
             MigrateSource::Database { schema, .. } => Some(schema.clone()),
             MigrateSource::SchemaFile => self.analysis.result.as_ref().ok().cloned(),
+            MigrateSource::PendingMigrations => None,
         }
     }
 

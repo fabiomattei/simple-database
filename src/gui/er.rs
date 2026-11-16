@@ -26,6 +26,10 @@ pub struct ErView {
     pub selected: Option<String>,
     /// Rows per table of the open database, shown in the box titles.
     pub row_counts: HashMap<String, i64>,
+    /// Tables, and (table, column)s, drawn in the palette's `added` color:
+    /// what pending migrations add.
+    pub new_tables: HashSet<String>,
+    pub new_columns: HashSet<(String, String)>,
     fit_requested: bool,
     /// Tables left out of the diagram and its exports.
     hidden: HashSet<String>,
@@ -441,6 +445,7 @@ impl ErView {
         // ---- table boxes
         let fs = 13.0 * self.zoom;
         let header_bg = visuals.selection.bg_fill.gamma_multiply(0.8);
+        let added_color = crate::theme::palette(ui).added;
         for t in &schema.tables {
             let layout = &layouts[&t.name];
             let rect = Rect::from_min_max(to_screen(layout.rect.min), to_screen(layout.rect.max));
@@ -448,11 +453,13 @@ impl ErView {
                 continue;
             }
             let highlighted = focus.as_deref() == Some(t.name.as_str());
+            let new_table = self.new_tables.contains(&t.name);
             let radius = CornerRadius::same((6.0 * self.zoom).round().clamp(0.0, 255.0) as u8);
             painter.rect_filled(rect.translate(vec2(2.0, 3.0) * self.zoom), radius, Color32::from_black_alpha(40));
             painter.rect_filled(rect, radius, visuals.window_fill);
             let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H * self.zoom));
-            painter.rect_filled(header, CornerRadius { ne: radius.ne, nw: radius.nw, se: 0, sw: 0 }, header_bg);
+            let header_fill = if new_table { added_color.gamma_multiply(0.45) } else { header_bg };
+            painter.rect_filled(header, CornerRadius { ne: radius.ne, nw: radius.nw, se: 0, sw: 0 }, header_fill);
             painter.text(
                 header.center(),
                 Align2::CENTER_CENTER,
@@ -460,7 +467,11 @@ impl ErView {
                 FontId::proportional(fs * 1.05),
                 visuals.strong_text_color(),
             );
-            let border = if highlighted { Stroke::new(2.0, accent) } else { Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color) };
+            let border = match (highlighted, new_table) {
+                (true, _) => Stroke::new(2.0, accent),
+                (false, true) => Stroke::new(2.0, added_color),
+                (false, false) => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+            };
             painter.rect_stroke(rect, radius, border, StrokeKind::Inside);
 
             if fs < 5.0 {
@@ -477,7 +488,13 @@ impl ErView {
                 };
                 let x0 = rect.min.x + PAD_X * self.zoom;
                 painter.text(pos2(x0, y), Align2::LEFT_CENTER, tag, FontId::monospace(fs * 0.8), tag_color);
-                let name_color = if c.nullable { visuals.text_color() } else { visuals.strong_text_color() };
+                let name_color = if new_table || self.new_columns.contains(&(t.name.clone(), c.name.clone())) {
+                    added_color
+                } else if c.nullable {
+                    visuals.text_color()
+                } else {
+                    visuals.strong_text_color()
+                };
                 painter.text(pos2(x0 + 26.0 * self.zoom, y), Align2::LEFT_CENTER, &c.name, FontId::proportional(fs), name_color);
                 let ty = column_type(c);
                 painter.text(

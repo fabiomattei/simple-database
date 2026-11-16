@@ -17,6 +17,8 @@ pub struct Palette {
     /// Behind a grid's header row and the filter field.
     pub well: Color32,
     pub muted: Color32,
+    /// What pending migrations add, in the diagram.
+    pub added: Color32,
 }
 
 pub fn palette(ui: &egui::Ui) -> Palette {
@@ -37,6 +39,7 @@ fn palette_for(dark: bool) -> Palette {
             selected: Color32::from_rgb(0x46, 0x46, 0x4a),
             well: Color32::from_rgb(0x38, 0x38, 0x3b),
             muted: Color32::from_gray(0x98),
+            added: Color32::from_rgb(0x32, 0xd7, 0x4b),
         }
     } else {
         Palette {
@@ -47,6 +50,7 @@ fn palette_for(dark: bool) -> Palette {
             selected: Color32::from_gray(0xd8),
             well: Color32::from_gray(0xe2),
             muted: Color32::from_gray(0x86),
+            added: Color32::from_rgb(0x1f, 0x9d, 0x3c),
         }
     }
 }
