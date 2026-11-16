@@ -50,7 +50,7 @@ pub fn run(db: Database) -> Result<()> {
         SafeMode::Off => String::new(),
         m => format!(" Safe mode: {}.", m.label().to_lowercase()),
     };
-    println!("sdb shell — connected to {label}.{mode} Type .help for commands.");
+    println!("Simple Database shell — connected to {label}.{mode} Type .help for commands.");
     let mut buffer = String::new();
     loop {
         let prompt = if buffer.is_empty() { "sdb> " } else { "...> " };

@@ -1,6 +1,6 @@
-# sdb — schema-first database toolkit
+# Simple Database — schema-first database toolkit
 
-Design your database as a small, readable text file, then let `sdb` validate it,
+Design your database as a small, readable text file, then let Simple Database (`sdb`) validate it,
 generate SQL for SQLite / PostgreSQL / MySQL, draw ER diagrams, compute migrations,
 and push changes into a live SQLite, PostgreSQL, MySQL or MariaDB database. Includes an interactive SQL shell.
 

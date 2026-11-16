@@ -51,7 +51,7 @@ const SCHEMA_EDITOR: &str = "schema_editor";
 fn main() -> eframe::Result {
     // Wayland ignores the icon and shows the one of the `.desktop` file named after the app id.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("sdb — database designer")
+        .with_title("Simple Database")
         .with_app_id(desktop_entry::APP_ID)
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([760.0, 480.0]);
@@ -547,7 +547,7 @@ impl App {
         let path = match (&self.schema_path, save_as) {
             (Some(p), false) => p.clone(),
             _ => match rfd::FileDialog::new()
-                .add_filter("sdb schema", &["dbs"])
+                .add_filter("Simple Database schema", &["dbs"])
                 .set_file_name("schema.dbs")
                 .save_file()
             {
@@ -596,7 +596,7 @@ impl App {
                 self.set_status("Loaded the example schema (not saved yet)", false);
             }
             Pending::OpenSchema => {
-                if let Some(p) = rfd::FileDialog::new().add_filter("sdb schema", &["dbs"]).pick_file() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("Simple Database schema", &["dbs"]).pick_file() {
                     self.load_schema_file(&p);
                     self.tab = Tab::Schema;
                 }
@@ -923,11 +923,11 @@ impl eframe::App for App {
         // The schema only when there is one: a file, or edits not saved yet.
         let schema = (self.schema_path.is_some() || self.dirty()).then(|| self.file_label());
         let title = match (&self.db, &self.opening, schema) {
-            (Some(db), _, Some(file)) => format!("{} — {file} — sdb", db_title(&db.label)),
-            (Some(db), _, None) => format!("{} — sdb", db_title(&db.label)),
-            (None, Some((task, _)), _) => format!("{}… — sdb", task.what),
-            (None, None, Some(file)) => format!("{file} — sdb"),
-            (None, None, None) => "sdb".to_string(),
+            (Some(db), _, Some(file)) => format!("{} — {file} — Simple Database", db_title(&db.label)),
+            (Some(db), _, None) => format!("{} — Simple Database", db_title(&db.label)),
+            (None, Some((task, _)), _) => format!("{}… — Simple Database", task.what),
+            (None, None, Some(file)) => format!("{file} — Simple Database"),
+            (None, None, None) => "Simple Database".to_string(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         self.handle_shortcuts(&ctx);

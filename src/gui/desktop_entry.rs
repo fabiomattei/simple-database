@@ -44,7 +44,7 @@ fn desktop_file(program: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=sdb\n\
+         Name=Simple Database\n\
          Comment=Schema-first database designer\n\
          Exec={} %F\n\
          Icon={APP_ID}\n\

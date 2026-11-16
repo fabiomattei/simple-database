@@ -333,7 +333,7 @@ impl App {
     fn tab_switcher(&mut self, ui: &mut egui::Ui) -> f32 {
         let has_db = self.db.is_some();
         let items: Vec<(Tab, RichText, &str)> = [
-            (Tab::Schema, "Schema", false, "Write the schema in the sdb language"),
+            (Tab::Schema, "Schema", false, "Write the schema in the Simple Database language"),
             (Tab::Diagram, "Diagram", false, "Tables and their relations"),
             (Tab::Sql, "SQL", false, "The schema as CREATE TABLE statements"),
             (Tab::Migrate, "Migrate", false, "Bring the database up to the schema"),

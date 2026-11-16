@@ -495,7 +495,7 @@ impl App {
                         ui.painter().rect_filled(logo, egui::CornerRadius::same(14), p.accent);
                         theme::paint_glyph(ui.painter(), theme::Glyph::Database, logo.center(), 2.0, egui::Color32::WHITE);
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Welcome to sdb").font(theme::bold(22.0)));
+                        ui.label(RichText::new("Welcome to Simple Database").font(theme::bold(22.0)));
                         ui.label(RichText::new("Pick a database to work with, or start a new one.").color(p.muted));
                         ui.add_space(16.0);
                         let green = egui::Color32::from_rgb(0x34, 0xc7, 0x59);

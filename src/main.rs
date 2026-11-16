@@ -8,7 +8,7 @@ use simple_database::*;
 use std::path::{Path, PathBuf};
 use simple_database::validate::{Issue, Severity, print_issues};
 
-/// sdb — design database schemas as code, generate SQL, diff, migrate and query.
+/// Simple Database — design database schemas as code, generate SQL, diff, migrate and query.
 ///
 /// Wherever a SCHEMA argument is expected you can pass a `.dbs` schema file, an
 /// existing SQLite database file or a database URL; databases are introspected.
