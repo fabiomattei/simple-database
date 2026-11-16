@@ -12,6 +12,7 @@ pub mod discover;
 pub mod dump;
 pub mod format;
 pub mod framework;
+pub mod framework_history;
 pub mod history;
 pub mod import;
 pub mod integrity;
