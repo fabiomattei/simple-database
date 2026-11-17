@@ -14,11 +14,15 @@ use simple_database::schema::Schema;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// An exploration and its resulting schema as text, formatted once.
+/// An exploration, the framework of its files and its resulting schema as text, formatted once.
 pub(crate) struct Explored {
     pub exploration: Exploration,
+    pub framework: Framework,
     pub text: String,
 }
+
+/// What `find` looks for, for messages.
+pub(crate) const MIGRATION_FOLDERS: &str = "database/migrations (Laravel) or db/migrate (Rails)";
 
 /// The pending migrations of `project` against the database schema
 /// `current`; `result` is `None` while they are read.
@@ -29,8 +33,7 @@ pub(crate) struct FrameworkFiles {
 }
 
 impl App {
-    /// The folder whose migrations are read: the one opened with File → Open
-    /// project folder, else the schema file's.
+    /// The folder whose migrations are read: the open project's, else the schema file's.
     pub(crate) fn project_folder(&self) -> Option<PathBuf> {
         if let Some(dir) = &self.project_dir {
             return Some(dir.clone());
@@ -42,16 +45,6 @@ impl App {
     /// Whether the project folder has migration files sdb can read.
     pub(crate) fn has_framework_migrations(&self) -> bool {
         self.project_folder().is_some_and(|d| framework_history::find(&d).is_some())
-    }
-
-    pub(crate) fn open_project_folder(&mut self) {
-        let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
-        match framework_history::find(&dir) {
-            Some(p) => self.set_status(format!("Project folder {}: {} migrations in {}", dir.display(), p.framework.label(), p.dir.display()), false),
-            None => self.set_status(format!("{} has no {} folder", dir.display(), Framework::Laravel.migrations_dir()), true),
-        }
-        self.project_dir = Some(dir);
-        self.reload_pending_migrations();
     }
 
     /// The pending migrations, read again on the database thread when the
@@ -103,7 +96,7 @@ impl App {
     /// The Migrate tab when its source is the pending migrations.
     pub(crate) fn pending_migrations_view(&mut self, ui: &mut egui::Ui) {
         let Some(folder) = self.project_folder().filter(|d| framework_history::find(d).is_some()) else {
-            let body = format!("Open the project folder (File → Open project folder…); its {} files are read.", Framework::Laravel.migrations_dir());
+            let body = format!("Open the project (File → Open project…); its {MIGRATION_FOLDERS} files are read.");
             empty_state(ui, "No migrations folder", &body);
             return;
         };
@@ -139,7 +132,7 @@ impl App {
         ui.columns(2, |cols| {
             file_list(&mut cols[0], &explored.exploration, selected);
             match selected.as_ref().and_then(|id| explored.exploration.files.iter().find(|f| f.file.id == *id)) {
-                Some(f) => file_detail(&mut cols[1], f),
+                Some(f) => file_detail(&mut cols[1], f, explored.framework),
                 None => into_editor = resulting_schema(&mut cols[1], &explored.text),
             }
         });
@@ -151,12 +144,12 @@ impl App {
 }
 
 fn explore(conn: &mut Database, folder: &Path, current: &Schema) -> anyhow::Result<Explored> {
-    let project = framework_history::find(folder).ok_or_else(|| anyhow::anyhow!("{} has no {} folder", folder.display(), Framework::Laravel.migrations_dir()))?;
+    let project = framework_history::find(folder).ok_or_else(|| anyhow::anyhow!("{} has no {MIGRATION_FOLDERS} folder", folder.display()))?;
     let files = framework_history::read_files(&project)?;
     let applied = framework_history::applied(conn, current, project.framework)?;
-    let exploration = framework_history::explore(current, files, &applied, conn.dialect());
+    let exploration = framework_history::explore(current, project.framework, files, &applied, conn.dialect());
     let text = format::format_schema(&exploration.result);
-    Ok(Explored { exploration, text })
+    Ok(Explored { exploration, framework: project.framework, text })
 }
 
 /// The files, oldest first, under the resulting schema; `selected` is a file's id, `None` the resulting schema.
@@ -183,11 +176,15 @@ fn file_list(ui: &mut egui::Ui, exploration: &Exploration, selected: &mut Option
 }
 
 /// One file: what it changes, sdb's SQL for it, and its source.
-fn file_detail(ui: &mut egui::Ui, f: &FileOutcome) {
+fn file_detail(ui: &mut egui::Ui, f: &FileOutcome, framework: Framework) {
+    let (history, lang) = match framework {
+        Framework::Laravel => ("migrations", Lang::Php),
+        Framework::Rails => ("schema_migrations", Lang::Ruby),
+    };
     ui.strong(&f.file.file_name);
     egui::ScrollArea::both().id_salt("migration_file").auto_shrink([false, false]).show(ui, |ui| {
         if f.applied {
-            ui.label(RichText::new("Already applied: the database's migrations table lists it.").weak());
+            ui.label(RichText::new(format!("Already applied: the database's {history} table lists it.")).weak());
         } else {
             if f.changes.is_empty() {
                 ui.label(RichText::new("No schema changes read from this file.").weak());
@@ -206,13 +203,13 @@ fn file_detail(ui: &mut egui::Ui, f: &FileOutcome) {
             if !f.statements.is_empty() {
                 ui.add_space(8.0);
                 ui.strong("SQL");
-                ui.label(RichText::new("sdb's SQL for the same changes; Laravel's own may differ in detail.").weak());
+                ui.label(RichText::new(format!("sdb's SQL for the same changes; {}'s own may differ in detail.", framework.label())).weak());
                 highlight::code_view(ui, &f.statements.join("\n"), Lang::Sql);
             }
         }
         ui.add_space(8.0);
         ui.strong("Source");
-        highlight::code_view(ui, &f.file.source, Lang::Php);
+        highlight::code_view(ui, &f.file.source, lang);
     });
 }
 

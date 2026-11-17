@@ -30,6 +30,9 @@ pub struct ErView {
     /// what pending migrations add.
     pub new_tables: HashSet<String>,
     pub new_columns: HashSet<(String, String)>,
+    /// Tables pending migrations change that the database doesn't have:
+    /// drawn as placeholders, header in the warning color.
+    pub missing_tables: HashSet<String>,
     fit_requested: bool,
     /// Tables left out of the diagram and its exports.
     hidden: HashSet<String>,
@@ -214,6 +217,9 @@ impl ErView {
 
     /// A box's title: the table name, plus its row count when known.
     fn title(&self, t: &Table) -> String {
+        if self.missing_tables.contains(&t.name) {
+            return format!("{} (not in database)", t.name);
+        }
         match self.row_counts.get(&t.name) {
             Some(n) => format!("{} ({n})", t.name),
             None => t.name.clone(),
@@ -458,7 +464,12 @@ impl ErView {
             painter.rect_filled(rect.translate(vec2(2.0, 3.0) * self.zoom), radius, Color32::from_black_alpha(40));
             painter.rect_filled(rect, radius, visuals.window_fill);
             let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H * self.zoom));
-            let header_fill = if new_table { added_color.gamma_multiply(0.45) } else { header_bg };
+            let missing = self.missing_tables.contains(&t.name);
+            let header_fill = match (missing, new_table) {
+                (true, _) => visuals.warn_fg_color.gamma_multiply(0.45),
+                (false, true) => added_color.gamma_multiply(0.45),
+                (false, false) => header_bg,
+            };
             painter.rect_filled(header, CornerRadius { ne: radius.ne, nw: radius.nw, se: 0, sw: 0 }, header_fill);
             painter.text(
                 header.center(),
@@ -467,10 +478,11 @@ impl ErView {
                 FontId::proportional(fs * 1.05),
                 visuals.strong_text_color(),
             );
-            let border = match (highlighted, new_table) {
-                (true, _) => Stroke::new(2.0, accent),
-                (false, true) => Stroke::new(2.0, added_color),
-                (false, false) => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+            let border = match (highlighted, missing, new_table) {
+                (true, _, _) => Stroke::new(2.0, accent),
+                (false, true, _) => Stroke::new(2.0, visuals.warn_fg_color),
+                (false, false, true) => Stroke::new(2.0, added_color),
+                (false, false, false) => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
             };
             painter.rect_stroke(rect, radius, border, StrokeKind::Inside);
 

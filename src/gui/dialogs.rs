@@ -469,6 +469,8 @@ impl App {
             Dialog::Welcome { last } => {
                 let last = last.clone();
                 let mut pick: Option<String> = None;
+                let mut pick_project: Option<std::path::PathBuf> = None;
+                let mut open_project = false;
                 let mut new_conn = false;
                 let mut open_file = false;
                 let mut new_file = false;
@@ -500,6 +502,10 @@ impl App {
                         ui.add_space(16.0);
                         let green = egui::Color32::from_rgb(0x34, 0xc7, 0x59);
                         let orange = egui::Color32::from_rgb(0xff, 0x9f, 0x0a);
+                        let purple = egui::Color32::from_rgb(0xaf, 0x52, 0xde);
+                        open_project = theme::card(ui, theme::Glyph::Folder, purple, "Open project…", "A Laravel or Rails folder and its database")
+                            .on_hover_text("Connects to the project's database and shows the migrations it hasn't run")
+                            .clicked();
                         new_conn = theme::card(ui, theme::Glyph::Plus, p.accent, "New connection…", "PostgreSQL, MySQL or SQLite")
                             .on_hover_text("Fill in a connection and save it")
                             .clicked();
@@ -536,6 +542,25 @@ impl App {
                             .collect();
                         list.sort_by_key(|c| (!c.favorite, std::cmp::Reverse(c.last_used), c.name.to_lowercase()));
                         egui::ScrollArea::vertical().id_salt("welcome_conns").auto_shrink([false, false]).show(ui, |ui| {
+                            let projects: Vec<_> = self
+                                .conns
+                                .projects()
+                                .into_iter()
+                                .filter_map(|c| Some((c, c.project_dir.as_ref()?)))
+                                .filter(|(c, dir)| needle.is_empty() || c.name.to_lowercase().contains(&needle) || dir.display().to_string().to_lowercase().contains(&needle))
+                                .collect();
+                            if !projects.is_empty() {
+                                theme::section(ui, "Recent projects");
+                                for (c, dir) in projects {
+                                    let name = dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned());
+                                    let tint = conns::to_color32(c.color).unwrap_or(egui::Color32::from_rgb(0xaf, 0x52, 0xde));
+                                    let card = theme::card(ui, theme::Glyph::Folder, tint, &name, &format!("@{} · {}", c.name, dir.display()));
+                                    if card.on_hover_text("Open the project and connect to its database").clicked() {
+                                        pick_project = Some(dir.clone());
+                                    }
+                                }
+                                ui.add_space(6.0);
+                            }
                             // The last session, unless it is one of the saved connections listed anyway.
                             if let Some(t) = &last
                                 && needle.is_empty()
@@ -591,6 +616,17 @@ impl App {
                 if let Some(t) = pick {
                     self.dialog = None;
                     self.open_db(&t);
+                    return;
+                }
+                // Before the call: opening a project may open the Connections dialog.
+                if let Some(dir) = pick_project {
+                    self.dialog = None;
+                    self.open_project(dir);
+                    return;
+                }
+                if open_project {
+                    self.dialog = None;
+                    self.pick_project();
                     return;
                 }
                 if new_conn {

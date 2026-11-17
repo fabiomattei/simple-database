@@ -6,7 +6,7 @@ use simple_database::connections::{Color, Connection, Kind, SafeMode, Store};
 use simple_database::db::{self, Database};
 use simple_database::discover::{self, Found};
 use simple_database::tls;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use crate::theme::{self, Glyph};
 use crate::worker::Task;
@@ -56,6 +56,27 @@ impl Manager {
             m.password = pw.unwrap_or_default();
         }
         m.message = Some((error, true));
+        m
+    }
+
+    /// For a project folder no saved connection is linked to: the form holds
+    /// the saved connection that uses the database its `.env` / compose files
+    /// describe, else that database as a new connection, else an empty one;
+    /// in each case with the folder set, so Save links them.
+    pub fn for_project(store: &Store, dir: &Path) -> Manager {
+        let mut m = Manager::blank().with_detected(&[dir.to_path_buf()]);
+        let saved = m.detected.iter().find_map(|f| store.connections.iter().find(|c| db::redact(&c.target(None)) == db::redact(&f.target)).map(|c| (c, f.source.clone())));
+        let message = if let Some((c, source)) = saved {
+            m.load(c);
+            format!("@{} uses the database in {source}: Save to link it to the project, then Connect", c.name)
+        } else if let Some(f) = m.detected.first().cloned() {
+            m.fill_from_found(store, &f);
+            format!("Found in {}: Save to link it to the project, then Connect", f.source)
+        } else {
+            "No database found in the project's .env or compose files: fill one in, then Save to link it".to_string()
+        };
+        m.form.project_dir = Some(dir.to_path_buf());
+        m.message = Some((message, false));
         m
     }
 
@@ -263,19 +284,26 @@ impl Manager {
                 self.connect(store, action);
             }
         }
-        if let Some(f) = detected_pick
-            && let Ok((mut c, pw)) = Connection::from_target(&store.unique_name(&f.name), &f.target)
-        {
-            c.save_password = pw.is_some();
+        if let Some(f) = detected_pick {
             self.reset();
-            self.form = c;
-            self.password_edited = pw.is_some();
-            self.password = pw.unwrap_or_default();
-            self.message = Some((format!("Found in {}; Save to keep it", f.source), false));
+            if self.fill_from_found(store, &f) {
+                self.message = Some((format!("Found in {}; Save to keep it", f.source), false));
+            }
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.label(RichText::new("Double-click a connection to connect.").small().color(p.muted));
         });
+    }
+
+    /// Fill the form with a database found in a project, as a new connection;
+    /// false when its target can't be read.
+    fn fill_from_found(&mut self, store: &Store, f: &Found) -> bool {
+        let Ok((mut c, pw)) = Connection::from_target(&store.unique_name(&f.name), &f.target) else { return false };
+        c.save_password = pw.is_some();
+        self.form = c;
+        self.password_edited = pw.is_some();
+        self.password = pw.unwrap_or_default();
+        true
     }
 
     /// The header with the connection's name and kind, the form in groups, and
@@ -490,6 +518,24 @@ impl Manager {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(egui::TextEdit::singleline(&mut f.group).hint_text("none").desired_width(ui.available_width()));
                 });
+            });
+            field(ui, "Project", |ui| {
+                let unlink = f.project_dir.is_some() && ui.button("Unlink").on_hover_text("Forget the project folder").clicked();
+                let choose = ui
+                    .button("Choose…")
+                    .on_hover_text("The Laravel or Rails folder this database belongs to: opening the project connects here, and connecting here opens the project");
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let text = f.project_dir.as_ref().map_or_else(|| "none".to_string(), |d| d.display().to_string());
+                    ui.add(egui::Label::new(RichText::new(text).color(p.muted)).truncate());
+                });
+                if choose.clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    f.project_dir = Some(dir);
+                }
+                if unlink {
+                    f.project_dir = None;
+                }
             });
             field(ui, "Color", |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {

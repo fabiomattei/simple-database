@@ -16,9 +16,9 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | Tab | What you do there |
 |---|---|
 | **Schema** | Edit the `.dbs` file with syntax highlighting and line numbers. Errors and design warnings update as you type |
-| **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. **Auto layout** keeps related tables together (parents left of the tables that reference them, tall layers wrapped into several columns, unrelated tables in a grid at the end) without overlaps; **Tidy** only moves overlapping tables apart, and a table that grows pushes its neighbors aside. **Browse data** (or right-click a table → **Browse data**, or double-click it in the read-only database diagram) opens the selected table in the Data tab. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file, the live database, or the database **With pending migrations** (see [Pending Laravel migrations](#pending-laravel-migrations)), what they add drawn in green. The schema file's diagram is editable (see below). **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
+| **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. **Auto layout** keeps related tables together (parents left of the tables that reference them, tall layers wrapped into several columns, unrelated tables in a grid at the end) without overlaps; **Tidy** only moves overlapping tables apart, and a table that grows pushes its neighbors aside. **Browse data** (or right-click a table → **Browse data**, or double-click it in the read-only database diagram) opens the selected table in the Data tab. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file, the live database, or the database **With pending migrations** (see [Pending framework migrations](#pending-framework-migrations)), what they add drawn in green. The schema file's diagram is editable (see below). **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
 | **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save. In SQLite it is editable and kept in sync with the schema (see below) |
-| **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, another database (a saved connection or a SQLite file), to make the open database match it, or the project's **Pending migrations** (shown, never pushed; see [Pending Laravel migrations](#pending-laravel-migrations)). **Show as** switches the right-hand side between the SQL and the same changes as a **Laravel** or **Rails** migration, to **Copy** or **Save as…** (into the project's `database/migrations` or `db/migrate` next to the schema file, when there is one). **Pull** replaces the editor with the database's schema |
+| **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, another database (a saved connection or a SQLite file), to make the open database match it, or the project's **Pending migrations** (shown, never pushed; see [Pending framework migrations](#pending-framework-migrations)). **Show as** switches the right-hand side between the SQL and the same changes as a **Laravel** or **Rails** migration, to **Copy** or **Save as…** (into the project's `database/migrations` or `db/migrate` next to the schema file, when there is one). **Pull** replaces the editor with the database's schema |
 | **Query** | Run SQL and see the results in a grid. **Run** (Ctrl+Enter) runs the selection, or else the statement at the caret (the one it is in, or the last one before it); **Run all** (Ctrl+Shift+Enter) runs the whole editor. Shows up to 10,000 rows per result. **Explain** shows the query plan of what Run would run: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept. **History** lists past queries (searchable; click to load, double-click to run all of it) and saved queries (**Save query…**). **Export** saves the result as CSV, TSV, JSON, JSON Lines, Markdown, HTML or SQL INSERTs, or copies it |
 | **Data** | Browse and edit tables, each in its own tab, 200 rows per page (see below) |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
@@ -570,28 +570,49 @@ each framework writes some types its own way, which `sdb` sees as differences: L
 booleans (`tinyint(1)`), `varchar` without a length and `uuid` (`varchar`), and both frameworks'
 unique columns (a separate unique index rather than an inline `UNIQUE`).
 
-### Pending Laravel migrations
+### Pending framework migrations
 
-The app can show what a Laravel project's migrations would do to the open database before they
-run. **File → Open project folder…** picks the project (without one, the schema file's folder is
-used); its `database/migrations` files are read. A file counts as pending when Laravel's
-`migrations` table doesn't list it. Then:
+The app can show what a Laravel or Rails project's migrations would do to its database before
+they run. **Open project…** (Welcome window or File menu) takes the project's root folder and
+opens it with its database:
+
+* A saved connection whose **Project** (Connections dialog) is that folder is connected to.
+* Otherwise the Connections dialog opens with the project filled in: the saved connection that
+  uses the database the project's `.env` / compose files describe, else that database as a new
+  connection. **Save** links the two, so next time it opens in one step. Nothing is saved
+  without Save.
+* Connecting to a linked connection, from anywhere, opens its project too. The Welcome window
+  lists them under **Recent projects**.
+
+The project's `database/migrations` (Laravel) or `db/migrate` (Rails) files are read (without a
+project, those next to the schema file). A file counts as pending when the framework's history
+table (`migrations`, `schema_migrations`) doesn't list it. The window opens on the diagram:
 
 * **Migrate → From → Pending migrations** lists the files, applied (✔) or pending (•, with a ⚠
   count). A pending file shows its changes, `sdb`'s SQL for them in the database's dialect and
-  its PHP. **Resulting schema** is the database once every pending file has run, to **Copy** or
-  **Open in Schema tab**. **⟳ Reload** reads the files again. There is no Push: let Laravel run
-  its migrations, so its `migrations` table stays right.
+  its source. **Resulting schema** is the database once every pending file has run, to **Copy**
+  or **Open in Schema tab**. **⟳ Reload** reads the files again. There is no Push: let the
+  framework run its migrations, so its history table stays right.
 * **Diagram → With pending migrations** draws that resulting schema, new tables and columns in
-  green.
+  green. A file that adds columns to a table the database doesn't have would fail when run; its
+  columns are still drawn, on a placeholder table with an orange header marked *not in database*,
+  so you can see what the file meant to do (its SQL leaves the placeholder out).
 
-The files are read, not run (no PHP needed): `up()`'s `Schema` builder calls
-(`Schema::create` / `table` / `drop` / `rename`, column types and modifiers, `constrained()`,
-`foreign()`, indexes, `renameColumn`, `dropColumn`, …). Anything else (`DB::statement`, `if`,
-loops, macros, generated columns) is left out with a warning naming its line, and so is a change
-to something that isn't there. `constrained()` without a table guesses it with the regular
+The files are read, not run (no PHP or Ruby needed):
+
+* Laravel: `up()`'s `Schema` builder calls (`Schema::create` / `table` / `drop` / `rename`,
+  column types and modifiers, `constrained()`, `foreign()`, indexes, `renameColumn`,
+  `dropColumn`, …).
+* Rails: `up` (else `change`) with `create_table` / `change_table` blocks (`t.string`,
+  `t.references`, `t.timestamps`, `t.index`, …), `add_column`, `change_column`,
+  `change_column_null` / `_default`, `remove_column`, `rename_column`, `add_index`,
+  `add_reference`, `add_foreign_key`, `create_join_table`, `rename_table`, `drop_table`, ….
+
+Anything else (`DB::statement`, `execute`, `reversible`, conditions, loops, macros, generated
+columns) is left out with a warning naming its line, and so is a change to something that isn't
+there. A table guessed from a column (`constrained()`, `foreign_key: true`) uses the regular
 English plural (`category_id` → `categories`); name the table for irregular ones. The SQL shown
-is `sdb`'s, and Laravel's own may differ in detail (index and constraint names, for one).
+is `sdb`'s, and the framework's own may differ in detail (index and constraint names, for one).
 
 ### Migration files
 

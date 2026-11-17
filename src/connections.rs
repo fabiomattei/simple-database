@@ -120,6 +120,10 @@ pub struct Connection {
     pub last_used: Option<u64>,
     /// What may run without asking.
     pub safe_mode: SafeMode,
+    /// The Laravel or Rails project folder this database belongs to: opening
+    /// the project connects here, and connecting here opens the project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<PathBuf>,
 }
 
 /// Characters escaped in the user, password and database parts of a URL.
@@ -491,6 +495,19 @@ impl Store {
         v
     }
 
+    /// The connection linked to the project folder `dir`, if any.
+    pub fn linked_to(&self, dir: &Path) -> Option<&Connection> {
+        let same = |p: &Path| p == dir || (p.canonicalize().ok().is_some_and(|a| dir.canonicalize().ok() == Some(a)));
+        self.connections.iter().find(|c| c.project_dir.as_deref().is_some_and(same))
+    }
+
+    /// Connections linked to a project folder, most recently used first.
+    pub fn projects(&self) -> Vec<&Connection> {
+        let mut v: Vec<&Connection> = self.connections.iter().filter(|c| c.project_dir.is_some()).collect();
+        v.sort_by_key(|c| std::cmp::Reverse(c.last_used));
+        v
+    }
+
     /// Group names in order, `""` (ungrouped) last; within each group the
     /// matching connections, sorted by name.
     pub fn grouped(&self, query: &str) -> Vec<(&str, Vec<&Connection>)> {
@@ -590,6 +607,28 @@ mod tests {
         let (c, _) = Connection::from_target("l", "app.db").unwrap();
         assert_eq!((c.kind, c.target(None).as_str()), (Kind::Sqlite, "app.db"));
         assert!(Connection::from_target("x", "redis://h").is_err());
+    }
+
+    #[test]
+    fn connections_link_to_project_folders() {
+        // A file written before connections had a project folder still loads.
+        let dir = std::env::temp_dir().join(format!("sdb-conn-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("connections.json"), r#"{"connections":[{"name":"old","kind":"mysql","host":"h","database":"app"}]}"#).unwrap();
+        let mut store = Store::load_from(&dir).unwrap();
+        assert_eq!(store.get("old").unwrap().project_dir, None);
+        let project = dir.join("shop");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut c = store.get("old").unwrap().clone();
+        c.project_dir = Some(project.clone());
+        store.upsert(Some("old"), c, None).unwrap();
+        store.save().unwrap();
+        let store = Store::load_from(&dir).unwrap();
+        assert_eq!(store.linked_to(&project.join(".")).map(|c| c.name.as_str()), Some("old"));
+        assert_eq!(store.linked_to(&dir), None);
+        assert_eq!(store.projects().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

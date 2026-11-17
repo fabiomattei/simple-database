@@ -4,6 +4,25 @@
 
 use crate::schema::*;
 
+/// What a reader got from a migration file: its operations, in order, and
+/// what it couldn't follow.
+pub(super) struct Reading {
+    pub operations: Vec<Operation>,
+    pub warnings: Vec<String>,
+}
+
+impl Reading {
+    pub fn new() -> Reading {
+        Reading { operations: Vec::new(), warnings: Vec::new() }
+    }
+
+    /// Notes that the code at `line` was left out.
+    pub fn skip(&mut self, line: usize, what: &str) {
+        let what: String = if what.chars().count() > 80 { what.chars().take(77).chain("...".chars()).collect() } else { what.to_string() };
+        self.warnings.push(format!("line {line}: not read: {what}"));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Operation {
     CreateTable(String),
@@ -15,6 +34,8 @@ pub(super) enum Operation {
     ChangeColumn { table: String, column: Column },
     DropColumn { table: String, column: String },
     RenameColumn { table: String, from: String, to: String },
+    SetNullable { table: String, column: String, nullable: bool },
+    SetDefault { table: String, column: String, default: Option<DefaultValue> },
     AddIndex { table: String, index: Index },
     /// The index named `name`. A database may know it under another name, or
     /// as a column's `unique`: then the index, or one-column unique, over `columns`.
@@ -69,6 +90,8 @@ pub(super) fn apply(schema: &mut Schema, op: &Operation) -> Result<(), String> {
             note_rename(&mut c.was, from, to);
             schema.rename_column(table, from, to);
         }
+        Operation::SetNullable { table, column, nullable } => column_mut(schema, table, column)?.nullable = *nullable,
+        Operation::SetDefault { table, column, default } => column_mut(schema, table, column)?.default = default.clone(),
         Operation::AddIndex { table, index } => table_mut(schema, table)?.indexes.push(index.clone()),
         Operation::DropIndex { table, name, columns } => drop_index(table_mut(schema, table)?, name, columns)?,
         Operation::RenameIndex { table, from, to } => {

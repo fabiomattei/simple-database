@@ -34,7 +34,7 @@ impl App {
                 if ui
                     .add_enabled(has_migrations, egui::Button::new("📄 Pending migrations"))
                     .on_hover_text("The project folder's migration files the database hasn't run")
-                    .on_disabled_hover_text("Open a project folder with database/migrations first (File → Open project folder…)")
+                    .on_disabled_hover_text("Open a project with database/migrations or db/migrate first (File → Open project…)")
                     .clicked()
                 {
                     pick_pending = true;

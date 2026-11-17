@@ -4,25 +4,14 @@
 //! isn't a builder call (raw SQL, conditions, loops, macros) is left out with
 //! a warning naming its line.
 
-use super::operations::Operation;
+use super::inflection::plural;
+use super::operations::{Operation, Reading};
 use super::php_syntax::{self, Call, Spanned, Statement, Value};
 use crate::schema::*;
 
-pub(super) struct Reading {
-    pub operations: Vec<Operation>,
-    pub warnings: Vec<String>,
-}
-
-impl Reading {
-    fn skip(&mut self, line: usize, what: &str) {
-        let what: String = if what.chars().count() > 80 { what.chars().take(77).chain("...".chars()).collect() } else { what.to_string() };
-        self.warnings.push(format!("line {line}: not read: {what}"));
-    }
-}
-
 pub(super) fn read(source: &str) -> Reading {
     let tokens = php_syntax::tokenize(source);
-    let mut out = Reading { operations: Vec::new(), warnings: Vec::new() };
+    let mut out = Reading::new();
     match php_syntax::method_body(&tokens, "up") {
         Some(body) => schema_statements(body, &mut out),
         None => out.warnings.push("no up() method".into()),
@@ -318,17 +307,8 @@ impl KeyDraft {
 }
 
 /// The table `constrained()` guesses from a column: `author_id` → `authors`.
-/// Laravel's inflector knows irregular plurals; these are the regular rules.
 fn guessed_table(column: &str) -> String {
-    let base = column.strip_suffix("_id").unwrap_or(column);
-    let consonant_y = base.len() > 1 && base.ends_with('y') && !base[..base.len() - 1].ends_with(['a', 'e', 'i', 'o', 'u']);
-    if consonant_y {
-        format!("{}ies", &base[..base.len() - 1])
-    } else if ["s", "x", "z", "ch", "sh"].iter().any(|e| base.ends_with(e)) {
-        format!("{base}es")
-    } else {
-        format!("{base}s")
-    }
+    plural(column.strip_suffix("_id").unwrap_or(column))
 }
 
 /// Laravel's name for an index: `users_email_unique`.

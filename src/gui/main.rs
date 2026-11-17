@@ -16,6 +16,7 @@ mod grid;
 mod highlight;
 mod migration_files;
 mod panels;
+mod project;
 mod table_edit;
 mod tabs;
 mod theme;
@@ -79,7 +80,7 @@ struct Settings {
     hide_sidebar: bool,
     /// The Migrate tab's format: 0 SQL, 1 Laravel, 2 Rails.
     migrate_format: u8,
-    /// Opened with File → Open project folder, for its framework migrations.
+    /// The open project's folder (File → Open project…), for its framework migrations.
     project_dir: Option<PathBuf>,
     /// Read from older settings only: Data tabs now live in their own file, shared by all windows.
     #[serde(skip_serializing)]
@@ -783,6 +784,10 @@ impl App {
         self.query_out = None;
         self.seed.tables.clear();
         self.seed.report = None;
+        // A connection linked to a project opens the project.
+        if let Some(dir) = self.db.as_ref().and_then(|d| self.linked_project(&d.label)) {
+            self.show_project(dir);
+        }
     }
 
     /// Queue database work; `then` runs on the UI thread with its result.

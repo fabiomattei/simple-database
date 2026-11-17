@@ -17,7 +17,8 @@ impl App {
         let browsable: HashSet<String> = self.db.as_ref().map(|d| d.schema.tables.iter().map(|t| t.name.clone()).collect()).unwrap_or_default();
         let undo_key = self.dialog.is_none() && editor::take_key(ui.ctx(), Modifiers::COMMAND, Key::Z);
         let has_migrations = db_schema.is_some() && self.has_framework_migrations();
-        if self.er_source == DiagramSource::PendingMigrations && !has_migrations {
+        // Not while a project's database is still connecting.
+        if self.er_source == DiagramSource::PendingMigrations && !self.has_framework_migrations() {
             self.er_source = DiagramSource::Database;
         }
         let pending = if self.er_source == DiagramSource::PendingMigrations { self.pending_migrations() } else { None };
@@ -31,7 +32,7 @@ impl App {
             ui.add_enabled_ui(has_migrations, |ui| {
                 ui.selectable_value(&mut self.er_source, DiagramSource::PendingMigrations, "With pending migrations")
                     .on_hover_text("The database once the project folder's pending migrations run, what they add in green")
-                    .on_disabled_hover_text("Open a database, and a project folder with database/migrations (File → Open project folder…)");
+                    .on_disabled_hover_text("Open a project with database/migrations or db/migrate, and its database (File → Open project…)");
             });
             if before != self.er_source {
                 self.er.reset_layout();
@@ -148,9 +149,24 @@ impl App {
                 Some(Err(e)) => {
                     ui.colored_label(error_color(ui), format!("✖ {e}"));
                 }
-                Some(Ok(_)) => {
-                    ui.colored_label(theme::palette(ui).added, "Green: added by the pending migrations.");
-                    ui.label(RichText::new("Read-only; Migrate → From → Pending migrations lists the files").weak());
+                Some(Ok(explored)) => {
+                    let files = &explored.exploration.files;
+                    let pending = files.iter().filter(|f| !f.applied).count();
+                    let problems = files.iter().filter(|f| !f.warnings.is_empty()).count();
+                    if pending == 0 {
+                        ui.label(format!("No pending migrations: the database has run all {} files.", files.len()));
+                    } else {
+                        ui.colored_label(theme::palette(ui).added, format!("{pending} pending migration(s); green: what they add."));
+                    }
+                    let missing = explored.exploration.missing_tables.len();
+                    if missing > 0 {
+                        ui.colored_label(warn_color(ui), format!("Orange: {missing} table(s) the migrations change but the database doesn't have."));
+                    }
+                    if problems > 0 {
+                        ui.colored_label(warn_color(ui), format!("⚠ {problems} file(s) with parts that couldn't be applied: see Migrate → From → Pending migrations"));
+                    } else {
+                        ui.label(RichText::new("Read-only; Migrate → From → Pending migrations lists the files").weak());
+                    }
                 }
             });
         }
@@ -160,6 +176,7 @@ impl App {
         let explored = self.explored().filter(|_| self.er_source == DiagramSource::PendingMigrations);
         self.er.new_tables = explored.iter().flat_map(|e| e.exploration.new_tables.iter().cloned()).collect();
         self.er.new_columns = explored.iter().flat_map(|e| e.exploration.new_columns.iter().cloned()).collect();
+        self.er.missing_tables = explored.iter().flat_map(|e| e.exploration.missing_tables.iter().cloned()).collect();
         if let Some(action) = self.er.ui(ui, &schema, editable, &browsable) {
             self.diagram_action(action, &schema);
         }

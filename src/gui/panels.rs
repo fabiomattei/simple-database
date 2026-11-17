@@ -28,11 +28,11 @@ impl App {
                     self.save_schema(true);
                 }
                 if ui
-                    .button("Open project folder…")
-                    .on_hover_text("A Laravel project: Migrate and Diagram show its migrations the database hasn't run")
+                    .button("Open project…")
+                    .on_hover_text("A Laravel or Rails project folder: connects to its database and shows the migrations it hasn't run")
                     .clicked()
                 {
-                    self.open_project_folder();
+                    self.pick_project();
                 }
                 ui.separator();
                 let shortcut = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
