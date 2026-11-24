@@ -472,6 +472,7 @@ impl App {
                 let mut new_conn = false;
                 let mut open_file = false;
                 let mut new_file = false;
+                let mut laravel = false;
                 let mut skip = false;
                 let p = theme::palette_for_ctx(ctx);
                 let screen = ctx.content_rect();
@@ -496,7 +497,7 @@ impl App {
                         theme::paint_glyph(ui.painter(), theme::Glyph::Database, logo.center(), 2.0, egui::Color32::WHITE);
                         ui.add_space(8.0);
                         ui.label(RichText::new("Welcome to Simple Database").font(theme::bold(22.0)));
-                        ui.label(RichText::new("Pick a database to work with, or start a new one.").color(p.muted));
+                        ui.label(RichText::new("Pick a database or a Laravel project to work with, or start a new database.").color(p.muted));
                         ui.add_space(16.0);
                         let green = egui::Color32::from_rgb(0x34, 0xc7, 0x59);
                         let orange = egui::Color32::from_rgb(0xff, 0x9f, 0x0a);
@@ -505,6 +506,10 @@ impl App {
                             .clicked();
                         open_file = theme::card(ui, theme::Glyph::Folder, orange, "Open SQLite file…", "A .db, .sqlite or .sqlite3 file").clicked();
                         new_file = theme::card(ui, theme::Glyph::Database, green, "New SQLite database…", "An empty file to push a schema into").clicked();
+                        let violet = egui::Color32::from_rgb(0xaf, 0x52, 0xde);
+                        laravel = theme::card(ui, theme::Glyph::Folder, violet, "Open Laravel project…", "Browse its migration history")
+                            .on_hover_text("Pick the project folder (or its database/migrations): the History tab shows how its data model evolved")
+                            .clicked();
                         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                             ui.label(RichText::new("Help → Example schema shows a sample schema to start from.").small().color(p.muted));
                             ui.add_space(4.0);
@@ -581,6 +586,19 @@ impl App {
                         });
                     });
                 });
+                if laravel {
+                    let Some(folder) = rfd::FileDialog::new().pick_folder() else { return };
+                    match simple_database::laravel::resolve_dir(&folder) {
+                        Some(dir) => {
+                            self.dialog = None;
+                            self.history.open(dir);
+                            self.tab = Tab::History;
+                        }
+                        // The welcome screen stays, to pick another folder or something else.
+                        None => self.set_status(format!("No Laravel migrations in {}", folder.display()), true),
+                    }
+                    return;
+                }
                 if new_file {
                     self.dialog = None;
                     if let Some(p) = rfd::FileDialog::new().add_filter("SQLite database", &["db"]).set_file_name("app.db").save_file() {

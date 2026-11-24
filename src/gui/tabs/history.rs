@@ -21,6 +21,8 @@ pub(crate) enum HistoryView {
     #[default]
     Diagram,
     Schema,
+    /// The migration's PHP source.
+    File,
 }
 
 #[derive(Default)]
@@ -46,7 +48,7 @@ pub(crate) struct HistoryState {
     /// A folder was looked for (or the saved one opened) once.
     searched: bool,
     /// The `.dbs` text of the selected step, made when shown.
-    text: Option<(usize, String)>,
+    text: Option<(usize, HistoryView, String)>,
 }
 
 fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
@@ -63,6 +65,15 @@ fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
         })
         .unwrap_or_default();
     out.sort();
+    out
+}
+
+/// A step's warnings under its file's path, for the clipboard.
+fn warning_text(step: &Step) -> String {
+    let mut out = format!("{}\n", step.file.display());
+    for w in &step.warnings {
+        out.push_str(&format!("  ⚠ {w}\n"));
+    }
     out
 }
 
@@ -163,6 +174,7 @@ impl App {
         let h = &mut self.history;
 
         let mut pick = false;
+        let mut copied = None;
         egui::Panel::top("history_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 match &h.dir {
@@ -177,8 +189,21 @@ impl App {
                 if h.dir.is_some() && ui.button("Reload").clicked() {
                     h.load();
                 }
+                let warned: Vec<&Step> = h.steps().unwrap_or_default().iter().map(|(s, _)| s).filter(|s| !s.warnings.is_empty()).collect();
+                if !warned.is_empty()
+                    && ui
+                        .button(format!("Copy all warnings ({})", warned.len()))
+                        .on_hover_text("Every migration with a warning: its file and the messages, as text")
+                        .clicked()
+                {
+                    ui.ctx().copy_text(warned.iter().map(|s| warning_text(s)).collect::<Vec<_>>().join("\n"));
+                    copied = Some(warned.len());
+                }
             });
         });
+        if let Some(n) = copied {
+            self.set_status(format!("Copied the warnings of {n} migration{}", if n == 1 { "" } else { "s" }), false);
+        }
         if pick && let Some(folder) = rfd::FileDialog::new().pick_folder() {
             match laravel::resolve_dir(&folder) {
                 Some(dir) => self.history.open(dir),
@@ -202,14 +227,18 @@ impl App {
             Some(Ok(s)) if s.is_empty() => {
                 ui.label(RichText::new("The folder has no migrations yet.").weak());
             }
-            Some(Ok(steps)) => steps_view(h, ui, steps),
+            Some(Ok(steps)) => copied = steps_view(h, ui, steps).then_some(1),
         }
         h.loaded = loaded;
+        if copied.is_some() {
+            self.set_status("Copied the warnings with the migration's file name", false);
+        }
     }
 }
 
 /// The step list, the changes of the selected step and its diagram or schema.
-fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]) {
+/// Returns whether a step's warnings were copied.
+fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]) -> bool {
     h.selected = h.selected.min(steps.len() - 1);
     if !h.arranged {
         h.er.arrange(ui, &every_table(steps));
@@ -258,7 +287,10 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                 if i == h.selected && h.shown_step != Some(i) {
                     resp.scroll_to_me(None);
                 }
-                let hover = format!("{}{}", step.id, step.date.as_deref().map(|d| format!("\n{d}")).unwrap_or_default());
+                let mut hover = format!("{}{}", step.id, step.date.as_deref().map(|d| format!("\n{d}")).unwrap_or_default());
+                for w in &step.warnings {
+                    hover.push_str(&format!("\n⚠ {w}"));
+                }
                 if resp.on_hover_text(hover).clicked() {
                     h.selected = i;
                 }
@@ -273,12 +305,30 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
         h.er_changes.selected = h.er.selected.clone();
     }
     let (step, c) = &steps[h.selected];
+    let mut copied_one = false;
     egui::Panel::right("history_changes").resizable(true).default_size(320.0).min_size(200.0).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             ui.label(RichText::new(&step.title).font(theme::bold(15.0)));
             ui.label(RichText::new(step.file.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).weak().small());
             ui.add_space(6.0);
+            // Warnings first: a long list of changes would push them out of sight.
+            if !step.warnings.is_empty() {
+                let warn = warn_color(ui);
+                egui::Frame::new().fill(warn.gamma_multiply(0.12)).stroke(egui::Stroke::new(1.0, warn.gamma_multiply(0.5))).corner_radius(6).inner_margin(8).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("⚠ Not modeled: the diagram may miss what these do").color(warn).strong());
+                    for w in &step.warnings {
+                        ui.label(RichText::new(format!("• {w}")).color(warn));
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("Copy with file name").on_hover_text("The migration's path and these messages, as text").clicked() {
+                        ui.ctx().copy_text(warning_text(step));
+                        copied_one = true;
+                    }
+                });
+                ui.add_space(8.0);
+            }
             if c.tables.is_empty() {
                 ui.label(RichText::new("No change to the schema.").weak());
             }
@@ -289,22 +339,25 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                     Mark::Dropped => "−",
                     _ => "~",
                 };
-                let resp = ui.add(egui::Label::new(RichText::new(format!("{sign} {table}")).color(color).strong()).sense(egui::Sense::click()));
-                if resp.on_hover_text("Select it in the diagram").clicked() {
+                let count = if m.details.len() > 12 { format!("  ({} changes)", m.details.len()) } else { String::new() };
+                let title = RichText::new(format!("{sign} {table}{count}")).color(color).strong();
+                let header = if m.mark == Mark::Dropped || m.details.is_empty() {
+                    ui.add(egui::Label::new(title).sense(egui::Sense::click()))
+                } else {
+                    // Long lists (a new table's columns) start folded.
+                    egui::CollapsingHeader::new(title)
+                        .id_salt((h.selected, table))
+                        .default_open(m.details.len() <= 12)
+                        .show(ui, |ui| {
+                            for d in &m.details {
+                                ui.label(RichText::new(d).small());
+                            }
+                        })
+                        .header_response
+                };
+                if header.on_hover_text("Select it in the diagram").clicked() {
                     h.er.selected = Some(table.clone());
                     h.er_changes.selected = Some(table.clone());
-                }
-                if m.mark != Mark::Dropped {
-                    for d in &m.details {
-                        ui.label(RichText::new(format!("    {d}")).small());
-                    }
-                }
-            }
-            if !step.warnings.is_empty() {
-                ui.add_space(8.0);
-                theme::section(ui, "NOT MODELED");
-                for w in &step.warnings {
-                    ui.label(RichText::new(format!("⚠ {w}")).color(warn_color(ui)).small());
                 }
             }
         });
@@ -324,7 +377,7 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                 ui.label(RichText::new(d).weak());
             }
             ui.separator();
-            let items = [(HistoryView::Diagram, RichText::new("Diagram"), "Tables after this migration; its changes in color"), (HistoryView::Schema, RichText::new("Schema"), "The schema after this migration, in the sdb language")];
+            let items = [(HistoryView::Diagram, RichText::new("Diagram"), "Tables after this migration; its changes in color"), (HistoryView::Schema, RichText::new("Schema"), "The schema after this migration, in the sdb language"), (HistoryView::File, RichText::new("File"), "The migration's PHP source")];
             if let (Some(v), _) = theme::segmented(ui, h.view, &items, false) {
                 h.view = v;
             }
@@ -349,14 +402,17 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                 ui.ctx().copy_text(format::format_schema(&steps[h.selected].0.schema));
             }
         });
-        ui.horizontal(|ui| {
-            for (mark, label) in [(Mark::Added, "added"), (Mark::Altered, "changed"), (Mark::Dropped, "dropped")] {
-                ui.label(RichText::new("■").color(mark_color(mark, dark).unwrap()));
-                ui.label(RichText::new(label).small());
-            }
-            ui.label(RichText::new("■").color(ui.visuals().weak_text_color().gamma_multiply(0.5)));
-            ui.label(RichText::new("as before").small());
-        });
+        // The colors' key, for the diagram.
+        if h.view == HistoryView::Diagram {
+            ui.horizontal(|ui| {
+                for (mark, label) in [(Mark::Added, "added"), (Mark::Altered, "changed"), (Mark::Dropped, "dropped")] {
+                    ui.label(RichText::new("■").color(mark_color(mark, dark).unwrap()));
+                    ui.label(RichText::new(label).small());
+                }
+                ui.label(RichText::new("■").color(ui.visuals().weak_text_color().gamma_multiply(0.5)));
+                ui.label(RichText::new("as before").small());
+            });
+        }
         ui.add_space(4.0);
         let (step, c) = &steps[h.selected];
         match h.view {
@@ -377,16 +433,37 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                 canvas.marks = Some(c.clone());
                 let _ = canvas.ui(ui, &shown, false, &Default::default());
             }
-            HistoryView::Schema => {
-                if h.text.as_ref().is_none_or(|(i, _)| *i != h.selected) {
-                    h.text = Some((h.selected, format::format_schema(&step.schema)));
+            HistoryView::Schema | HistoryView::File => {
+                // Made once per step and view; a reload of the folder drops it, so edits show.
+                if h.text.as_ref().is_none_or(|(i, v, _)| *i != h.selected || *v != h.view) {
+                    let text = match h.view {
+                        HistoryView::File => std::fs::read_to_string(&step.file)
+                            .map(|t| t.replace("\r\n", "\n"))
+                            .unwrap_or_else(|e| format!("// cannot read {}: {e}", step.file.display())),
+                        _ => format::format_schema(&step.schema),
+                    };
+                    h.text = Some((h.selected, h.view, text));
                 }
-                let text = &h.text.as_ref().unwrap().1;
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| highlight::code_view(ui, text, Lang::Dbs));
+                let text = &h.text.as_ref().unwrap().2;
+                if h.view == HistoryView::File {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(step.file.display().to_string()).weak().small());
+                        if ui.small_button("Copy path").clicked() {
+                            ui.ctx().copy_text(step.file.display().to_string());
+                        }
+                        if ui.small_button("Copy file").clicked() {
+                            ui.ctx().copy_text(text.clone());
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+                let lang = if h.view == HistoryView::File { Lang::Php } else { Lang::Dbs };
+                egui::ScrollArea::both().id_salt(("history_text", h.view == HistoryView::File)).auto_shrink([false, false]).show(ui, |ui| highlight::code_view(ui, text, lang));
             }
         }
     });
     h.shown_step = Some(h.selected);
+    copied_one
 }
 
 #[cfg(test)]
