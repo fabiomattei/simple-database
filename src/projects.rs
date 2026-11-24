@@ -1,5 +1,6 @@
-//! Recent projects (`projects.json` in `config_dir()`): a project is a folder, and with it the
-//! schema file and the database last used while it was open. `contents` looks at what a folder
+//! Recent projects and SQLite files (`projects.json` in `config_dir()`): a project is a folder,
+//! and with it the schema file and the database last used while it was open. Both can be put in
+//! a group, as saved connections can (`Connection::group`); the welcome screen shows them together. `contents` looks at what a folder
 //! holds (a `.dbs` schema, Laravel migrations, databases `discover` finds), for opening it.
 
 use crate::connections::{config_dir, write_file};
@@ -21,8 +22,25 @@ pub struct Project {
     /// The database last open with it: a SQLite path, a URL without its password, or `@name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db: Option<String>,
+    /// The group it is shown in; empty = none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
     #[serde(default)]
     pub last_used: u64,
+}
+
+/// A SQLite file opened directly, not through a saved connection.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecentFile {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    #[serde(default)]
+    pub last_used: u64,
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 impl Project {
@@ -36,13 +54,16 @@ impl Project {
 struct ProjectsFile {
     #[serde(default)]
     projects: Vec<Project>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files: Vec<RecentFile>,
 }
 
-/// The recent projects, most recently used first.
+/// The recent projects and SQLite files, most recently used first.
 #[derive(Clone, Debug, Default)]
 pub struct Projects {
     dir: PathBuf,
     pub list: Vec<Project>,
+    pub files: Vec<RecentFile>,
 }
 
 impl Projects {
@@ -58,14 +79,15 @@ impl Projects {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProjectsFile::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let mut list = file.projects;
+        let (mut list, mut files) = (file.projects, file.files);
         list.sort_by_key(|p| std::cmp::Reverse(p.last_used));
-        Ok(Projects { dir: dir.to_path_buf(), list })
+        files.sort_by_key(|f| std::cmp::Reverse(f.last_used));
+        Ok(Projects { dir: dir.to_path_buf(), list, files })
     }
 
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
-        let file = ProjectsFile { projects: self.list.clone() };
+        let file = ProjectsFile { projects: self.list.clone(), files: self.files.clone() };
         write_file(&self.dir.join("projects.json"), &serde_json::to_string_pretty(&file)?, false)
     }
 
@@ -77,7 +99,7 @@ impl Projects {
     /// at `path` (added if new), marks it used now and saves.
     pub fn update(&mut self, path: &Path, edit: impl FnOnce(&mut Project)) -> Result<()> {
         *self = Projects::load_from(&self.dir)?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let now = now();
         let mut project = match self.list.iter().position(|p| p.path == path) {
             Some(i) => self.list.remove(i),
             None => Project { path: path.to_path_buf(), ..Project::default() },
@@ -92,10 +114,49 @@ impl Projects {
         self.save()
     }
 
-    /// Re-reads the file and removes the project at `path`.
+    /// Re-reads the file and records the SQLite file at `path` as used now.
+    pub fn touch_file(&mut self, path: &Path) -> Result<()> {
+        *self = Projects::load_from(&self.dir)?;
+        let mut file = match self.files.iter().position(|f| f.path == path) {
+            Some(i) => self.files.remove(i),
+            None => RecentFile { path: path.to_path_buf(), ..RecentFile::default() },
+        };
+        file.last_used = now().max(self.files.first().map_or(0, |f| f.last_used));
+        self.files.insert(0, file);
+        self.files.truncate(LIMIT);
+        self.save()
+    }
+
+    /// Re-reads the file and removes the project or SQLite file at `path`.
     pub fn forget(&mut self, path: &Path) -> Result<()> {
         *self = Projects::load_from(&self.dir)?;
         self.list.retain(|p| p.path != path);
+        self.files.retain(|f| f.path != path);
+        self.save()
+    }
+
+    /// Re-reads the file and puts the project or SQLite file at `path` in `group` (empty = none).
+    pub fn set_group(&mut self, path: &Path, group: &str) -> Result<()> {
+        *self = Projects::load_from(&self.dir)?;
+        let group = group.trim().to_string();
+        for p in self.list.iter_mut().filter(|p| p.path == path) {
+            p.group = group.clone();
+        }
+        for f in self.files.iter_mut().filter(|f| f.path == path) {
+            f.group = group.clone();
+        }
+        self.save()
+    }
+
+    /// Re-reads the file and moves everything in group `from` to `to` (empty = no group).
+    pub fn rename_group(&mut self, from: &str, to: &str) -> Result<()> {
+        *self = Projects::load_from(&self.dir)?;
+        let to = to.trim();
+        for g in self.list.iter_mut().map(|p| &mut p.group).chain(self.files.iter_mut().map(|f| &mut f.group)) {
+            if g == from {
+                *g = to.to_string();
+            }
+        }
         self.save()
     }
 }
@@ -201,6 +262,13 @@ mod tests {
         assert!(!again.list[1].db.as_deref().unwrap().contains("secret"));
         store.forget(Path::new("/work/a")).unwrap();
         assert_eq!(Projects::load_from(&dir).unwrap().list.len(), 1);
+        store.touch_file(Path::new("/work/app.db")).unwrap();
+        store.set_group(Path::new("/work/app.db"), " Acme ").unwrap();
+        store.set_group(Path::new("/work/b"), "Acme").unwrap();
+        store.rename_group("Acme", "Client").unwrap();
+        let again = Projects::load_from(&dir).unwrap();
+        assert_eq!(again.files[0].group, "Client");
+        assert_eq!(again.list[0].group, "Client");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

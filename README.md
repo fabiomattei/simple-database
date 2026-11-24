@@ -76,12 +76,17 @@ a password is missing, the dialog opens with the error.
 At startup, unless a database is given on the command line, the welcome screen fills the window.
 Along the top are **Open Project…**, **New Connection…**, **Open SQLite…**, **New SQLite…** and
 **Continue without a database** (or Escape), and under them a filter field over everything listed.
-**Projects** are the recent project folders, drawn as colored folder tiles; **Connections**, in the
-column on the right, are the saved connections (favorites first), plus the last session's database
-when it isn't a saved one. One click opens either. The arrow keys move through both and Enter opens
-the chosen one; Cmd/Ctrl+1 to 9 open the first nine projects. Dropping a folder on the window opens it
-as a project, a `.dbs` file in the editor, a SQLite file as the database. **File → Welcome screen…**
-shows it again, and **File → Open project…** opens a project from anywhere.
+Below, in one space, are tiles for everything you can open, each with its own icon: a folder for a
+project, a page for a SQLite file (saved SQLite connections and files opened directly), a database
+cylinder for a PostgreSQL or MySQL connection (in the connection's color), plus the last session's
+database when it is none of these. Tiles sit in a card per group, groups alphabetically, then the
+rest under **Other**; in each, favorites come first, then the most recently used. The group is the
+connection's **Group** field, and projects and files have one too: drag a tile onto a card, or
+right-click it to pick a group, type a new one, or take it out of its group. Right-click a card's
+heading to rename the group or ungroup everything in it. One click opens a tile; the arrow keys move
+between tiles and Enter opens the chosen one; Cmd/Ctrl+1 to 9 open the first nine. Dropping a folder
+on the window opens it as a project, a `.dbs` file in the editor, a SQLite file as the database.
+**File → Welcome screen…** shows it again, and **File → Open project…** opens a project from anywhere.
 
 A project is a folder. Opening one loads its schema file (the one last used with it, else
 `schema.dbs`, else its first `.dbs` file), opens its Laravel migrations in the **History** tab
@@ -89,7 +94,7 @@ A project is a folder. Opening one loads its schema file (the one last used with
 project is open, the schema file you open or save and the database you connect to are remembered with
 it (`projects.json` in the config folder, without passwords). Without a database, the ones found in the
 folder (`.env`, compose, Prisma) are counted in the status bar and listed under Connections.
-Right-click a tile to remove it from the list. A new schema starts empty; **Help → Example
+Right-click a project or file tile to remove it from the list. A new schema starts empty; **Help → Example
 schema** shows a sample blog schema and can open it in the editor.
 
 Each window works with one database, and its title names it. With a database already open,

@@ -509,6 +509,20 @@ impl Store {
     }
 
     /// The groups in use, for suggestions.
+    /// Puts the connection `name` in `group` (empty = none).
+    pub fn set_group(&mut self, name: &str, group: &str) {
+        if let Some(c) = self.connections.iter_mut().find(|c| c.name == name) {
+            c.group = group.trim().to_string();
+        }
+    }
+
+    /// Moves every connection in group `from` to `to` (empty = no group).
+    pub fn rename_group(&mut self, from: &str, to: &str) {
+        for c in self.connections.iter_mut().filter(|c| c.group == from) {
+            c.group = to.trim().to_string();
+        }
+    }
+
     pub fn groups(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.connections.iter().map(|c| c.group.as_str()).filter(|g| !g.is_empty()).collect();
         v.sort_unstable();

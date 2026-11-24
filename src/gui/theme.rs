@@ -358,39 +358,6 @@ pub fn paint_glyph(painter: &egui::Painter, glyph: Glyph, c: egui::Pos2, scale: 
     }
 }
 
-/// A large clickable card: `glyph` on a rounded square of `tint`, a title
-/// and a line under it. Fills the width it is given.
-pub fn card(ui: &mut egui::Ui, glyph: Glyph, tint: Color32, title: &str, subtitle: &str) -> egui::Response {
-    let height = if subtitle.is_empty() { 44.0 } else { 54.0 };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), egui::Sense::click());
-    let p = palette(ui);
-    let w = ui.style().interact(&resp);
-    let fill = if resp.hovered() { p.selected.gamma_multiply(0.6) } else { Color32::TRANSPARENT };
-    ui.painter().rect(rect, CornerRadius::same(10), fill, if resp.hovered() { w.bg_stroke } else { Stroke::NONE }, egui::StrokeKind::Inside);
-    let icon = egui::Rect::from_min_size(rect.left_center() + Vec2::new(8.0, -17.0), Vec2::splat(34.0));
-    ui.painter().rect_filled(icon, CornerRadius::same(8), tint);
-    paint_glyph(ui.painter(), glyph, icon.center(), 1.3, Color32::WHITE);
-    let x = icon.right() + 12.0;
-    let text = ui.visuals().text_color();
-    // One line each, cut with "…" when too long.
-    let line = |text: &str, font: FontId, color: Color32| {
-        let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
-        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.right() - x - 10.0);
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
-    let title_galley = line(title, bold(14.0), text);
-    let sub_galley = (!subtitle.is_empty()).then(|| line(subtitle, FontId::proportional(11.5), p.muted));
-    let total = title_galley.size().y + sub_galley.as_ref().map_or(0.0, |g| g.size().y + 2.0);
-    let mut y = rect.center().y - total / 2.0;
-    let th = title_galley.size().y;
-    ui.painter().galley(egui::pos2(x, y), title_galley, text);
-    if let Some(g) = sub_galley {
-        y += th + 2.0;
-        ui.painter().galley(egui::pos2(x, y), g, p.muted);
-    }
-    resp
-}
-
 /// A padlock centred on `c`, open when not `locked`.
 pub fn paint_lock(ui: &egui::Ui, c: egui::Pos2, locked: bool, color: Color32) {
     let painter = ui.painter();

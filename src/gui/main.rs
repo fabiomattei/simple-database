@@ -778,6 +778,9 @@ impl App {
         }
         let target = label.clone();
         self.remember_project(|p| p.db = Some(target));
+        if dialect == Dialect::Sqlite && !label.starts_with('@') {
+            self.remember_sqlite_file(&label);
+        }
         self.remember_data_tabs();
         if let Some(list) = data_view::load_saved() {
             self.saved_tabs = list;
