@@ -18,6 +18,7 @@ mod panels;
 mod table_edit;
 mod tabs;
 mod theme;
+mod welcome;
 mod window;
 mod worker;
 
@@ -32,6 +33,7 @@ use simple_database::diff::{Migration, TableDrift};
 use simple_database::framework::{Framework, Generated};
 use simple_database::dump;
 use simple_database::history::QueryLog;
+use simple_database::projects::Projects;
 use simple_database::import;
 use simple_database::seed::{self, TableReport};
 use simple_database::sqlite;
@@ -80,6 +82,8 @@ struct Settings {
     migrate_format: u8,
     /// The History tab's Laravel migrations folder.
     migrations_dir: Option<PathBuf>,
+    /// The project folder open last.
+    project: Option<PathBuf>,
     /// Read from older settings only: Data tabs now live in their own file, shared by all windows.
     #[serde(skip_serializing)]
     data_tabs: Vec<data_view::SavedTabs>,
@@ -149,7 +153,7 @@ enum Dialog {
     Syntax,
     Example,
     /// Shown at startup: pick a saved connection or make a new one.
-    Welcome { last: Option<String> },
+    Welcome(Box<welcome::WelcomeState>),
     Connections(Box<conns::Manager>),
     Table(Box<table_edit::TableEditor>),
     /// Safe mode asks before these statements run.
@@ -380,6 +384,10 @@ struct App {
     allow_close: bool,
     /// Saved connections (re-read from disk before every change).
     conns: Store,
+    /// Recent projects (re-read from disk before every change).
+    projects: Projects,
+    /// The project folder open: what is opened with it is remembered for next time.
+    project: Option<PathBuf>,
     show_sidebar: bool,
     sidebar_view: panels::SidebarView,
     /// The sidebar's filter over tables and connections.
@@ -445,6 +453,8 @@ impl App {
             dialog: None,
             allow_close: false,
             conns: Store::default(),
+            projects: Projects::default(),
+            project: None,
             show_sidebar: !settings.hide_sidebar,
             sidebar_view: panels::SidebarView::Tables,
             sidebar_filter: String::new(),
@@ -453,6 +463,10 @@ impl App {
         match Store::load() {
             Ok(store) => app.conns = store,
             Err(e) => app.set_status(format!("Cannot read saved connections: {e:#}"), true),
+        }
+        match Projects::load() {
+            Ok(projects) => app.projects = projects,
+            Err(e) => app.set_status(format!("Cannot read recent projects: {e:#}"), true),
         }
         match QueryLog::load() {
             Ok(log) => app.log = log,
@@ -486,12 +500,13 @@ impl App {
                     None => app.open_db(&launch.target),
                 }
             } else {
-                app.dialog = Some(Dialog::Welcome { last: settings.db_target });
+                app.dialog = Some(Dialog::Welcome(welcome::WelcomeState::new(settings.db_target)));
             }
             return app;
         }
         let (mut schema_path, mut db_target) = (settings.schema_path, None);
-        if !args.is_empty() {
+        let args_given = !args.is_empty();
+        if args_given {
             schema_path = None;
             db_target = None;
             for a in args {
@@ -507,13 +522,16 @@ impl App {
                 }
             }
         }
+        if !args_given {
+            app.project = settings.project.filter(|p| p.is_dir());
+        }
         if let Some(p) = schema_path.filter(|p| p.exists()) {
             app.load_schema_file(&p);
         }
         // Without a database on the command line, ask which one to use.
         match db_target {
             Some(t) => app.open_db(&t),
-            None => app.dialog = Some(Dialog::Welcome { last: settings.db_target }),
+            None => app.dialog = Some(Dialog::Welcome(welcome::WelcomeState::new(settings.db_target))),
         }
         app
     }
@@ -545,6 +563,8 @@ impl App {
                 self.schema_path = Some(path.to_path_buf());
                 self.er.reset_layout();
                 self.set_status(format!("Opened {}", path.display()), false);
+                let schema = path.to_path_buf();
+                self.remember_project(|p| p.schema = Some(schema));
             }
             Err(e) => self.set_status(format!("Cannot open {}: {e}", path.display()), true),
         }
@@ -566,6 +586,8 @@ impl App {
             Ok(()) => {
                 self.saved_text = self.schema_text.clone();
                 self.set_status(format!("Saved {}", path.display()), false);
+                let schema = path.clone();
+                self.remember_project(|p| p.schema = Some(schema));
                 self.schema_path = Some(path);
                 true
             }
@@ -754,6 +776,8 @@ impl App {
         if [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql].iter().any(|d| self.query == default_query(*d)) {
             self.query = default_query(dialect).into();
         }
+        let target = label.clone();
+        self.remember_project(|p| p.db = Some(target));
         self.remember_data_tabs();
         if let Some(list) = data_view::load_saved() {
             self.saved_tabs = list;
@@ -839,8 +863,8 @@ impl App {
     /// The Connections dialog; `new` starts with an empty form instead of the most recent connection.
     fn connections_dialog(&mut self, new: bool) {
         let current = self.db.as_ref().and_then(|d| d.label.strip_prefix('@'));
-        // Look for databases next to the schema file and in the working directory.
-        let mut dirs: Vec<PathBuf> = Vec::new();
+        // Look for databases in the project, next to the schema file and in the working directory.
+        let mut dirs: Vec<PathBuf> = self.project.iter().cloned().collect();
         if let Some(dir) = self.schema_path.as_ref().and_then(|p| p.parent()) {
             dirs.push(if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir.to_path_buf() });
         }
@@ -982,7 +1006,7 @@ impl eframe::App for App {
                 (Some(d), _) => Some(d.label.clone()),
                 // Still on the welcome dialog: keep offering the last database.
                 _ => match &self.dialog {
-                    Some(Dialog::Welcome { last }) => last.clone(),
+                    Some(Dialog::Welcome(st)) => st.last.clone(),
                     _ => None,
                 },
             },
@@ -1001,6 +1025,7 @@ impl eframe::App for App {
                 Some(Framework::Rails) => 2,
             },
             migrations_dir: self.history.dir.clone(),
+            project: self.project.clone(),
             data_tabs: Vec::new(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);

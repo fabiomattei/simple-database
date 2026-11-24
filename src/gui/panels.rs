@@ -28,6 +28,13 @@ impl App {
                     self.save_schema(true);
                 }
                 ui.separator();
+                if ui.button("Welcome screen…").on_hover_text("Recent projects and saved connections").clicked() {
+                    self.show_welcome();
+                }
+                if ui.button("Open project…").on_hover_text("A folder: its schema file, Laravel migrations and database are remembered").clicked() {
+                    self.pick_project();
+                }
+                ui.separator();
                 let shortcut = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
                 if ui
                     .add(egui::Button::new("New window").shortcut_text(ctx.format_shortcut(&shortcut)))
