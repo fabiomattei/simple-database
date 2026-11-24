@@ -118,6 +118,20 @@ enum Command {
     /// records them in its `_sdb_migrations` table.
     #[command(subcommand)]
     Migrate(MigrateCommand),
+    /// Replay a Laravel project's migrations: what each one changed, or the schema after one
+    ///
+    /// The files in `database/migrations` are read without PHP, in name order.
+    /// Calls sdb can't model (raw SQL, unknown methods) are reported as warnings.
+    History {
+        /// The Laravel project or its migrations folder
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Print the schema after this migration (its number, or a part of its file name)
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Reverse-engineer a schema file from a database
     Pull {
         #[arg(long)]
@@ -509,6 +523,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             println!("Applied {} change(s) to {}.", m.changes.len(), db.label());
         }
+        Command::History { path, at, output } => history(&path, at.as_deref(), output.as_deref())?,
         Command::Pull { db, output } => {
             let (s, skipped) = open_existing(&db)?.introspect_with_skipped()?;
             let (s, skipped) = migrations::strip_history(s, skipped);
@@ -960,6 +975,57 @@ fn ensure_exists(path: &Path) -> Result<()> {
         bail!("{} does not exist", path.display());
     }
     Ok(())
+}
+
+fn history(path: &Path, at: Option<&str>, output: Option<&Path>) -> Result<()> {
+    use simple_database::timeline::{Mark, changes};
+    let dir = laravel::resolve_dir(path).with_context(|| format!("no Laravel migrations in or above {}", path.display()))?;
+    let steps = laravel::read_dir(&dir)?;
+    if let Some(at) = at {
+        let step = match at.parse::<usize>() {
+            Ok(n) if (1..=steps.len()).contains(&n) => &steps[n - 1],
+            Ok(_) => bail!("there are {} migrations", steps.len()),
+            Err(_) => {
+                let hits: Vec<_> = steps.iter().filter(|s| s.id.contains(at)).collect();
+                match hits.as_slice() {
+                    [one] => *one,
+                    [] => bail!("no migration matches '{at}'"),
+                    many => bail!("'{at}' matches {} migrations: {}", many.len(), many.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")),
+                }
+            }
+        };
+        for w in &step.warnings {
+            eprintln!("{} {w}", Paint::Yellow.err("warning:"));
+        }
+        return emit(output, &format::format_schema(&step.schema));
+    }
+    let mut text = String::new();
+    let mut before = Schema::default();
+    for (n, step) in steps.iter().enumerate() {
+        let c = changes(&before, &step.schema, &step.renames);
+        text.push_str(&format!("{} {}{}\n", Paint::Dim.out(format!("{:>3}", n + 1)), step.date.as_deref().map(|d| format!("{d}  ")).unwrap_or_default(), step.title));
+        for (table, m) in &c.tables {
+            let (sign, paint) = match m.mark {
+                Mark::Added => ("+", Paint::Green),
+                Mark::Dropped => ("−", Paint::Red),
+                _ => ("~", Paint::Yellow),
+            };
+            text.push_str(&format!("      {} {table}\n", paint.out(sign)));
+            if m.mark != Mark::Dropped {
+                for d in &m.details {
+                    text.push_str(&format!("          {d}\n"));
+                }
+            }
+        }
+        for w in &step.warnings {
+            text.push_str(&format!("      {} {w}\n", Paint::Yellow.out("warning:")));
+        }
+        before = step.schema.clone();
+    }
+    if steps.is_empty() {
+        eprintln!("No migrations in {}", dir.display());
+    }
+    emit(output, &text)
 }
 
 fn emit(output: Option<&Path>, text: &str) -> Result<()> {

@@ -78,6 +78,8 @@ struct Settings {
     hide_sidebar: bool,
     /// The Migrate tab's format: 0 SQL, 1 Laravel, 2 Rails.
     migrate_format: u8,
+    /// The History tab's Laravel migrations folder.
+    migrations_dir: Option<PathBuf>,
     /// Read from older settings only: Data tabs now live in their own file, shared by all windows.
     #[serde(skip_serializing)]
     data_tabs: Vec<data_view::SavedTabs>,
@@ -89,6 +91,7 @@ enum Tab {
     Diagram,
     Sql,
     Migrate,
+    History,
     Query,
     Data,
     Seed,
@@ -101,6 +104,7 @@ impl Tab {
             "diagram" => Tab::Diagram,
             "sql" => Tab::Sql,
             "migrate" => Tab::Migrate,
+            "history" => Tab::History,
             "query" => Tab::Query,
             "data" => Tab::Data,
             "seed" => Tab::Seed,
@@ -114,6 +118,7 @@ impl Tab {
             Tab::Diagram => "diagram",
             Tab::Sql => "sql",
             Tab::Migrate => "migrate",
+            Tab::History => "history",
             Tab::Query => "query",
             Tab::Data => "data",
             Tab::Seed => "seed",
@@ -369,6 +374,7 @@ struct App {
     migrate_source: MigrateSource,
     migrate_reading: Option<SourceRead>,
     seed: SeedState,
+    history: tabs::HistoryState,
     status: Option<(String, bool, Instant)>,
     dialog: Option<Dialog>,
     allow_close: bool,
@@ -434,6 +440,7 @@ impl App {
                 tables: HashMap::new(),
                 report: None,
             },
+            history: tabs::HistoryState::with_dir(settings.migrations_dir.clone().filter(|d| d.is_dir())),
             status: None,
             dialog: None,
             allow_close: false,
@@ -956,6 +963,7 @@ impl eframe::App for App {
                 Tab::Diagram => self.tab_diagram(ui),
                 Tab::Sql => self.tab_sql(ui),
                 Tab::Migrate => self.tab_migrate(ui),
+                Tab::History => self.tab_history(ui),
                 Tab::Query => self.tab_query(ui),
                 Tab::Data => self.tab_data(ui),
                 Tab::Seed => self.tab_seed(ui),
@@ -992,6 +1000,7 @@ impl eframe::App for App {
                 Some(Framework::Laravel) => 1,
                 Some(Framework::Rails) => 2,
             },
+            migrations_dir: self.history.dir.clone(),
             data_tabs: Vec::new(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);

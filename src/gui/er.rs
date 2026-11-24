@@ -5,6 +5,7 @@
 use crate::er_layout;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use simple_database::schema::{Schema, Table};
+use simple_database::timeline::{Changes, Mark};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -26,6 +27,9 @@ pub struct ErView {
     pub selected: Option<String>,
     /// Rows per table of the open database, shown in the box titles.
     pub row_counts: HashMap<String, i64>,
+    /// One migration's changes: unchanged tables and columns are drawn grey,
+    /// the others in the color of their [`Mark`].
+    pub marks: Option<Changes>,
     fit_requested: bool,
     /// Tables left out of the diagram and its exports.
     hidden: HashSet<String>,
@@ -74,6 +78,8 @@ struct Edge {
     parent_dir: f32,
     nullable: bool,
     child: String,
+    /// The child's (first) column.
+    column: String,
     parent: String,
 }
 
@@ -208,12 +214,34 @@ impl ErView {
             .collect()
     }
 
-    /// A box's title: the table name, plus its row count when known.
+    /// A box's title: the table name, plus its row count when known, or its old name.
     fn title(&self, t: &Table) -> String {
+        if let Some(was) = self.marks.as_ref().and_then(|m| m.table(&t.name)).and_then(|m| m.was.as_ref()) {
+            return format!("{} (was {was})", t.name);
+        }
         match self.row_counts.get(&t.name) {
             Some(n) => format!("{} ({n})", t.name),
             None => t.name.clone(),
         }
+    }
+
+    /// The mark of a table and of one of its columns, with marks on.
+    fn mark_of(&self, table: &str, column: Option<&str>) -> Option<Mark> {
+        let changes = self.marks.as_ref()?;
+        let Some(t) = changes.table(table) else { return Some(Mark::Unchanged) };
+        Some(match (t.mark, column) {
+            (Mark::Added | Mark::Dropped, _) | (_, None) => t.mark,
+            (_, Some(c)) => t.column(c),
+        })
+    }
+
+    /// Positions for every table of `schema` at once (e.g. all tables a
+    /// project ever had), so boxes keep their places as tables come and go.
+    pub fn arrange(&mut self, ui: &egui::Ui, schema: &Schema) {
+        let painter = ui.painter();
+        let sizes: HashMap<String, Vec2> = schema.tables.iter().map(|t| (t.name.clone(), box_size(painter, &self.title(t), t))).collect();
+        self.positions = er_layout::layout(schema, &sizes);
+        self.fit_requested = true;
     }
 
     /// `full` is the whole schema; hidden tables are left out here. With
@@ -420,7 +448,13 @@ impl ErView {
         let line_color = visuals.weak_text_color();
         for e in edges(schema, &layouts) {
             let related = focus.as_deref().is_some_and(|f| f == e.child || f == e.parent);
-            let stroke = if related { Stroke::new(2.0, accent) } else { Stroke::new(1.3, line_color) };
+            let marked = self.mark_of(&e.child, Some(&e.column)).and_then(|m| mark_color(m, visuals.dark_mode));
+            let stroke = match marked {
+                _ if related => Stroke::new(2.0, accent),
+                Some(c) => Stroke::new(1.8, c),
+                None if self.marks.is_some() => Stroke::new(1.0, line_color.gamma_multiply(0.6)),
+                None => Stroke::new(1.3, line_color),
+            };
             let points = e.points.map(to_screen);
             painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, stroke));
             let (a, b) = (points[0], points[3]);
@@ -448,19 +482,25 @@ impl ErView {
                 continue;
             }
             let highlighted = focus.as_deref() == Some(t.name.as_str());
+            let table_mark = self.mark_of(&t.name, None);
+            let table_color = table_mark.and_then(|m| mark_color(m, visuals.dark_mode));
+            let grey = visuals.weak_text_color();
             let radius = CornerRadius::same((6.0 * self.zoom).round().clamp(0.0, 255.0) as u8);
             painter.rect_filled(rect.translate(vec2(2.0, 3.0) * self.zoom), radius, Color32::from_black_alpha(40));
             painter.rect_filled(rect, radius, visuals.window_fill);
             let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H * self.zoom));
-            painter.rect_filled(header, CornerRadius { ne: radius.ne, nw: radius.nw, se: 0, sw: 0 }, header_bg);
-            painter.text(
-                header.center(),
-                Align2::CENTER_CENTER,
-                self.title(t),
-                FontId::proportional(fs * 1.05),
-                visuals.strong_text_color(),
-            );
-            let border = if highlighted { Stroke::new(2.0, accent) } else { Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color) };
+            let (bg, title_color) = match (table_mark, table_color) {
+                (_, Some(c)) => (c.gamma_multiply(0.85), Color32::WHITE),
+                (Some(_), None) => (grey.gamma_multiply(0.25), grey),
+                (None, None) => (header_bg, visuals.strong_text_color()),
+            };
+            painter.rect_filled(header, CornerRadius { ne: radius.ne, nw: radius.nw, se: 0, sw: 0 }, bg);
+            painter.text(header.center(), Align2::CENTER_CENTER, self.title(t), FontId::proportional(fs * 1.05), title_color);
+            let border = match table_color {
+                _ if highlighted => Stroke::new(2.0, accent),
+                Some(c) => Stroke::new(1.5, c),
+                None => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+            };
             painter.rect_stroke(rect, radius, border, StrokeKind::Inside);
 
             if fs < 5.0 {
@@ -469,24 +509,33 @@ impl ErView {
             let pk = t.primary_key();
             for c in &t.columns {
                 let y = to_screen(pos2(0.0, layout.rows[&c.name])).y;
+                let mark = self.mark_of(&t.name, Some(&c.name));
+                let marked = mark.and_then(|m| mark_color(m, visuals.dark_mode));
+                if let Some(color) = marked.filter(|_| table_mark != Some(Mark::Added) && table_mark != Some(Mark::Dropped)) {
+                    let row = Rect::from_min_max(pos2(rect.min.x + 1.0, y - ROW_H * self.zoom / 2.0), pos2(rect.max.x - 1.0, y + ROW_H * self.zoom / 2.0));
+                    painter.rect_filled(row, 0.0, color.gamma_multiply(0.16));
+                }
+                // With marks on, unchanged columns go grey; changed ones take their color.
+                let tint = |normal: Color32| match (mark, marked) {
+                    (_, Some(c)) => c,
+                    (Some(_), None) => grey.gamma_multiply(0.8),
+                    (None, None) => normal,
+                };
                 let tag = column_tag(t, &pk, c);
                 let tag_color = match tag {
                     "PK" => PK_COLOR,
                     "FK" => accent,
-                    _ => visuals.weak_text_color(),
+                    _ => grey,
                 };
                 let x0 = rect.min.x + PAD_X * self.zoom;
-                painter.text(pos2(x0, y), Align2::LEFT_CENTER, tag, FontId::monospace(fs * 0.8), tag_color);
+                painter.text(pos2(x0, y), Align2::LEFT_CENTER, tag, FontId::monospace(fs * 0.8), if mark == Some(Mark::Unchanged) { grey } else { tag_color });
                 let name_color = if c.nullable { visuals.text_color() } else { visuals.strong_text_color() };
-                painter.text(pos2(x0 + 26.0 * self.zoom, y), Align2::LEFT_CENTER, &c.name, FontId::proportional(fs), name_color);
-                let ty = column_type(c);
-                painter.text(
-                    pos2(rect.max.x - PAD_X * self.zoom, y),
-                    Align2::RIGHT_CENTER,
-                    ty,
-                    FontId::monospace(fs * 0.85),
-                    visuals.weak_text_color(),
-                );
+                let name_rect = painter.text(pos2(x0 + 26.0 * self.zoom, y), Align2::LEFT_CENTER, &c.name, FontId::proportional(fs), tint(name_color));
+                let ty_rect = painter.text(pos2(rect.max.x - PAD_X * self.zoom, y), Align2::RIGHT_CENTER, column_type(c), FontId::monospace(fs * 0.85), tint(grey));
+                if mark == Some(Mark::Dropped) {
+                    let stroke = Stroke::new(1.0, marked.unwrap_or(grey));
+                    painter.line_segment([pos2(name_rect.min.x, y), pos2(ty_rect.max.x, y)], stroke);
+                }
             }
         }
 
@@ -761,6 +810,19 @@ impl ErView {
     }
 }
 
+/// The color of a change; `None` for unchanged.
+pub fn mark_color(mark: Mark, dark: bool) -> Option<Color32> {
+    Some(match (mark, dark) {
+        (Mark::Unchanged, _) => return None,
+        (Mark::Added, false) => Color32::from_rgb(0x1f, 0x9d, 0x4a),
+        (Mark::Added, true) => Color32::from_rgb(0x3f, 0xb9, 0x5f),
+        (Mark::Altered | Mark::Renamed, false) => Color32::from_rgb(0xc7, 0x7c, 0x02),
+        (Mark::Altered | Mark::Renamed, true) => Color32::from_rgb(0xe3, 0xa0, 0x2b),
+        (Mark::Dropped, false) => Color32::from_rgb(0xd1, 0x3b, 0x3b),
+        (Mark::Dropped, true) => Color32::from_rgb(0xf0, 0x5d, 0x5d),
+    })
+}
+
 const PK_COLOR: Color32 = Color32::from_rgb(0xe0, 0xa0, 0x20);
 
 fn column_tag(t: &Table, pk: &[String], c: &simple_database::schema::Column) -> &'static str {
@@ -820,6 +882,7 @@ fn edges(schema: &Schema, layouts: &HashMap<String, BoxLayout>) -> Vec<Edge> {
                 parent_dir,
                 nullable,
                 child: t.name.clone(),
+                column: fk.columns[0].clone(),
                 parent: fk.table.clone(),
             });
         }

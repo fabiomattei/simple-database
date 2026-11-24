@@ -15,6 +15,7 @@ pub mod framework;
 pub mod history;
 pub mod import;
 pub mod integrity;
+pub mod laravel;
 pub mod migrations;
 pub mod mysqldb;
 pub mod output;
@@ -26,6 +27,7 @@ pub mod schema;
 pub mod seed;
 pub mod shell;
 pub mod sqlite;
+pub mod timeline;
 pub mod tls;
 pub mod validate;
 

@@ -347,6 +347,34 @@ fn shell_meta_commands() {
 }
 
 #[test]
+fn laravel_history() {
+    let s = Scratch::new("history");
+    let dir = s.path("database").join("migrations");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("2024_01_01_000000_create_users_table.php"),
+        "<?php\nreturn new class extends Migration {\n    public function up(): void\n    {\n        Schema::create('users', function (Blueprint $table) {\n            $table->id();\n            $table->string('email')->unique();\n        });\n    }\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("2024_02_01_000000_add_name_to_users.php"),
+        "<?php\nreturn new class extends Migration {\n    public function up(): void\n    {\n        Schema::table('users', function (Blueprint $table) {\n            $table->string('name')->nullable();\n        });\n        DB::statement('UPDATE users SET name = email');\n        DB::statement('ALTER TABLE users ADD age INT NULL');\n        DB::statement('CREATE VIEW adults AS SELECT * FROM users');\n    }\n};\n",
+    )
+    .unwrap();
+    let out = s.ok(&["history"]);
+    assert!(out.contains("1 2024-01-01  create users table"), "{out}");
+    assert!(out.contains("+ users") && out.contains("~ users") && out.contains("+ column name varchar(255)"), "{out}");
+    assert!(out.contains("+ column age int") && !out.contains("UPDATE"), "{out}");
+    assert!(out.contains("warning: raw SQL not applied: CREATE VIEW adults AS SELECT * FROM users"), "{out}");
+    let first = s.ok(&["history", "--at", "1", "-o", "first.dbs"]);
+    assert!(first.contains("Wrote"));
+    let text = std::fs::read_to_string(s.path("first.dbs")).unwrap();
+    assert!(text.contains("email") && !text.contains("name"), "{text}");
+    assert!(s.ok(&["history", "database", "--at", "add_name"]).contains("name"));
+    s.fails(&["history", "--at", "9"]);
+}
+
+#[test]
 fn pull_keeps_types_of_several_words() {
     let s = Scratch::new("types");
     std::fs::write(s.path("setup.sql"), "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT UNSIGNED NOT NULL, d DOUBLE PRECISION, note TEXT DEFAULT (upper('Mixed')));\n").unwrap();
