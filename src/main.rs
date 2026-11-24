@@ -118,12 +118,13 @@ enum Command {
     /// records them in its `_sdb_migrations` table.
     #[command(subcommand)]
     Migrate(MigrateCommand),
-    /// Replay a Laravel project's migrations: what each one changed, or the schema after one
+    /// Replay a Laravel or Rails project's migrations: what each one changed, or the schema after one
     ///
-    /// The files in `database/migrations` are read without PHP, in name order.
-    /// Calls sdb can't model (raw SQL, unknown methods) are reported as warnings.
+    /// The files in `database/migrations` (Laravel) or `db/migrate` (Rails) are read
+    /// without PHP or Ruby, in name order. Calls sdb can't model (raw SQL, unknown
+    /// methods) are reported as warnings.
     History {
-        /// The Laravel project or its migrations folder
+        /// The Laravel or Rails project, or its migrations folder
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Print the schema after this migration (its number, or a part of its file name)
@@ -978,9 +979,9 @@ fn ensure_exists(path: &Path) -> Result<()> {
 }
 
 fn history(path: &Path, at: Option<&str>, output: Option<&Path>) -> Result<()> {
-    use simple_database::timeline::{Mark, changes};
-    let dir = laravel::resolve_dir(path).with_context(|| format!("no Laravel migrations in or above {}", path.display()))?;
-    let steps = laravel::read_dir(&dir)?;
+    use simple_database::timeline::{self, Mark, changes};
+    let dir = timeline::resolve_dir(path).with_context(|| format!("no Laravel or Rails migrations in or above {}", path.display()))?;
+    let steps = timeline::read_dir(&dir)?;
     if let Some(at) = at {
         let step = match at.parse::<usize>() {
             Ok(n) if (1..=steps.len()).contains(&n) => &steps[n - 1],

@@ -10,7 +10,7 @@ use crate::schema::{Column, DataType, DefaultValue, ForeignKey, Index, RefAction
 use crate::timeline::Renames;
 
 /// Applies `sql` (one or more statements) to `schema`; returns warnings.
-pub(super) fn apply(schema: &mut Schema, sql: &str, renames: &mut Renames) -> Vec<String> {
+pub(crate) fn apply(schema: &mut Schema, sql: &str, renames: &mut Renames) -> Vec<String> {
     let mut warnings = Vec::new();
     for stmt in crate::db::split_statements(sql) {
         let toks = tokenize(&stmt);
@@ -114,9 +114,9 @@ const OPTION_WORDS: [&str; 25] = [
 ];
 
 /// Statements that read or write rows, or set the session: never a schema change.
-const NOT_SCHEMA: [&str; 20] = [
+const NOT_SCHEMA: [&str; 24] = [
     "set", "update", "insert", "delete", "select", "replace", "truncate", "lock", "unlock", "analyze", "optimize", "flush", "grant", "revoke", "commit", "begin",
-    "start", "rollback", "savepoint", "pragma",
+    "start", "rollback", "savepoint", "pragma", "reindex", "vacuum", "cluster", "refresh",
 ];
 
 struct Stmt<'a> {
@@ -367,6 +367,26 @@ impl Stmt<'_> {
                 tb.columns.insert(at, col);
                 return Ok(());
             }
+            // Postgres: ADD [CONSTRAINT x] PRIMARY KEY USING INDEX i
+            let start = self.i;
+            if self.eat("constraint") {
+                self.name();
+            }
+            if self.eat_all(&["primary", "key", "using", "index"]) {
+                let name = self.name().ok_or(())?;
+                let tb = schema.tables.iter_mut().find(|x| x.name == t).ok_or(())?;
+                let at = tb.indexes.iter().position(|i| i.name == name).ok_or(())?;
+                let cols = tb.indexes.remove(at).columns;
+                for c in &mut tb.columns {
+                    c.primary_key = cols == [c.name.clone()];
+                    if c.primary_key || cols.contains(&c.name) {
+                        c.nullable = false;
+                    }
+                }
+                tb.composite_pk = if cols.len() > 1 { cols } else { Vec::new() };
+                return Ok(());
+            }
+            self.i = start;
             return self.item(schema, &t).map_err(|_| ());
         }
         if self.eat("modify") {
@@ -427,7 +447,9 @@ impl Stmt<'_> {
                 let name = self.name().ok_or(())?;
                 let tb = schema.tables.iter_mut().find(|x| x.name == t).ok_or(())?;
                 if let Some(cols) = tb.all_foreign_keys().into_iter().map(|fk| fk.columns).find(|cols| {
-                    name == index_name(&t, cols, "foreign") || name == format!("fk_{}_{}", crate::schema::unqualified(&t), cols.join("_"))
+                    name == index_name(&t, cols, "foreign")
+                        || name == format!("fk_{}_{}", crate::schema::unqualified(&t), cols.join("_"))
+                        || name == crate::rails::foreign_key_name(&t, &cols.join("_"))
                 }) {
                     if let [one] = cols.as_slice()
                         && let Some(c) = tb.columns.iter_mut().find(|c| c.name == *one)
@@ -766,6 +788,13 @@ fn default_value(s: &mut Stmt) -> Option<DefaultValue> {
                 }
                 return Some(DefaultValue::Now);
             }
+            // A function call: DEFAULT timestamp_id('accounts')
+            _ if matches!(s.t.get(s.i + 1), Some(T::P('('))) => {
+                let start = s.i;
+                s.i += 1;
+                s.name_list();
+                return Some(DefaultValue::Expr(self::text(&s.t[start..s.i])));
+            }
             w => DefaultValue::Expr(w.to_string()),
         },
         _ => return None,
@@ -789,7 +818,13 @@ fn text(t: &[T]) -> String {
             T::Num(n) => n.clone(),
             T::P(c) => c.to_string(),
         };
-        let tight = matches!(x, T::P(',' | ')' | '.')) || k == 0 || out.ends_with(['(', '.']) || (matches!(x, T::P('(')) && matches!(t[k - 1], T::Word { .. }));
+        // Operators of several characters (`||`, `::`, `<=`) stay together.
+        let operator = |x: &T| matches!(x, T::P('|' | '&' | '<' | '>' | '=' | '!' | ':'));
+        let tight = matches!(x, T::P(',' | ')' | '.'))
+            || k == 0
+            || out.ends_with(['(', '.'])
+            || (matches!(x, T::P('(')) && matches!(t[k - 1], T::Word { .. }))
+            || (operator(x) && operator(&t[k - 1]));
         if !tight {
             out.push(' ');
         }

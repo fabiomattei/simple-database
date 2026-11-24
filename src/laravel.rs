@@ -9,7 +9,7 @@ use crate::schema::{Column, DataType, DefaultValue, ForeignKey, Index, RefAction
 use crate::timeline::{Renames, Step, Warning};
 use anyhow::{Context, Result};
 
-mod raw_sql;
+pub(crate) mod raw_sql;
 use std::path::{Path, PathBuf};
 
 /// `database/migrations` in `start` or the nearest folder above it that has one.
@@ -24,14 +24,20 @@ pub fn resolve_dir(path: &Path) -> Option<PathBuf> {
     if has_php && !path.join("artisan").is_file() { Some(path.to_path_buf()) } else { find_dir(path) }
 }
 
-/// Every `*.php` file of `dir`, in name order, replayed one after the other.
-pub fn read_dir(dir: &Path) -> Result<Vec<Step>> {
+/// The `*.php` files of `dir`, in name order (Laravel's order).
+pub fn files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("cannot read {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("php")))
         .collect();
     files.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
+    Ok(files)
+}
+
+/// Every `*.php` file of `dir`, in name order, replayed one after the other.
+pub fn read_dir(dir: &Path) -> Result<Vec<Step>> {
+    let files = files(dir)?;
     let mut schema = Schema::default();
     let mut steps = Vec::new();
     for file in files {
@@ -576,7 +582,7 @@ fn text(t: &[Tok]) -> String {
     s
 }
 
-fn short(s: &str) -> String {
+pub(crate) fn short(s: &str) -> String {
     let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() > 90 { format!("{}…", one.chars().take(90).collect::<String>()) } else { one }
 }

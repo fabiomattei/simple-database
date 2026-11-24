@@ -23,6 +23,7 @@ pub mod parser;
 pub mod pg;
 pub mod preflight;
 pub mod projects;
+pub mod rails;
 pub mod safety;
 pub mod schema;
 pub mod seed;

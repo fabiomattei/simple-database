@@ -1,4 +1,4 @@
-//! The History tab: a Laravel project's migrations, one step at a time. The
+//! The History tab: a Laravel or Rails project's migrations, one step at a time. The
 //! diagram shows the schema after the selected migration, what it changed in
 //! color and the rest in grey; the panel on the right lists the changes.
 
@@ -6,9 +6,8 @@ use crate::er::{self, mark_color};
 use crate::highlight::{self, Lang};
 use crate::{App, theme, warn_color};
 use eframe::egui::{self, Key, RichText};
-use simple_database::laravel;
 use simple_database::schema::Schema;
-use simple_database::timeline::{Changes, Mark, Step, Warning, changes};
+use simple_database::timeline::{self, Changes, Mark, Source, Step, Warning, changes};
 use simple_database::format;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -21,7 +20,7 @@ pub(crate) enum HistoryView {
     #[default]
     Diagram,
     Schema,
-    /// The migration's PHP source.
+    /// The migration's PHP or Ruby source.
     File,
 }
 
@@ -56,20 +55,14 @@ pub(crate) struct HistoryState {
 }
 
 fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
-    let mut out: Vec<_> = std::fs::read_dir(dir)
-        .map(|r| {
-            r.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("php")))
-                .map(|p| {
-                    let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
-                    (p, t)
-                })
-                .collect()
+    let files = timeline::files(dir).unwrap_or_default();
+    files
+        .into_iter()
+        .map(|p| {
+            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+            (p, t)
         })
-        .unwrap_or_default();
-    out.sort();
-    out
+        .collect()
 }
 
 /// A step's warnings, one per line as `path:line: message` (what editors and
@@ -87,8 +80,8 @@ fn warning_text(step: &Step) -> String {
 
 /// The migration's source with line numbers; lines with a warning are tinted
 /// and show it on hover. Scrolls to `goto` (taken) once laid out.
-fn file_view(ui: &mut egui::Ui, text: &str, warnings: &[Warning], goto: &mut Option<usize>) {
-    let galley = highlight::layout(ui, text, Lang::Php);
+fn file_view(ui: &mut egui::Ui, text: &str, lang: Lang, warnings: &[Warning], goto: &mut Option<usize>) {
+    let galley = highlight::layout(ui, text, lang);
     let warn = warn_color(ui);
     let number_font = egui::FontId::monospace(11.0);
     let gutter_w = 14.0 + 8.0 * galley.rows.len().to_string().len() as f32;
@@ -156,7 +149,7 @@ impl HistoryState {
         self.signature = signature(&dir);
         self.checked = Some(Instant::now());
         self.text = None;
-        self.loaded = Some(laravel::read_dir(&dir).map_err(|e| format!("{e:#}")).map(|steps| {
+        self.loaded = Some(timeline::read_dir(&dir).map_err(|e| format!("{e:#}")).map(|steps| {
             let mut before = Schema::default();
             steps
                 .into_iter()
@@ -215,8 +208,8 @@ impl HistoryState {
 impl App {
     /// Where to look for migrations first: the schema file's folder, then the working directory.
     fn find_migrations(&self) -> Option<PathBuf> {
-        let from_schema = self.schema_path.as_ref().and_then(|p| p.parent()).and_then(laravel::find_dir);
-        from_schema.or_else(|| std::env::current_dir().ok().and_then(|d| laravel::find_dir(&d)))
+        let from_schema = self.schema_path.as_ref().and_then(|p| p.parent()).and_then(timeline::find_dir);
+        from_schema.or_else(|| std::env::current_dir().ok().and_then(|d| timeline::find_dir(&d)))
     }
 
     pub(crate) fn tab_history(&mut self, ui: &mut egui::Ui) {
@@ -235,13 +228,13 @@ impl App {
             ui.horizontal(|ui| {
                 match &h.dir {
                     Some(d) => {
-                        ui.label(RichText::new(d.display().to_string()).weak()).on_hover_text("Laravel migrations folder, watched for changes");
+                        ui.label(RichText::new(d.display().to_string()).weak()).on_hover_text(format!("{} migrations folder, watched for changes", Source::of(d).label()));
                     }
                     None => {
-                        ui.label(RichText::new("No Laravel migrations folder").weak());
+                        ui.label(RichText::new("No migrations folder").weak());
                     }
                 }
-                pick = ui.button("Open folder…").on_hover_text("A Laravel project, or its database/migrations folder").clicked();
+                pick = ui.button("Open folder…").on_hover_text("A Laravel or Rails project, or its database/migrations or db/migrate folder").clicked();
                 if h.dir.is_some() && ui.button("Reload").clicked() {
                     h.load();
                 }
@@ -261,9 +254,9 @@ impl App {
             self.set_status(format!("Copied the warnings of {n} migration{}", if n == 1 { "" } else { "s" }), false);
         }
         if pick && let Some(folder) = rfd::FileDialog::new().pick_folder() {
-            match laravel::resolve_dir(&folder) {
+            match timeline::resolve_dir(&folder) {
                 Some(dir) => self.history.open(dir),
-                None => self.set_status(format!("No Laravel migrations in {}", folder.display()), true),
+                None => self.set_status(format!("No Laravel or Rails migrations in {}", folder.display()), true),
             }
             return;
         }
@@ -273,8 +266,8 @@ impl App {
             None => {
                 ui.add_space(30.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Explore how a Laravel project's data model evolved").size(16.0));
-                    ui.label(RichText::new("Open a Laravel project (or its database/migrations folder): every migration becomes a step, drawn as a diagram with its changes in color.").weak());
+                    ui.label(RichText::new("Explore how a Laravel or Rails project's data model evolved").size(16.0));
+                    ui.label(RichText::new("Open a Laravel or Rails project (or its database/migrations or db/migrate folder): every migration becomes a step, drawn as a diagram with its changes in color.").weak());
                 });
             }
             Some(Err(e)) => {
@@ -440,7 +433,7 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                 ui.label(RichText::new(d).weak());
             }
             ui.separator();
-            let items = [(HistoryView::Diagram, RichText::new("Diagram"), "Tables after this migration; its changes in color"), (HistoryView::Schema, RichText::new("Schema"), "The schema after this migration, in the sdb language"), (HistoryView::File, RichText::new("File"), "The migration's PHP source")];
+            let items = [(HistoryView::Diagram, RichText::new("Diagram"), "Tables after this migration; its changes in color"), (HistoryView::Schema, RichText::new("Schema"), "The schema after this migration, in the sdb language"), (HistoryView::File, RichText::new("File"), "The migration's source file")];
             if let (Some(v), _) = theme::segmented(ui, h.view, &items, false) {
                 h.view = v;
             }
@@ -527,7 +520,10 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                         h.goto_line = step.warnings.iter().find_map(|w| w.line);
                     }
                     let goto = &mut h.goto_line;
-                    egui::ScrollArea::both().id_salt(("history_text", true)).auto_shrink([false, false]).show(ui, |ui| file_view(ui, text, &step.warnings, goto));
+                    egui::ScrollArea::both().id_salt(("history_text", true)).auto_shrink([false, false]).show(ui, |ui| {
+                        let lang = if step.file.extension().is_some_and(|x| x.eq_ignore_ascii_case("rb")) { Lang::Ruby } else { Lang::Php };
+                        file_view(ui, text, lang, &step.warnings, goto)
+                    });
                 } else {
                     egui::ScrollArea::both().id_salt(("history_text", false)).auto_shrink([false, false]).show(ui, |ui| highlight::code_view(ui, text, Lang::Dbs));
                 }

@@ -31,7 +31,7 @@ impl App {
                 if ui.button("Welcome screen…").on_hover_text("Recent projects and saved connections").clicked() {
                     self.show_welcome();
                 }
-                if ui.button("Open project…").on_hover_text("A folder: its schema file, Laravel migrations and database are remembered").clicked() {
+                if ui.button("Open project…").on_hover_text("A folder: its schema file, Laravel or Rails migrations and database are remembered").clicked() {
                     self.pick_project();
                 }
                 ui.separator();
@@ -345,7 +345,7 @@ impl App {
             (Tab::Diagram, "Diagram", false, "Tables and their relations"),
             (Tab::Sql, "SQL", false, "The schema as CREATE TABLE statements"),
             (Tab::Migrate, "Migrate", false, "Bring the database up to the schema"),
-            (Tab::History, "History", false, "Step through a Laravel project's migrations"),
+            (Tab::History, "History", false, "Step through a Laravel or Rails project's migrations"),
             (Tab::Query, "Query", true, "Run SQL on the database"),
             (Tab::Data, "Data", true, "Browse and edit rows"),
             (Tab::Seed, "Seed", true, "Fill tables with fake rows"),

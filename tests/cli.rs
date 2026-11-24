@@ -375,6 +375,30 @@ fn laravel_history() {
 }
 
 #[test]
+fn rails_history() {
+    let s = Scratch::new("rails-history");
+    std::fs::write(s.path("Gemfile"), "source 'https://rubygems.org'\n").unwrap();
+    let dir = s.path("db").join("migrate");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("20240101000000_create_users.rb"),
+        "class CreateUsers < ActiveRecord::Migration[8.0]\n  def change\n    create_table :users do |t|\n      t.string :email, null: false\n      t.timestamps\n    end\n    add_index :users, :email, unique: true\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("20240201000000_add_name_to_users.rb"),
+        "class AddNameToUsers < ActiveRecord::Migration[8.0]\n  def change\n    add_column :users, :name, :string\n    execute \"CREATE VIEW adults AS SELECT * FROM users\"\n  end\nend\n",
+    )
+    .unwrap();
+    let out = s.ok(&["history"]);
+    assert!(out.contains("1 2024-01-01  create users"), "{out}");
+    assert!(out.contains("+ users") && out.contains("~ users") && out.contains("+ column name varchar(255)"), "{out}");
+    assert!(out.contains("warning: line 4: raw SQL not applied: CREATE VIEW adults"), "{out}");
+    let first = s.ok(&["history", "db/migrate", "--at", "1"]);
+    assert!(first.contains("email") && !first.contains("name "), "{first}");
+}
+
+#[test]
 fn pull_keeps_types_of_several_words() {
     let s = Scratch::new("types");
     std::fs::write(s.path("setup.sql"), "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT UNSIGNED NOT NULL, d DOUBLE PRECISION, note TEXT DEFAULT (upper('Mixed')));\n").unwrap();

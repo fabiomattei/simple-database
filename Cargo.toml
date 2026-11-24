@@ -20,6 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustyline = "18.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.10.9"
 tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 webpki-roots = "1.0.9"
 

@@ -1,7 +1,7 @@
 //! Recent projects and SQLite files (`projects.json` in `config_dir()`): a project is a folder,
 //! and with it the schema file and the database last used while it was open. Both can be put in
 //! a group, as saved connections can (`Connection::group`); the welcome screen shows them together. `contents` looks at what a folder
-//! holds (a `.dbs` schema, Laravel migrations, databases `discover` finds), for opening it.
+//! holds (a `.dbs` schema, Laravel or Rails migrations, databases `discover` finds), for opening it.
 
 use crate::connections::{config_dir, write_file};
 use crate::{db, discover};
@@ -166,7 +166,7 @@ impl Projects {
 pub struct Contents {
     /// The project's schema file if it still exists, else `schema.dbs`, else the first `.dbs`.
     pub schema: Option<PathBuf>,
-    /// Laravel migrations (`database/migrations`).
+    /// Laravel (`database/migrations`) or Rails (`db/migrate`) migrations.
     pub migrations: Option<PathBuf>,
     /// The project's database, if it still exists or is a server.
     pub db: Option<String>,
@@ -178,8 +178,8 @@ impl Contents {
     /// A short line of what is there: `Laravel · schema.dbs · app.db`.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
-        if self.migrations.is_some() {
-            parts.push("Laravel".to_string());
+        if let Some(m) = &self.migrations {
+            parts.push(crate::timeline::Source::of(m).label().to_string());
         }
         if let Some(s) = &self.schema
             && let Some(n) = s.file_name()
@@ -200,7 +200,7 @@ impl Contents {
 pub fn contents(project: &Project) -> Contents {
     let dir = &project.path;
     let schema = project.schema.clone().filter(|p| p.is_file()).or_else(|| find_schema(dir));
-    let migrations = Some(dir.join("database").join("migrations")).filter(|m| m.is_dir());
+    let migrations = [dir.join("database").join("migrations"), dir.join("db").join("migrate")].into_iter().find(|m| m.is_dir());
     let db = project.db.clone().filter(|t| db::is_url(t) || t.starts_with('@') || Path::new(t).is_file());
     let found = if db.is_none() && dir.is_dir() { discover::discover(dir) } else { Vec::new() };
     Contents { schema, migrations, db, found }
@@ -221,13 +221,13 @@ fn find_schema(dir: &Path) -> Option<PathBuf> {
     files.into_iter().next()
 }
 
-/// The project a path chosen as one names: a folder as is; the Laravel project around a
-/// `database/migrations` folder; the folder holding a file.
+/// The project a path chosen as one names: a folder as is; the Laravel or Rails project
+/// around a `database/migrations` or `db/migrate` folder; the folder holding a file.
 pub fn root_of(path: &Path) -> PathBuf {
     if path.is_file() {
         return path.parent().map_or_else(|| path.to_path_buf(), Path::to_path_buf);
     }
-    if path.ends_with(Path::new("database").join("migrations"))
+    if (path.ends_with(Path::new("database").join("migrations")) || path.ends_with(Path::new("db").join("migrate")))
         && let Some(root) = path.parent().and_then(Path::parent)
     {
         return root.to_path_buf();
@@ -292,6 +292,11 @@ mod tests {
         assert_eq!(c.summary(), "Laravel · schema.dbs · app.db");
         assert_eq!(root_of(&migrations), dir);
         assert_eq!(root_of(&db), dir);
+        std::fs::remove_dir_all(dir.join("database")).unwrap();
+        let rails = dir.join("db").join("migrate");
+        std::fs::create_dir_all(&rails).unwrap();
+        assert_eq!(contents(&project).summary(), "Rails · schema.dbs · app.db");
+        assert_eq!(root_of(&rails), dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

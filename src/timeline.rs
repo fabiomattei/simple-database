@@ -1,9 +1,78 @@
 //! A project's schema history: one [`Step`] per migration file, each holding
 //! the schema as it stands after that file, and what changed in it
-//! ([`changes`]). Filled by [`crate::laravel::read_dir`].
+//! ([`changes`]). Filled from Laravel ([`crate::laravel`]) or Rails
+//! ([`crate::rails`]) migrations; [`read_dir`] picks by the folder.
 
 use crate::schema::{Column, Schema, Table};
-use std::path::PathBuf;
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+/// The framework a migrations folder belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `database/migrations/*.php`.
+    Laravel,
+    /// `db/migrate/*.rb`.
+    Rails,
+}
+
+impl Source {
+    /// A folder's framework: Rails for `db/migrate` or `.rb` files without `.php` ones.
+    pub fn of(dir: &Path) -> Source {
+        let rails = dir.ends_with(Path::new("db").join("migrate")) || (has_files(dir, "rb") && !has_files(dir, "php"));
+        if rails { Source::Rails } else { Source::Laravel }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Laravel => "Laravel",
+            Source::Rails => "Rails",
+        }
+    }
+
+    /// The migration files' extension.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Source::Laravel => "php",
+            Source::Rails => "rb",
+        }
+    }
+}
+
+/// Whether `dir` holds files with extension `ext`.
+pub fn has_files(dir: &Path, ext: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|r| r.filter_map(|e| e.ok()).any(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case(ext))))
+}
+
+/// The migrations folder of the project `start` is in: `database/migrations`
+/// (Laravel) or `db/migrate` (Rails) of it or the nearest folder above.
+pub fn find_dir(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|d| [d.join("database").join("migrations"), d.join("db").join("migrate")].into_iter().find(|m| m.is_dir()))
+}
+
+/// The migrations folder `path` names: itself when it holds migrations,
+/// else the one of its project ([`find_dir`]).
+pub fn resolve_dir(path: &Path) -> Option<PathBuf> {
+    let laravel = has_files(path, "php") && !path.join("artisan").is_file();
+    let rails = has_files(path, "rb") && !path.join("Gemfile").is_file();
+    if laravel || rails { Some(path.to_path_buf()) } else { find_dir(path) }
+}
+
+/// The migration files of a folder, in the order they run.
+pub fn files(dir: &Path) -> Result<Vec<PathBuf>> {
+    match Source::of(dir) {
+        Source::Laravel => crate::laravel::files(dir),
+        Source::Rails => crate::rails::files(dir),
+    }
+}
+
+/// The steps of a migrations folder, read the way its framework runs them.
+pub fn read_dir(dir: &Path) -> Result<Vec<Step>> {
+    match Source::of(dir) {
+        Source::Laravel => crate::laravel::read_dir(dir),
+        Source::Rails => crate::rails::read_dir(dir),
+    }
+}
 
 /// Names a migration changed, oldest first, so [`changes`] can tell a rename
 /// from a drop plus a create.
@@ -61,7 +130,7 @@ pub struct Step {
     pub file: PathBuf,
     /// The file name without extension: `2014_10_12_000000_create_users_table`.
     pub id: String,
-    /// `2014-10-12`, from a Laravel-style timestamp prefix.
+    /// `2014-10-12`, from the file name's timestamp prefix.
     pub date: Option<String>,
     /// `create users table`.
     pub title: String,

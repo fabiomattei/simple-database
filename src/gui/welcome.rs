@@ -3,7 +3,7 @@
 //! each with its own icon, in a card per group (`Project::group`, `RecentFile::group`,
 //! `Connection::group`). A tile dragged onto a card moves into that group; right-click to
 //! choose a group, a card's heading to rename or dissolve it. A project is a folder: opening it
-//! loads its schema file, its Laravel migrations (History tab) and the database last used with
+//! loads its schema file, its Laravel or Rails migrations (History tab) and the database last used with
 //! it (`projects.rs`). Folders and files dropped on the window open.
 
 use crate::{App, Dialog, Tab, conns, db_title, theme};
@@ -363,7 +363,7 @@ impl App {
     }
 
     /// Opens the project at `path` (a folder, or a file or `database/migrations` in one): its
-    /// schema file, its Laravel migrations and the database last used with it.
+    /// schema file, its Laravel or Rails migrations and the database last used with it.
     pub(crate) fn open_project(&mut self, path: &Path) {
         let root = projects::root_of(path);
         if !root.is_dir() {
@@ -523,7 +523,7 @@ fn title_row(ui: &mut egui::Ui) -> Option<Pick> {
             let orange = Color32::from_rgb(0xff, 0x9f, 0x0a);
             let violet = Color32::from_rgb(0xaf, 0x52, 0xde);
             let buttons = [
-                (theme::Glyph::Folder, violet, "Open Project…", "A folder: its schema file, Laravel migrations and database", Pick::OpenProject),
+                (theme::Glyph::Folder, violet, "Open Project…", "A folder: its schema file, Laravel or Rails migrations and database", Pick::OpenProject),
                 (theme::Glyph::Plus, p.accent, "New Connection…", "PostgreSQL, MySQL or SQLite, saved to reuse", Pick::NewConnection),
                 (theme::Glyph::Folder, orange, "Open SQLite…", "A .db, .sqlite or .sqlite3 file", Pick::OpenSqlite),
                 (theme::Glyph::Database, green, "New SQLite…", "An empty file to push a schema into", Pick::NewSqlite),

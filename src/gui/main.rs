@@ -80,7 +80,7 @@ struct Settings {
     hide_sidebar: bool,
     /// The Migrate tab's format: 0 SQL, 1 Laravel, 2 Rails.
     migrate_format: u8,
-    /// The History tab's Laravel migrations folder.
+    /// The History tab's Laravel or Rails migrations folder.
     migrations_dir: Option<PathBuf>,
     /// The project folder open last.
     project: Option<PathBuf>,

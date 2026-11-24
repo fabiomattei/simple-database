@@ -19,7 +19,7 @@ sdb-gui schema.dbs postgres://me:secret@localhost/app   # ...or a server
 | **Diagram** | Interactive ER diagram. Drag tables, drag the background to pan, scroll or use − / % / + to zoom. **Auto layout** keeps related tables together (parents left of the tables that reference them, tall layers wrapped into several columns, unrelated tables in a grid at the end) without overlaps; **Tidy** only moves overlapping tables apart, and a table that grows pushes its neighbors aside. **Browse data** (or right-click a table → **Browse data**, or double-click it in the read-only database diagram) opens the selected table in the Data tab. Choose which tables are shown from the **Tables** menu or by right-clicking a table (hide it, or show only it and its related tables). Show the schema file or the live database. The schema file's diagram is editable (see below). **Export**: PNG (the canvas as shown), SVG (every visible table at 100%, light background), Mermaid or Graphviz DOT (visible tables only) |
 | **SQL** | Generated DDL for SQLite, PostgreSQL or MySQL; copy or save. In SQLite it is editable and kept in sync with the schema (see below) |
 | **Migrate** | Changes between the schema file and the open database, the exact SQL that will run, and **Push** (asks for confirmation). **From** picks what to compare with: the schema file, or another database (a saved connection or a SQLite file), to make the open database match it. **Show as** switches the right-hand side between the SQL and the same changes as a **Laravel** or **Rails** migration, to **Copy** or **Save as…** (into the project's `database/migrations` or `db/migrate` next to the schema file, when there is one). **Pull** replaces the editor with the database's schema |
-| **History** | A Laravel project's migrations, one step at a time (see [Laravel migration history](#laravel-migration-history)). The list on the left has every file in `database/migrations` with what it changed (+ added, ~ changed, − dropped tables); the diagram shows the schema after the selected migration, its changes in color (added green, changed amber, dropped red, struck through) and everything else in grey. **Only changes** draws just the tables it touched and those they reference. The panel on the right lists the changes column by column, and what couldn't be modeled. ↑ / ↓ step through; **Schema** shows that step as `.dbs` text (**Copy schema** copies it), **File** the migration's PHP source with line numbers (**Copy path**, **Copy file**); lines with a warning are highlighted, and clicking a warning in the right panel jumps to its line. The folder is found next to the schema file or the working directory (**Open folder…** picks another) and is watched: new or edited migrations show up as you save them |
+| **History** | A Laravel or Rails project's migrations, one step at a time (see [Laravel migration history](#laravel-migration-history) and [Rails migration history](#rails-migration-history)). The list on the left has every file in `database/migrations` (or `db/migrate`) with what it changed (+ added, ~ changed, − dropped tables); the diagram shows the schema after the selected migration, its changes in color (added green, changed amber, dropped red, struck through) and everything else in grey. **Only changes** draws just the tables it touched and those they reference. The panel on the right lists the changes column by column, and what couldn't be modeled. ↑ / ↓ step through; **Schema** shows that step as `.dbs` text (**Copy schema** copies it), **File** the migration's PHP or Ruby source with line numbers (**Copy path**, **Copy file**); lines with a warning are highlighted, and clicking a warning in the right panel jumps to its line. The folder is found next to the schema file or the working directory (**Open folder…** picks another) and is watched: new or edited migrations show up as you save them |
 | **Query** | Run SQL and see the results in a grid. **Run** (Ctrl+Enter) runs the selection, or else the statement at the caret (the one it is in, or the last one before it); **Run all** (Ctrl+Shift+Enter) runs the whole editor. Shows up to 10,000 rows per result. **Explain** shows the query plan of what Run would run: SQLite plans only (`EXPLAIN QUERY PLAN`, nothing runs). Postgres and MySQL use `EXPLAIN ANALYZE` in a transaction that is rolled back, so you get real timings and no changes are kept. **History** lists past queries (searchable; click to load, double-click to run all of it) and saved queries (**Save query…**). **Export** saves the result as CSV, TSV, JSON, JSON Lines, Markdown, HTML or SQL INSERTs, or copies it |
 | **Data** | Browse and edit tables, each in its own tab, 200 rows per page (see below) |
 | **Seed** | Fill tables with realistic fake data, with a row count per table and a reproducible seed |
@@ -89,8 +89,8 @@ on the window opens it as a project, a `.dbs` file in the editor, a SQLite file 
 **File → Welcome screen…** shows it again, and **File → Open project…** opens a project from anywhere.
 
 A project is a folder. Opening one loads its schema file (the one last used with it, else
-`schema.dbs`, else its first `.dbs` file), opens its Laravel migrations in the **History** tab
-(`database/migrations`, no database needed) and connects to the database last used with it. While a
+`schema.dbs`, else its first `.dbs` file), opens its Laravel or Rails migrations in the **History** tab
+(`database/migrations` or `db/migrate`, no database needed) and connects to the database last used with it. While a
 project is open, the schema file you open or save and the database you connect to are remembered with
 it (`projects.json` in the config folder, without passwords). Without a database, the ones found in the
 folder (`.env`, compose, Prisma) are counted in the status bar and listed under Connections.
@@ -312,7 +312,7 @@ certificate comes from a private CA, pass it with `sslrootcert`:
 | `sdb diagram SCHEMA -f mermaid\|dot` | ER diagram: paste Mermaid into GitHub/GitLab markdown, or `\| dot -Tsvg > er.svg` |
 | `sdb diff FROM TO -d DIALECT [-o file] [--down]` | Summary of changes + migration SQL; `--down` writes the way back (TO → FROM, renames undone) |
 | `sdb diff FROM TO -d DIALECT -f laravel\|rails [--name NAME] [--rails-version 8.0] [-o dir]` | The same changes as a Laravel or Rails migration (see [Framework migrations](#framework-migrations)) |
-| `sdb history [PROJECT] [--at N\|NAME] [-o file]` | Replay a Laravel project's migrations: each one and what it changed; `--at` prints the schema after one (by number or part of its file name) as `.dbs` (see [Laravel migration history](#laravel-migration-history)) |
+| `sdb history [PROJECT] [--at N\|NAME] [-o file]` | Replay a Laravel or Rails project's migrations: each one and what it changed; `--at` prints the schema after one (by number or part of its file name) as `.dbs` (see [Laravel migration history](#laravel-migration-history), [Rails migration history](#rails-migration-history)) |
 | `sdb push SCHEMA --db app.db [--dry-run] [-y] [--force] [--step]` | Migrate a database to match the schema. Refuses when rows already there would make it fail (see below) unless `--force`. `--step` shows each statement and asks before running it |
 | `sdb migrate new SCHEMA [-d DIALECT] [--name NAME] [--dir migrations]` | Write the next versioned migration file (see [Migration files](#migration-files)) |
 | `sdb migrate new --empty --name NAME` | An empty migration file to fill in by hand |
@@ -620,6 +620,37 @@ Postgres's `ALTER COLUMN … TYPE / SET NOT NULL / SET DEFAULT`, `CREATE TABLE`,
 The rest is reported as a warning on that migration, not guessed: other raw SQL (views,
 triggers, a clause of an `ALTER TABLE` it can't read), names or defaults computed at run time,
 unknown methods. Control flow is ignored: every call in `up()` counts, whatever `if` it sits in.
+
+### Rails migration history
+
+The same works for a Rails project's `db/migrate`, read without Ruby: each file's `up` (or else
+`change`) is replayed in version order. A `db/post_migrate` next to it (GitLab's and Mastodon's
+post-deployment migrations) is merged in, as Rails runs it. `sdb history` finds `db/migrate` in
+the folder given or above it, like `database/migrations`.
+
+```sh
+sdb history ~/code/blog                     # every migration and what it changed
+sdb history ~/code/blog --at add_tags -o tags.dbs
+```
+
+Understood: `create_table` (with `id:`, `primary_key:`, `comment:`, `force:`), `change_table`,
+`create_join_table`, `rename_table`, `drop_table`; the column types (`t.string`, `t.decimal`,
+`t.references` / `t.belongs_to` with `polymorphic:`, `foreign_key:` and `index:`, `t.timestamps`,
+`t.column`, Postgres `t.enum` with `create_enum`, `array: true`, Paperclip's `t.attachment`, …) and
+options (`null`, `default`, `limit`, `precision`, `scale`, `comment`, `index`); `add_column`,
+`change_column`, `change_column_default` / `_null` / `_comment`, `rename_column`,
+`remove_column(s)`, `add_index` / `remove_index` / `rename_index` (with `unique:`, `where:` and
+`using:`), `add_reference`, `add_foreign_key` / `remove_foreign_key`, `add_timestamps`, check
+and unique constraints. Indexes get Rails's names (`index_posts_on_user_id`; from
+`Migration[7.1]` on, long ones become `idx_on_…_<hash>`), renamed along with their table or
+column as Rails does, and foreign keys are found by Rails's `fk_rails_<hash>` names too.
+`execute` is applied like Laravel's raw SQL.
+
+In `reversible` blocks only `dir.up` counts, and `rescue` branches are skipped. Statements
+under a condition (`… if index_exists?(…)`, an `if` block, after `return unless …`) are applied
+without warning when what they act on is missing. As with Laravel, the rest is a warning: views
+(`create_view`), a project's own helpers called on a table, names or defaults computed at run
+time.
 
 ### Migration files
 
