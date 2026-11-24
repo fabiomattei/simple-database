@@ -8,7 +8,7 @@ use crate::{App, theme, warn_color};
 use eframe::egui::{self, Key, RichText};
 use simple_database::laravel;
 use simple_database::schema::Schema;
-use simple_database::timeline::{Changes, Mark, Step, changes};
+use simple_database::timeline::{Changes, Mark, Step, Warning, changes};
 use simple_database::format;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -49,6 +49,10 @@ pub(crate) struct HistoryState {
     searched: bool,
     /// The `.dbs` text of the selected step, made when shown.
     text: Option<(usize, HistoryView, String)>,
+    /// The step whose file the File view shows, to jump to its first warning once.
+    file_shown: Option<usize>,
+    /// A line of the file to scroll to (a warning clicked in the changes panel).
+    goto_line: Option<usize>,
 }
 
 fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
@@ -68,13 +72,65 @@ fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
     out
 }
 
-/// A step's warnings under its file's path, for the clipboard.
+/// A step's warnings, one per line as `path:line: message` (what editors and
+/// terminals open at the line), for the clipboard.
 fn warning_text(step: &Step) -> String {
-    let mut out = format!("{}\n", step.file.display());
-    for w in &step.warnings {
-        out.push_str(&format!("  ⚠ {w}\n"));
-    }
-    out
+    let path = step.file.display();
+    step.warnings
+        .iter()
+        .map(|w| match w.line {
+            Some(n) => format!("{path}:{n}: ⚠ {}\n", w.message),
+            None => format!("{path}: ⚠ {}\n", w.message),
+        })
+        .collect()
+}
+
+/// The migration's source with line numbers; lines with a warning are tinted
+/// and show it on hover. Scrolls to `goto` (taken) once laid out.
+fn file_view(ui: &mut egui::Ui, text: &str, warnings: &[Warning], goto: &mut Option<usize>) {
+    let galley = highlight::layout(ui, text, Lang::Php);
+    let warn = warn_color(ui);
+    let number_font = egui::FontId::monospace(11.0);
+    let gutter_w = 14.0 + 8.0 * galley.rows.len().to_string().len() as f32;
+    let warned = |line: usize| warnings.iter().filter(move |w| w.line == Some(line));
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let (gutter, _) = ui.allocate_exact_size(egui::vec2(gutter_w, galley.size().y), egui::Sense::hover());
+        let origin = egui::pos2(gutter.right() + 8.0, gutter.top());
+        let right = origin.x + galley.size().x.max(ui.available_width());
+        let painter = ui.painter().clone();
+        let mut target = None;
+        for (n, row) in galley.rows.iter().enumerate() {
+            let line = n + 1;
+            let r = row.rect().translate(origin.to_vec2());
+            let band = egui::Rect::from_x_y_ranges(gutter.left()..=right, r.y_range());
+            let hit = warned(line).next().is_some();
+            if hit {
+                painter.rect_filled(band, 0.0, warn.gamma_multiply(0.18));
+                painter.rect_filled(egui::Rect::from_x_y_ranges(gutter.left()..=gutter.left() + 3.0, r.y_range()), 0.0, warn);
+            }
+            let color = if hit { warn } else { ui.visuals().weak_text_color() };
+            painter.text(egui::pos2(gutter.right() - 4.0, r.center().y), egui::Align2::RIGHT_CENTER, line.to_string(), number_font.clone(), color);
+            if *goto == Some(line) {
+                target = Some(band);
+            }
+        }
+        ui.add_space(8.0);
+        let resp = ui.add(egui::Label::new(galley.clone()).selectable(true).wrap_mode(egui::TextWrapMode::Extend));
+        // A warning line shows its messages on hover.
+        if let Some(pos) = resp.hover_pos()
+            && let Some(n) = galley.rows.iter().position(|row| row.rect().translate(origin.to_vec2()).y_range().contains(pos.y))
+        {
+            let text: Vec<String> = warned(n + 1).map(|w| format!("⚠ {}", w.message)).collect();
+            if !text.is_empty() {
+                resp.on_hover_text(text.join("\n"));
+            }
+        }
+        if let Some(band) = target {
+            ui.scroll_to_rect(band, Some(egui::Align::Center));
+            *goto = None;
+        }
+    });
 }
 
 /// Every table any step has, as last seen, for one layout of the whole history.
@@ -319,7 +375,14 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new("⚠ Not modeled: the diagram may miss what these do").color(warn).strong());
                     for w in &step.warnings {
-                        ui.label(RichText::new(format!("• {w}")).color(warn));
+                        let label = ui.add(egui::Label::new(RichText::new(format!("• {w}")).color(warn)).sense(egui::Sense::click()));
+                        if let Some(line) = w.line
+                            && label.on_hover_text(format!("Show line {line} of the migration file")).clicked()
+                        {
+                            h.view = HistoryView::File;
+                            h.file_shown = Some(h.selected);
+                            h.goto_line = Some(line);
+                        }
                     }
                     ui.add_space(4.0);
                     if ui.button("Copy with file name").on_hover_text("The migration's path and these messages, as text").clicked() {
@@ -457,11 +520,23 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                     });
                     ui.add_space(4.0);
                 }
-                let lang = if h.view == HistoryView::File { Lang::Php } else { Lang::Dbs };
-                egui::ScrollArea::both().id_salt(("history_text", h.view == HistoryView::File)).auto_shrink([false, false]).show(ui, |ui| highlight::code_view(ui, text, lang));
+                if h.view == HistoryView::File {
+                    // Opening a file (or another step's) goes to its first warning.
+                    if h.file_shown != Some(h.selected) {
+                        h.file_shown = Some(h.selected);
+                        h.goto_line = step.warnings.iter().find_map(|w| w.line);
+                    }
+                    let goto = &mut h.goto_line;
+                    egui::ScrollArea::both().id_salt(("history_text", true)).auto_shrink([false, false]).show(ui, |ui| file_view(ui, text, &step.warnings, goto));
+                } else {
+                    egui::ScrollArea::both().id_salt(("history_text", false)).auto_shrink([false, false]).show(ui, |ui| highlight::code_view(ui, text, Lang::Dbs));
+                }
             }
         }
     });
+    if h.view != HistoryView::File {
+        h.file_shown = None;
+    }
     h.shown_step = Some(h.selected);
     copied_one
 }

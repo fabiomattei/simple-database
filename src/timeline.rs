@@ -38,6 +38,23 @@ impl Renames {
     }
 }
 
+/// Something a step does that the schema can't show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    /// The line of the migration file it comes from.
+    pub line: Option<usize>,
+    pub message: String,
+}
+
+impl std::fmt::Display for Warning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.line {
+            Some(n) => write!(f, "line {n}: {}", self.message),
+            None => write!(f, "{}", self.message),
+        }
+    }
+}
+
 /// One migration file and the schema after it.
 #[derive(Debug, Clone)]
 pub struct Step {
@@ -51,7 +68,7 @@ pub struct Step {
     pub schema: Schema,
     pub renames: Renames,
     /// What the step does that the schema can't show (raw SQL, unknown calls).
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 /// How a table or column fared in one step.

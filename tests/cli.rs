@@ -365,7 +365,7 @@ fn laravel_history() {
     assert!(out.contains("1 2024-01-01  create users table"), "{out}");
     assert!(out.contains("+ users") && out.contains("~ users") && out.contains("+ column name varchar(255)"), "{out}");
     assert!(out.contains("+ column age int") && !out.contains("UPDATE"), "{out}");
-    assert!(out.contains("warning: raw SQL not applied: CREATE VIEW adults AS SELECT * FROM users"), "{out}");
+    assert!(out.contains("warning: line 10: raw SQL not applied: CREATE VIEW adults AS SELECT * FROM users"), "{out}");
     let first = s.ok(&["history", "--at", "1", "-o", "first.dbs"]);
     assert!(first.contains("Wrote"));
     let text = std::fs::read_to_string(s.path("first.dbs")).unwrap();

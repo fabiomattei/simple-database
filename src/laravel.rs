@@ -6,7 +6,7 @@
 //! step. Control flow is ignored: every call in `up()` counts.
 
 use crate::schema::{Column, DataType, DefaultValue, ForeignKey, Index, RefAction, Schema, Table, TableForeignKey};
-use crate::timeline::{Renames, Step};
+use crate::timeline::{Renames, Step, Warning};
 use anyhow::{Context, Result};
 
 mod raw_sql;
@@ -57,11 +57,11 @@ fn split_id(id: &str) -> (Option<String>, String) {
 }
 
 /// Replays the `up()` of one migration file onto `schema`; returns its warnings.
-pub fn apply(schema: &mut Schema, src: &str, renames: &mut Renames) -> Vec<String> {
-    let toks = tokenize(src);
-    let mut ctx = Ctx { schema, renames, warnings: Vec::new() };
+pub fn apply(schema: &mut Schema, src: &str, renames: &mut Renames) -> Vec<Warning> {
+    let (toks, lines) = tokenize(src);
+    let mut ctx = Ctx { schema, renames, warnings: Vec::new(), line: None };
     match up_body(&toks) {
-        Some(body) => ctx.run(body),
+        Some(r) => ctx.run(&toks[r.clone()], &lines[r]),
         None => ctx.warn("no up() method found".into()),
     }
     ctx.warnings
@@ -82,12 +82,16 @@ enum Tok {
 
 const PUNCT: [&str; 14] = ["?->", "...", "->", "::", "=>", "==", "!=", "&&", "||", "<=", ">=", "??", "++", "--"];
 
-fn tokenize(src: &str) -> Vec<Tok> {
+/// The tokens of `src`, and the line (from 1) each one starts on.
+fn tokenize(src: &str) -> (Vec<Tok>, Vec<usize>) {
     let c: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
+    let mut lines = Vec::new();
+    let (mut line, mut counted) = (1, 0);
     let mut i = 0;
     let at = |i: usize, s: &str| s.chars().enumerate().all(|(k, ch)| c.get(i + k) == Some(&ch));
     while i < c.len() {
+        let (start, before) = (i, out.len());
         let ch = c[i];
         if ch.is_whitespace() {
             i += 1;
@@ -184,8 +188,13 @@ fn tokenize(src: &str) -> Vec<Tok> {
             }
             i += 1;
         }
+        if out.len() > before {
+            line += c[counted..start].iter().filter(|x| **x == '\n').count();
+            counted = start;
+            lines.push(line);
+        }
     }
-    out
+    (out, lines)
 }
 
 /// A heredoc or nowdoc body, `i` just after `<<<`; returns it and where it ends.
@@ -215,14 +224,14 @@ fn heredoc(c: &[char], mut i: usize) -> (String, usize) {
     (lines.join("\n"), consumed.min(c.len()))
 }
 
-/// The tokens inside the braces of `function up(...) { ... }`.
-fn up_body(t: &[Tok]) -> Option<&[Tok]> {
+/// Where the tokens inside the braces of `function up(...) { ... }` are.
+fn up_body(t: &[Tok]) -> Option<std::ops::Range<usize>> {
     let start = t.windows(3).position(|w| {
         w[0] == Tok::Ident("function".into()) && matches!(&w[1], Tok::Ident(n) if n.eq_ignore_ascii_case("up")) && w[2] == Tok::P("(")
     })?;
     let open = start + t[start..].iter().position(|x| *x == Tok::P("{"))?;
     let close = matching(t, open)?;
-    Some(&t[open + 1..close])
+    Some(open + 1..close)
 }
 
 /// Index of the bracket closing the one at `open`.
@@ -256,7 +265,7 @@ enum Val {
     Class(String),
     /// `DB::raw('…')` or `new Expression('…')`: SQL.
     Raw(String),
-    Closure { var: String, body: Vec<Tok> },
+    Closure { var: String, body: Vec<Tok>, lines: Vec<usize> },
     /// Anything else, as source-ish text.
     Other(String),
 }
@@ -324,6 +333,8 @@ impl Call {
 
 struct Parser<'a> {
     t: &'a [Tok],
+    /// The line of each token.
+    lines: &'a [usize],
     i: usize,
 }
 
@@ -504,15 +515,16 @@ impl Parser<'_> {
             self.i += 1;
             let start = self.i;
             self.skip_expr();
-            return Some(Val::Closure { var, body: self.t[start..self.i].to_vec() });
+            return Some(Val::Closure { var, body: self.t[start..self.i].to_vec(), lines: self.lines[start..self.i].to_vec() });
         }
         while self.i < self.t.len() && !self.is(0, "{") {
             self.i += 1;
         }
         let close = matching(self.t, self.i)?;
         let body = self.t[self.i + 1..close].to_vec();
+        let lines = self.lines[self.i + 1..close].to_vec();
         self.i = close + 1;
-        Some(Val::Closure { var, body })
+        Some(Val::Closure { var, body, lines })
     }
 
     /// Moves to the end of the current expression (depth 0 `,` `)` `]` `;`).
@@ -574,20 +586,26 @@ fn short(s: &str) -> String {
 struct Ctx<'a> {
     schema: &'a mut Schema,
     renames: &'a mut Renames,
-    warnings: Vec<String>,
+    warnings: Vec<Warning>,
+    /// The line of the call being replayed, for its warnings.
+    line: Option<usize>,
 }
 
 impl Ctx<'_> {
-    fn warn(&mut self, w: String) {
+    fn warn(&mut self, message: String) {
+        let w = Warning { line: self.line, message };
         if !self.warnings.contains(&w) {
             self.warnings.push(w);
         }
     }
 
     /// Every `Schema::…` and `DB::…` call in a body, in order.
-    fn run(&mut self, body: &[Tok]) {
-        let mut p = Parser { t: body, i: 0 };
+    fn run(&mut self, body: &[Tok], lines: &[usize]) {
+        let mut p = Parser { t: body, lines, i: 0 };
         while p.i < body.len() {
+            if matches!(p.peek(0), Some(Tok::Ident(_))) {
+                self.line = lines.get(p.i).copied();
+            }
             let facade = p.ident(0).map(|id| id.rsplit('\\').next().unwrap_or(id).to_string());
             match facade.as_deref() {
                 Some("Schema") if p.is(1, "::") => {
@@ -632,7 +650,7 @@ impl Ctx<'_> {
         match c.name.as_str() {
             "create" | "table" => {
                 let Some(name) = table else { return self.warn(format!("Schema::{} with a table name computed at run time", c.name)) };
-                let Some(Val::Closure { var, body }) = c.arg(1, "callback") else { return };
+                let Some(Val::Closure { var, body, lines }) = c.arg(1, "callback") else { return };
                 if c.name == "create" {
                     if self.schema.table(&name).is_some() {
                         self.warn(format!("{name} is created again; the earlier one is replaced"));
@@ -642,8 +660,8 @@ impl Ctx<'_> {
                 } else if self.schema.table(&name).is_none() {
                     return self.warn(format!("Schema::table on {name}, which doesn't exist yet"));
                 }
-                let (var, body) = (var.clone(), body.clone());
-                self.blueprint(name, &var, &body);
+                let (var, body, lines) = (var.clone(), body.clone(), lines.clone());
+                self.blueprint(name, &var, &body, &lines);
             }
             "rename" => {
                 if let (Some(from), Some(to)) = (table, c.str(1, "to")) {
@@ -666,9 +684,9 @@ impl Ctx<'_> {
                 }
             }
             "withoutForeignKeyConstraints" => {
-                if let Some(Val::Closure { body, .. }) = c.arg(0, "callback") {
-                    let body = body.clone();
-                    self.run(&body);
+                if let Some(Val::Closure { body, lines, .. }) = c.arg(0, "callback") {
+                    let (body, lines) = (body.clone(), lines.clone());
+                    self.run(&body, &lines);
                 }
             }
             "dropAllTables" => self.schema.tables.clear(),
@@ -690,10 +708,11 @@ impl Ctx<'_> {
     }
 
     /// The commands on `$var` inside a `Schema::create` / `table` closure.
-    fn blueprint(&mut self, mut table: String, var: &str, body: &[Tok]) {
-        let mut p = Parser { t: body, i: 0 };
+    fn blueprint(&mut self, mut table: String, var: &str, body: &[Tok], lines: &[usize]) {
+        let mut p = Parser { t: body, lines, i: 0 };
         while p.i < body.len() {
             if matches!(p.peek(0), Some(Tok::Var(v)) if v == var) && p.is(1, "->") {
+                self.line = lines.get(p.i).copied();
                 p.i += 1;
                 let calls = p.chain();
                 if !calls.is_empty() {
@@ -1320,7 +1339,7 @@ class AlterPosts extends Migration {
             .iter()
             .map(|f| {
                 let mut r = Renames::default();
-                let w = apply(&mut s, f, &mut r);
+                let w = apply(&mut s, f, &mut r).into_iter().map(|w| w.message).collect();
                 (s.clone(), r, w)
             })
             .collect()
@@ -1416,6 +1435,18 @@ class AlterPosts extends Migration {
     }
 
     #[test]
+    fn warnings_carry_their_line() {
+        let mut s = Schema::default();
+        let w = apply(&mut s, POSTS, &mut Renames::default());
+        // POSTS: line 1 is `<?php`; the DB::statement is on line 19.
+        let line = POSTS.lines().position(|l| l.contains("pg_trgm")).unwrap() + 1;
+        assert_eq!(w[0].line, Some(line));
+        let w = apply(&mut s, "<?php\nclass X { function up() {\n  Schema::create('t', function ($t) {\n    $t->id();\n    $t->string($name);\n  });\n} }\n", &mut Renames::default());
+        assert_eq!((w[0].line, w[0].to_string()), (Some(5), "line 5: t: ->string() with a column name computed at run time".to_string()));
+        assert_eq!(apply(&mut s, "<?php // nothing", &mut Renames::default())[0].line, None);
+    }
+
+    #[test]
     fn plurals() {
         for (s, p) in [("user", "users"), ("category", "categories"), ("day", "days"), ("status", "statuses"), ("person", "people"), ("blog_post", "blog_posts"), ("box", "boxes")] {
             assert_eq!(plural(s), p);
@@ -1427,7 +1458,7 @@ class AlterPosts extends Migration {
     fn heredoc_statements_are_warned_about() {
         let src = "<?php\nclass X { public function up() {\n DB::statement(<<<SQL\n    CREATE VIEW v AS SELECT 1\n    SQL);\n Schema::create('a', fn (Blueprint $t) => $t->id());\n} }\n";
         let mut s = Schema::default();
-        let w = apply(&mut s, src, &mut Renames::default());
+        let w: Vec<String> = apply(&mut s, src, &mut Renames::default()).into_iter().map(|w| w.message).collect();
         assert_eq!(w, vec!["raw SQL not applied: CREATE VIEW v AS SELECT 1".to_string()]);
         assert!(s.table("a").unwrap().column("id").is_some());
     }
