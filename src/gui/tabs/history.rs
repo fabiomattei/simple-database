@@ -52,6 +52,17 @@ pub(crate) struct HistoryState {
     file_shown: Option<usize>,
     /// A line of the file to scroll to (a warning clicked in the changes panel).
     goto_line: Option<usize>,
+    /// Where the table or column last clicked on the diagram was defined.
+    defined: Option<Defined>,
+}
+
+/// The migration that created what was clicked on the diagram, outlined in the list.
+struct Defined {
+    step: usize,
+    /// `users` or `users.email`.
+    what: String,
+    /// The list has scrolled to it once.
+    scrolled: bool,
 }
 
 fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
@@ -149,6 +160,7 @@ impl HistoryState {
         self.signature = signature(&dir);
         self.checked = Some(Instant::now());
         self.text = None;
+        self.defined = None;
         self.loaded = Some(timeline::read_dir(&dir).map_err(|e| format!("{e:#}")).map(|steps| {
             let mut before = Schema::default();
             steps
@@ -337,6 +349,15 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                     resp.scroll_to_me(None);
                 }
                 let mut hover = format!("{}{}", step.id, step.date.as_deref().map(|d| format!("\n{d}")).unwrap_or_default());
+                if let Some(d) = h.defined.as_mut().filter(|d| d.step == i) {
+                    let accent = theme::palette(ui).accent;
+                    ui.painter().rect_stroke(resp.rect, 6.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+                    if !d.scrolled {
+                        d.scrolled = true;
+                        resp.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    hover = format!("Defines {}\n{hover}", d.what);
+                }
                 for w in &step.warnings {
                     hover.push_str(&format!("\n⚠ {w}"));
                 }
@@ -485,9 +506,32 @@ fn steps_view(h: &mut HistoryState, ui: &mut egui::Ui, steps: &[(Step, Changes)]
                         .collect();
                     shown.tables.retain(|t| keep.contains(&t.name));
                 }
+                let mut go = None;
+                if let Some(d) = &h.defined {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{} is defined in", d.what)).weak());
+                        if ui.link(format!("{} {}", d.step + 1, steps[d.step].0.title)).on_hover_text("Show that migration").clicked() {
+                            go = Some(d.step);
+                        }
+                    });
+                }
                 let canvas = if h.only_changed { &mut h.er_changes } else { &mut h.er };
                 canvas.marks = Some(c.clone());
                 let _ = canvas.ui(ui, &shown, false, &Default::default());
+                // A click on a table or column outlines the migration that created it.
+                if let Some(click) = canvas.clicked.take() {
+                    h.defined = click.table.and_then(|t| {
+                        let step = timeline::defined_in(steps, h.selected, &t, click.column.as_deref())?;
+                        let what = match &click.column {
+                            Some(col) => format!("{t}.{col}"),
+                            None => t,
+                        };
+                        Some(Defined { step, what, scrolled: false })
+                    });
+                }
+                if let Some(step) = go {
+                    h.selected = step;
+                }
             }
             HistoryView::Schema | HistoryView::File => {
                 // Made once per step and view; a reload of the folder drops it, so edits show.

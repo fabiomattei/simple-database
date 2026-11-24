@@ -274,6 +274,8 @@ pub fn list_row(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::U
     }
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(6.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
     child.spacing_mut().item_spacing.x = 6.0;
+    // Selectable labels sense clicks themselves, which would keep them from the row.
+    child.style_mut().interaction.selectable_labels = false;
     add(&mut child);
     resp
 }

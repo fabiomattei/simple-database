@@ -46,6 +46,15 @@ pub struct ErView {
     /// A screenshot is on its way: keep hover effects and the hint off the canvas.
     capturing: bool,
     png_result: Option<Result<PathBuf, String>>,
+    /// The last click on the canvas, until the caller takes it.
+    pub clicked: Option<Click>,
+}
+
+/// A click on the canvas: the table and column under it, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Click {
+    pub table: Option<String>,
+    pub column: Option<String>,
 }
 
 /// A schema change asked for on the canvas, applied by the caller.
@@ -383,6 +392,7 @@ impl ErView {
         }
         if response.clicked() {
             self.selected = hovered_table.clone();
+            self.clicked = Some(Click { table: hovered_table.clone(), column: hovered_column.clone() });
         }
         if response.double_clicked()
             && let Some(t) = &hovered_table

@@ -168,6 +168,26 @@ impl TableMarks {
     }
 }
 
+/// The step (at or before `at`) that created `table`, or with `column` that
+/// column, following the names back through renames. `None` when it predates
+/// every step.
+pub fn defined_in(steps: &[(Step, Changes)], at: usize, table: &str, column: Option<&str>) -> Option<usize> {
+    let mut table = table.to_string();
+    let mut column = column.map(str::to_string);
+    for k in (0..=at.min(steps.len().checked_sub(1)?)).rev() {
+        let (step, c) = &steps[k];
+        if let Some(m) = c.table(&table)
+            && (m.mark == Mark::Added || column.as_ref().is_some_and(|col| m.column(col) == Mark::Added))
+        {
+            return Some(k);
+        }
+        // The names before step k.
+        column = column.map(|col| step.renames.old_column(&table, &col));
+        table = step.renames.old_table(&table);
+    }
+    None
+}
+
 /// What one step did, and a schema to draw it with.
 #[derive(Debug, Clone, Default)]
 pub struct Changes {
@@ -393,5 +413,35 @@ mod tests {
         let mut r = Renames::default();
         r.table("a", "b");
         assert_eq!(changes(&before, &after, &r).table("b").unwrap().mark, Mark::Renamed);
+    }
+
+    #[test]
+    fn finds_where_a_table_or_column_was_defined_through_renames() {
+        let schemas = [
+            "table users {\n  id int pk\n  name text\n}\n",
+            "table users {\n  id int pk\n  name text\n}\ntable tags {\n  id int pk\n}\n",
+            "table users {\n  id int pk\n  name text\n  email text\n}\ntable tags {\n  id int pk\n}\n",
+            "table people {\n  id int pk\n  full_name text\n  email text\n}\ntable tags {\n  id int pk\n}\n",
+        ];
+        let mut renames = vec![Renames::default(); 4];
+        renames[3].column("users", "name", "full_name");
+        renames[3].table("users", "people");
+        let mut before = Schema::default();
+        let steps: Vec<(Step, Changes)> = schemas
+            .iter()
+            .zip(renames)
+            .map(|(text, renames)| {
+                let schema = parse(text).unwrap();
+                let c = changes(&before, &schema, &renames);
+                before = schema.clone();
+                (Step { file: PathBuf::new(), id: String::new(), date: None, title: String::new(), schema, renames, warnings: vec![] }, c)
+            })
+            .collect();
+        assert_eq!(defined_in(&steps, 3, "people", None), Some(0));
+        assert_eq!(defined_in(&steps, 3, "people", Some("full_name")), Some(0));
+        assert_eq!(defined_in(&steps, 3, "people", Some("email")), Some(2));
+        assert_eq!(defined_in(&steps, 3, "tags", Some("id")), Some(1));
+        assert_eq!(defined_in(&steps, 1, "users", Some("email")), Some(0), "not yet added: the table's step");
+        assert_eq!(defined_in(&steps, 3, "nothing", None), None);
     }
 }
